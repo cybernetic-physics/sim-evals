@@ -24,7 +24,7 @@ from isaaclab.sensors import CameraCfg
 
 from .nvidia_droid import NVIDIA_DROID
 
-DATA_PATH = Path(__file__).parent / "../../assets/"
+DATA_PATH = Path(__file__).parent / "../../../assets/"
 
 @configclass
 class SceneCfg(InteractiveSceneCfg):

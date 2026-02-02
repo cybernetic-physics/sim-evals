@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 
-from src.inference.droid_jointpos import Client as DroidJointPosClient
+from sim_evals.inference.droid_jointpos import Client as DroidJointPosClient
 
 
 def main(
@@ -47,7 +47,7 @@ def main(
     simulation_app = app_launcher.app
 
     # All IsaacLab dependent modules should be imported after the app is launched
-    import src.environments # noqa: F401
+    import sim_evals.environments # noqa: F401
     from isaaclab_tasks.utils import parse_env_cfg
 
 
