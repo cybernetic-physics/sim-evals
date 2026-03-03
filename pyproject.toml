@@ -40,9 +40,9 @@ explicit = true
 
 [tool.basedpyright]
 extraPaths = [
-    "./submodules/IsaacLab/source/isaaclab",
-    "./submodules/IsaacLab/source/isaaclab_assets",
-    "./submodules/IsaacLab/source/isaaclab_tasks"
+    "./.venv/lib/python3.11/site-packages/isaaclab/source/isaaclab/",
+    "./.venv/lib/python3.11/site-packages/isaaclab/source/isaaclab_assets/",
+    "./.venv/lib/python3.11/site-packages/isaaclab/source/isaaclab_tasks/",
 ]
 typeCheckingMode = "standard"
 
