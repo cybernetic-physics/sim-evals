@@ -70,7 +70,6 @@ def main(
     # Per-env state
     videos = [[] for _ in range(num_envs)]
     ep_steps = np.zeros(num_envs, dtype=np.int32)
-    last_rew = np.zeros(num_envs, dtype=np.float32)
     # Map each env slot to the episode id it's currently running
     env_ep_ids = np.arange(next_ep_id, next_ep_id + num_envs)
 
@@ -88,56 +87,48 @@ def main(
             obs, rew, term, trunc, info = env.step(action)
             ep_steps += 1
 
-            # rew is (num_envs,) — track last reward per env
-            if isinstance(rew, torch.Tensor):
-                last_rew = rew.detach().cpu().numpy().flatten()
-            else:
-                last_rew = np.array(rew, dtype=np.float32).flatten()
+            # Check which envs are done
+            # if isinstance(term, torch.Tensor):
+            #     done = (term | trunc).detach().cpu().numpy().flatten().astype(bool)
+            # else:
+            #     done = np.array(term | trunc, dtype=bool).flatten()
+            # done |= ep_steps >= max_steps
 
-            # Compute done mask
-            if isinstance(term, torch.Tensor):
-                done = ((term | trunc).detach().cpu().numpy().flatten()).astype(bool)
-            else:
-                done = np.array(term | trunc, dtype=bool).flatten()
+            if term.any() or trunc.any():
+                done_ids = (term | trunc).nonzero().flatten()
+                for i in done_ids:
+                    ep_id = env_ep_ids[i]
 
-            # Also mark envs that hit max steps
-            done |= ep_steps >= max_steps
+                    # Save video
+                    if videos[i]:
+                        mediapy.write_video(
+                            run_folder / f"episode_{ep_id}.mp4",
+                            videos[i],
+                            fps=15,
+                        )
 
-            for i in range(num_envs):
-                if not done[i] or env_ep_ids[i] >= episodes:
-                    continue
-
-                ep_id = env_ep_ids[i]
-
-                # Save video
-                if videos[i]:
-                    mediapy.write_video(
-                        run_folder / f"episode_{ep_id}.mp4",
-                        videos[i],
-                        fps=15,
+                    # Log to CSV
+                    progress = rew[i].item() if isinstance(rew, torch.Tensor) else float(rew[i])
+                    episode_data = {
+                        "episode": ep_id,
+                        "episode_length": int(ep_steps[i]),
+                        "progress": progress,
+                    }
+                    episode_df = pd.concat(
+                        [episode_df, pd.DataFrame([episode_data])], ignore_index=True
                     )
+                    episode_df.to_csv(csv_path, index=False)
+                    print(f"Episode {ep_id} finished. Length: {ep_steps[i]}, Progress: {progress:.4f}")
+                    bar.update(1)
 
-                # Log to CSV
-                episode_data = {
-                    "episode": ep_id,
-                    "episode_length": int(ep_steps[i]),
-                    "progress": float(last_rew[i]),
-                }
-                episode_df = pd.concat(
-                    [episode_df, pd.DataFrame([episode_data])], ignore_index=True
-                )
-                episode_df.to_csv(csv_path, index=False)
-                print(f"Episode {ep_id} finished. Length: {ep_steps[i]}, Progress: {last_rew[i]:.4f}")
-                bar.update(1)
+                    # Reset per-env state for next episode
+                    videos[i] = []
+                    ep_steps[i] = 0
+                    client.reset(env_ids=[i])
 
-                # Reset per-env state for next episode
-                videos[i] = []
-                ep_steps[i] = 0
-                client.reset(env_ids=[i])
-
-                # Assign next episode to this env slot
-                next_ep_id = len(episode_df)
-                env_ep_ids[i] = next_ep_id
+                    # Assign next episode to this env slot
+                    next_ep_id = len(episode_df)
+                    env_ep_ids[i] = next_ep_id
 
     bar.close()
     env.close()
