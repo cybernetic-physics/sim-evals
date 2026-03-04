@@ -1,5 +1,20 @@
 # DROID Sim Evaluation
 
+```bash
+# run one at a time
+CUDA_VISIBLE_DEVICES=0 uv run run_eval_lw.py --environment BlockStack --run-folder runs/blockstack --num-envs 3 --episodes 6
+CUDA_VISIBLE_DEVICES=0 uv run run_eval_lw.py --environment FoodBussing --run-folder runs/foodbussing --num-envs 3 --episodes 6
+CUDA_VISIBLE_DEVICES=0 uv run run_eval_lw.py --environment PanClean --run-folder runs/panclean --num-envs 3 --episodes 6
+
+
+# separate pane
+git clone git@github.com:arhanjain/openpi.git openpi-arhan
+cd openpi-arhan
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 CUDA_VISIBLE_DEVICES=1  uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_droid_jointpos_polaris --policy.dir=gs://openpi-assets/checkpoints/pi05_droid_jointpos
+
+```
+
 This repository contains scripts for evaluating DROID policies in a simple ISAAC Sim environment.
 
 Here is an example rollout of a pi0-FAST-DROID policy:
