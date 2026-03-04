@@ -53,7 +53,7 @@ class Client(InferenceClient):
             }
             new_chunks = self.client.infer(request_data)["actions"]  # (num_envs, chunk_len, action_dim)
             if self._action_chunks is None:
-                self._action_chunks = new_chunks
+                self._action_chunks = new_chunks.copy()
                 self._chunk_counters[:] = 0
             else:
                 # Only update envs that needed new chunks

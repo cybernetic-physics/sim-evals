@@ -293,13 +293,34 @@ class reset_initial_conditions(ManagerTermBase):
             print(f"No initial conditions found. Objects will be reset to default poses.")
             return
 
-        initial_condition = self.initial_conditions[self.current_index % len(self.initial_conditions)]
-        print(f"Resetting to initial condition #{self.current_index % len(self.initial_conditions)}")
-        for obj, pose in initial_condition.items():
-            pose = torch.tensor(pose)[None]
-            env.scene[obj].write_root_pose_to_sim(pose)
+        # Ensure env_ids is a tensor
+        if not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.tensor(env_ids, device=env.device)
+        num_resets = len(env_ids)
 
-        self.current_index += 1
+        # Get ICs for each env being reset
+        ic_indices = [(self.current_index + i) % len(self.initial_conditions) for i in range(num_resets)]
+        print(f"Resetting envs {env_ids.cpu().tolist()} to initial conditions {ic_indices}")
+
+        # Get env origins for all envs being reset
+        env_origins = env.scene.env_origins[env_ids]  # (num_resets, 3)
+
+        # Collect all object names (assume all ICs have same objects)
+        obj_names = list(self.initial_conditions[0].keys())
+
+        # Batch write per object
+        for obj in obj_names:
+            poses = []
+            for i in range(num_resets):
+                pose = self.initial_conditions[ic_indices[i]][obj]
+                poses.append(pose)
+            poses = torch.tensor(poses, device=env.device)  # (num_resets, 7)
+            # Add env origin offset to positions
+            poses[:, :3] += env_origins
+            env.scene[obj].write_root_pose_to_sim(poses, env_ids=env_ids)
+
+        # Advance counter by number of envs reset
+        self.current_index += num_resets
 
 @configclass
 class EventCfg:

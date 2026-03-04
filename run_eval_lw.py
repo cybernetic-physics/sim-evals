@@ -87,15 +87,8 @@ def main(
             obs, rew, term, trunc, info = env.step(action)
             ep_steps += 1
 
-            # Check which envs are done
-            # if isinstance(term, torch.Tensor):
-            #     done = (term | trunc).detach().cpu().numpy().flatten().astype(bool)
-            # else:
-            #     done = np.array(term | trunc, dtype=bool).flatten()
-            # done |= ep_steps >= max_steps
-
             if term.any() or trunc.any():
-                done_ids = (term | trunc).nonzero().flatten()
+                done_ids = (term | trunc).nonzero().flatten().cpu().tolist()
                 for i in done_ids:
                     ep_id = env_ep_ids[i]
 
@@ -127,7 +120,7 @@ def main(
                     client.reset(env_ids=[i])
 
                     # Assign next episode to this env slot
-                    next_ep_id = len(episode_df)
+                    next_ep_id = env_ep_ids.max() + 1
                     env_ep_ids[i] = next_ep_id
 
     bar.close()

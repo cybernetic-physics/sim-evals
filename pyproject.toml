@@ -8,14 +8,16 @@ dependencies = [
   "pip>=25.0",
   "mediapy>=1.2.4",
   "openpi-client",
-  "isaaclab[all,isaacsim]==2.2.0",
+  "isaaclab[all,isaacsim]==2.3.0",
   "tyro>=0.9.17",
   "websockets>=16.0",
 ]
 
 [tool.uv]
 override-dependencies = [
-  "websockets>=16.0"
+  "pywin32==306; sys_platform == 'win32'",
+  "websockets>=16.0",
+  "flatdict==4.1.0"
 ]
 
 [tool.uv.sources]
