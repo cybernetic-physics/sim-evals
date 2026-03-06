@@ -303,6 +303,16 @@ class EnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_heap_capacity = 2**30
         self.sim.physx.gpu_collision_stack_size = 2**30
         self.rerender_on_reset = True
+        self.wait_for_textures = True
+
+        # overwrite carb settings
+        carb_settings = self.sim.render.carb_settings if self.sim.render.carb_settings is not None else {}
+        carb_settings["rtx.post.tonemap.op"] = "Iray"
+        carb_settings["rtx/post/tonemap/irayReinhard/crushBlacks"] = 0.2
+        carb_settings["rtx/post/tonemap/irayReinhard/burnHighlights"] = 0.1
+        carb_settings["rtx/post/tonemap/enableSrgbToGamma"] = False
+        carb_settings["rtx/post/tonemap/cm2Factor"] = 1.2
+        self.sim.render.carb_settings = carb_settings
 
     
     def set_scene(self, scene_name: str):

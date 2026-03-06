@@ -8,14 +8,13 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 
-from sim_evals.inference.droid_jointpos import Client as DroidJointPosClient
 
 def main(
         environment: str,
         run_folder: Path,
         episodes: int = 3,
         num_envs: int = 1,
-        headless: bool = True,
+        headless: bool = False,
         ):
     # launch omniverse app with arguments (inside function to prevent overriding tyro)
     from isaaclab.app import AppLauncher
@@ -63,7 +62,6 @@ def main(
     obs, info = env.reset()
     instruction = info["instruction"]
     print(f"Instruction: {instruction}")
-    client = DroidJointPosClient(num_envs=num_envs)
 
     max_steps = env.unwrapped.max_episode_length
 
@@ -77,52 +75,8 @@ def main(
     bar = tqdm(total=episodes - next_ep_id, desc="Episodes completed")
 
     with torch.no_grad():
-        while next_ep_id < episodes:
-            ret = client.infer(obs, instruction=[instruction] * num_envs)
-            action = torch.tensor(ret["action"], dtype=torch.float32)  # (num_envs, action_dim)
-            for i in range(num_envs):
-                if env_ep_ids[i] < episodes:
-                    videos[i].append(ret["viz"][i])
-
-            obs, rew, term, trunc, info = env.step(action)
-            ep_steps += 1
-
-            if term.any() or trunc.any():
-                done_ids = (term | trunc).nonzero().flatten().cpu().tolist()
-                for i in done_ids:
-                    ep_id = env_ep_ids[i]
-
-                    # Save video
-                    if videos[i]:
-                        mediapy.write_video(
-                            run_folder / f"episode_{ep_id}.mp4",
-                            videos[i],
-                            fps=15,
-                        )
-
-                    # Log to CSV
-                    progress = rew[i].item() if isinstance(rew, torch.Tensor) else float(rew[i])
-                    episode_data = {
-                        "episode": ep_id,
-                        "episode_length": int(ep_steps[i]),
-                        "progress": progress,
-                    }
-                    episode_df = pd.concat(
-                        [episode_df, pd.DataFrame([episode_data])], ignore_index=True
-                    )
-                    episode_df.to_csv(csv_path, index=False)
-                    print(f"Episode {ep_id} finished. Length: {ep_steps[i]}, Progress: {progress:.4f}")
-                    bar.update(1)
-
-                    # Reset per-env state for next episode
-                    videos[i] = []
-                    ep_steps[i] = 0
-                    client.reset(env_ids=[i])
-
-                    # Assign next episode to this env slot
-                    next_ep_id = env_ep_ids.max() + 1
-                    env_ep_ids[i] = next_ep_id
-
+        while True:
+            env.unwrapped.sim.render()
     bar.close()
     env.close()
     simulation_app.close()

@@ -1,6 +1,15 @@
 # DROID Sim Evaluation
 
 ```bash
+# QUICK TEST (for LW)
+uvx hf download owhan/DROID-sim-environments --repo-type dataset --local-dir assets
+uv run run_eval_lw_test.py --environment Test --run-folder runs/test
+```
+
+
+
+
+```bash
 # run one at a time
 CUDA_VISIBLE_DEVICES=0 uv run run_eval_lw.py --environment BlockStack --run-folder runs/blockstack --num-envs 3 --episodes 6
 CUDA_VISIBLE_DEVICES=0 uv run run_eval_lw.py --environment FoodBussing --run-folder runs/foodbussing --num-envs 3 --episodes 6

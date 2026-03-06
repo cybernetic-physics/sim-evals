@@ -21,6 +21,15 @@ gym.register(
 
 
 # TODO: check that final points are awarded when object is not grasped
+gym.register(
+    id="Test",
+    entry_point=DynamicManagerBasedRLEnv,
+    kwargs={
+        "env_cfg_entry_point": LWEnvCfg,
+        "usd_file": str(DATA_PATH / "scene1.usd"),
+    },
+    disable_env_checker=True,
+)
 
 gym.register(
     id="BlockStack",
