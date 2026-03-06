@@ -15,9 +15,10 @@ class DynamicManagerBasedRLEnv(ManagerBasedRLEnv):
         **kwargs,
     ):
         self.usd_file = usd_file
+        self.instruction = ""
         cfg.dynamic_setup(usd_file=usd_file, progress_criteria=progress_criteria)
 
-        if usd_file is not None:
+        if usd_file is not None and (Path(usd_file).parent / "initial_conditions.json").exists():
             with open(Path(usd_file).parent / "initial_conditions.json", "r") as f:
                 self.instruction = json.load(f)["instruction"]
 

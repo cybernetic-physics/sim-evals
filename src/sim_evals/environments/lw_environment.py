@@ -9,7 +9,7 @@ from functools import partial
 
 from typing import List
 from pathlib import Path
-from pxr import Usd, UsdPhysics
+from pxr import Usd, UsdPhysics, Gf
 
 from isaaclab.envs.mdp.actions.actions_cfg import BinaryJointPositionActionCfg
 from isaaclab.envs.mdp.actions.binary_joint_actions import BinaryJointPositionAction
@@ -113,6 +113,7 @@ class SceneCfg(InteractiveSceneCfg):
     def dynamic_setup(self, usd_file: str, **kwargs):
         environment_path_ = Path(usd_file)
         environment_path = str(environment_path_.resolve())
+        print(f"Setting up scene from {environment_path}")
 
         self.scene = AssetBaseCfg(
             prim_path="{ENV_REGEX_NS}/scene",
@@ -131,13 +132,27 @@ class SceneCfg(InteractiveSceneCfg):
             if UsdPhysics.RigidBodyAPI(child) or any([UsdPhysics.RigidBodyAPI(c) for c in child.GetChildren()]):
                 print(f"Rigid Body: {name}")
                 pos = child.GetAttribute("xformOp:translate").Get()
-                rot = child.GetAttribute("xformOp:orient").Get()
-                rot = (
-                    rot.GetReal(),
-                    rot.GetImaginary()[0],
-                    rot.GetImaginary()[1],
-                    rot.GetImaginary()[2],
-                )
+                # Try orient (quaternion) first, fallback to rotateXYZ (Euler degrees)
+                orient_val = child.GetAttribute("xformOp:orient").Get()
+                if orient_val is not None:
+                    rot = (
+                        orient_val.GetReal(),
+                        orient_val.GetImaginary()[0],
+                        orient_val.GetImaginary()[1],
+                        orient_val.GetImaginary()[2],
+                    )
+                else:
+                    rotate_val = child.GetAttribute("xformOp:rotateXYZ").Get()
+                    if rotate_val is not None:
+                        # Euler XYZ in degrees -> quaternion via composed Gf.Rotations
+                        rx = Gf.Rotation(Gf.Vec3d(1, 0, 0), rotate_val[0])
+                        ry = Gf.Rotation(Gf.Vec3d(0, 1, 0), rotate_val[1])
+                        rz = Gf.Rotation(Gf.Vec3d(0, 0, 1), rotate_val[2])
+                        combined = rz * ry * rx
+                        q = combined.GetQuat()
+                        rot = (q.GetReal(), q.GetImaginary()[0], q.GetImaginary()[1], q.GetImaginary()[2])
+                    else:
+                        rot = (1.0, 0.0, 0.0, 0.0)
                 asset = RigidObjectCfg(
                     prim_path=f"{{ENV_REGEX_NS}}/scene/{name}",
                     spawn=None,
@@ -328,13 +343,14 @@ class EventCfg:
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
 
     def dynamic_setup(self, usd_file: str, **kwargs):
-        self.reset_initial_conditions = EventTerm(
-            func=reset_initial_conditions, 
-            mode="reset",
-            params={
-                "initial_conditions_file": Path(usd_file).parent / "initial_conditions.json",
-            }
-        )
+        if (Path(usd_file).parent / "initial_conditions.json").exists():
+            self.reset_initial_conditions = EventTerm(
+                func=reset_initial_conditions, 
+                mode="reset",
+                params={
+                    "initial_conditions_file": Path(usd_file).parent / "initial_conditions.json",
+                }
+            )
 
 @configclass
 class CommandsCfg:
@@ -346,13 +362,14 @@ class RewardsCfg:
     """Reward terms for the MDP."""
 
     def dynamic_setup(self, progress_criteria: list[tuple[Any, list[int]]], **kwargs):
-        self.progress = RewTerm(
-            func=mdp.rubric_reward,
-            weight=1.0,
-            params=dict(
-                criteria=progress_criteria,
+        if progress_criteria is not None:
+            self.progress = RewTerm(
+                func=mdp.rubric_reward,
+                weight=1.0,
+                params=dict(
+                    criteria=progress_criteria,
+                )
             )
-        )
 
 @configclass
 class TerminationsCfg:
@@ -393,6 +410,15 @@ class EnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_collision_stack_size = 2**30
         self.wait_for_textures = True
         self.rerender_on_reset = True
+
+        # overwrite carb settings
+        carb_settings = self.sim.render.carb_settings if self.sim.render.carb_settings is not None else {}
+        carb_settings["rtx.post.tonemap.op"] = "Iray"
+        carb_settings["rtx/post/tonemap/irayReinhard/crushBlacks"] = 0.2
+        carb_settings["rtx/post/tonemap/irayReinhard/burnHighlights"] = 0.1
+        carb_settings["rtx/post/tonemap/enableSrgbToGamma"] = False
+        carb_settings["rtx/post/tonemap/cm2Factor"] = 1.2
+        self.sim.render.carb_settings = carb_settings
 
     
     def dynamic_setup(self, **kwargs):

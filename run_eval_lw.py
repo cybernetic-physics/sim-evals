@@ -85,6 +85,8 @@ def main(
                     videos[i].append(ret["viz"][i])
 
             obs, rew, term, trunc, info = env.step(action)
+            while True:
+                env.unwrapped.sim.render()
             ep_steps += 1
 
             if term.any() or trunc.any():

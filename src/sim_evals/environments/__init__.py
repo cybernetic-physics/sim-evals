@@ -79,7 +79,7 @@ gym.register(
     entry_point=DynamicManagerBasedRLEnv,
     kwargs={
         "env_cfg_entry_point": LWEnvCfg,
-        "usd_file": str(DATA_PATH / "RA_LW_Scene/OrganizeTools_Sence/OrganizeTools_Sence.usd"),
+        "usd_file": str(DATA_PATH / "OrganizeTools_Sence/scene.usda"),
     },
     disable_env_checker=True,
 )
@@ -89,7 +89,7 @@ gym.register(
     entry_point=DynamicManagerBasedRLEnv,
     kwargs={
         "env_cfg_entry_point": LWEnvCfg,
-        "usd_file": str(DATA_PATH / "RA_LW_Scene/MoveLatteCup_Sence/MoveLatteCup_Sence.usd"),
+        "usd_file": str(DATA_PATH / "RA_LW_Scene/MoveLatteCup_Sence/scene.usda"),
     },
     disable_env_checker=True,
 )
@@ -99,7 +99,7 @@ gym.register(
     entry_point=DynamicManagerBasedRLEnv,
     kwargs={
         "env_cfg_entry_point": LWEnvCfg,
-        "usd_file": str(DATA_PATH / "RA_LW_Scene/TapeIntoContainer_Scene/TapeIntoContainer_Scene.usd"),
+        "usd_file": str(DATA_PATH / "TapeIntoContainer_Scene/scene.usda"),
     },
     disable_env_checker=True,
 )
