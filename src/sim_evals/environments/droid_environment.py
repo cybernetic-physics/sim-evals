@@ -303,7 +303,9 @@ class EnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_heap_capacity = 2**30
         self.sim.physx.gpu_collision_stack_size = 2**30
         self.rerender_on_reset = True
+
         self.wait_for_textures = True
+        self.rerender_on_reset = True
 
         # overwrite carb settings
         carb_settings = self.sim.render.carb_settings if self.sim.render.carb_settings is not None else {}

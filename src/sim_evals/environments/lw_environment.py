@@ -54,7 +54,7 @@ class SceneCfg(InteractiveSceneCfg):
             vertical_aperture=3.024,
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.05, 0.57, 0.66), rot=(-0.393, -0.195, 0.399, 0.805), convention="opengl"
+            pos=(0.15, 0.4, 0.55), rot=(-0.393, -0.195, 0.399, 0.805), convention="opengl"
         ),
     )
 
@@ -70,7 +70,7 @@ class SceneCfg(InteractiveSceneCfg):
             vertical_aperture=3.024,
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.05, -0.57, 0.66), rot=(0.805, 0.399, -0.195, -0.393), convention="opengl"
+            pos=(0.15, -0.4, 0.55), rot=(0.805, 0.399, -0.195, -0.393), convention="opengl"
         ),
     )
 
