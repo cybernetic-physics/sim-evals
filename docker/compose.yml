@@ -1,0 +1,37 @@
+services:
+  sim-eval-runtime:
+    image: sim-eval-image
+    container_name: sim-eval-runtime
+    build:
+      context: ../                            
+      dockerfile: docker/Dockerfile   
+
+    # Interactive shell
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+
+
+    # GPU access
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+
+    # Networking
+    network_mode: host
+
+    # Environment variables
+    environment:
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "Y"
+      PYTHONPATH: "/workspace/sim-evals/src:${PYTHONPATH}"
+    # Volumes (exact mapping)
+    volumes:
+      - ~/docker/isaac-sim/cache:/.venv/lib/python3.11/site-packages/isaacsim/kit/cache:rw 
+      - ~/docker/isaac-sim/data:/.venv/lib/python3.11/site-packages/isaacsim/kit/data:rw
+
+       # Bind current working directory into /workspace
+      - ${PWD}:/workspace/sim-evals:rw
