@@ -98,7 +98,7 @@ gym.register(
     entry_point=DynamicManagerBasedRLEnv,
     kwargs={
         "env_cfg_entry_point": LWEnvCfg,
-        "usd_file": str(DATA_PATH / "RA_LW_Scene/MoveLatteCup_Sence/scene.usda"),
+        "usd_file": str(DATA_PATH / "MoveLatteCup_Sence/scene.usda"),
     },
     disable_env_checker=True,
 )

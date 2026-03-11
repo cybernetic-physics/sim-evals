@@ -413,11 +413,12 @@ class EnvCfg(ManagerBasedRLEnvCfg):
 
         # overwrite carb settings
         carb_settings = self.sim.render.carb_settings if self.sim.render.carb_settings is not None else {}
-        carb_settings["rtx.post.tonemap.op"] = "Iray"
+        carb_settings["rtx.post.tonemap.op"] = 7
         carb_settings["rtx/post/tonemap/irayReinhard/crushBlacks"] = 0.2
         carb_settings["rtx/post/tonemap/irayReinhard/burnHighlights"] = 0.1
         carb_settings["rtx/post/tonemap/enableSrgbToGamma"] = False
         carb_settings["rtx/post/tonemap/cm2Factor"] = 1.2
+        carb_settings["rtx/raytracing/fractionalCutoutOpacity"] = True
         self.sim.render.carb_settings = carb_settings
 
     
