@@ -1150,7 +1150,7 @@ wheels = [
 [[package]]
 name = "isaaclab"
 version = "2.3.0"
-source = { registry = "https://pypi.org/simple" }
+source = { registry = "https://pypi.nvidia.com/" }
 dependencies = [
     { name = "einops" },
     { name = "flaky" },
@@ -1181,9 +1181,9 @@ dependencies = [
     { name = "warp-lang" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b1/f6/a0d4db75d6c6a69b150b833a4bb99eb2aea6302f5419a5a766343025919f/isaaclab-2.3.0-cp311-none-manylinux_2_35_aarch64.whl", hash = "sha256:d4278fbf2bd0b96835016098853c07058eacd89d076f40c896d853e02db7b1e8", size = 2746901, upload-time = "2025-10-28T20:53:20.68Z" },
-    { url = "https://files.pythonhosted.org/packages/80/b5/908cb670aae465c20d51bbeb60f682fd6366837016e212f9536fa68e466d/isaaclab-2.3.0-cp311-none-manylinux_2_35_x86_64.whl", hash = "sha256:6fa943792f3771e6358023af1f8a88d486afbc126a774db09c4bd4123756db74", size = 2746900, upload-time = "2025-10-28T20:52:48.028Z" },
-    { url = "https://files.pythonhosted.org/packages/3c/ed/a3e3ae855cba6fc096214618bb41f21c291d2f7b7732f45bb08b859d6f50/isaaclab-2.3.0-cp311-none-win_amd64.whl", hash = "sha256:c88737e7d27fe608cfeb77ae49cb999bd237b99f5553b20185b29eada14cd838", size = 2761982, upload-time = "2025-10-28T20:54:18.058Z" },
+    { url = "https://pypi.nvidia.com/isaaclab/isaaclab-2.3.0-cp311-none-manylinux_2_35_aarch64.whl", hash = "sha256:d4278fbf2bd0b96835016098853c07058eacd89d076f40c896d853e02db7b1e8" },
+    { url = "https://pypi.nvidia.com/isaaclab/isaaclab-2.3.0-cp311-none-manylinux_2_35_x86_64.whl", hash = "sha256:6fa943792f3771e6358023af1f8a88d486afbc126a774db09c4bd4123756db74" },
+    { url = "https://pypi.nvidia.com/isaaclab/isaaclab-2.3.0-cp311-none-win_amd64.whl", hash = "sha256:c88737e7d27fe608cfeb77ae49cb999bd237b99f5553b20185b29eada14cd838" },
 ]
 
 [package.optional-dependencies]
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "isaaclab", extras = ["all", "isaacsim"], specifier = "==2.3.0" },
+    { name = "isaaclab", extras = ["all", "isaacsim"], specifier = "==2.3.0", index = "https://pypi.nvidia.com/" },
     { name = "mediapy", specifier = ">=1.2.4" },
     { name = "openpi-client", git = "https://github.com/Physical-Intelligence/openpi.git?subdirectory=packages%2Fopenpi-client" },
     { name = "pip", specifier = ">=25.0" },
