@@ -1,7 +1,9 @@
 import tyro
 import numpy as np
 from PIL import Image
-from openpi_client import websocket_client_policy, image_tools
+# from openpi_client import websocket_client_policy, image_tools
+from openpi_client import image_tools
+from .test import WebsocketClientPolicy
 
 from .abstract_client import InferenceClient
 
@@ -16,7 +18,8 @@ class Client(InferenceClient):
     ) -> None:
         self.open_loop_horizon = open_loop_horizon
         self.num_envs = num_envs
-        self.client = websocket_client_policy.WebsocketClientPolicy(
+        # self.client = websocket_client_policy.WebsocketClientPolicy(
+        self.client = WebsocketClientPolicy(
             remote_host, remote_port
         )
 

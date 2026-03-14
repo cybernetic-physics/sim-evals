@@ -89,6 +89,11 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": LWEnvCfg,
         "usd_file": str(DATA_PATH / "OrganizeTools_Sence/scene.usda"),
+        "progress_criteria": [
+            mdp.reach("Scissor052", threshold=0.2),
+            (mdp.lift("Scissor052", threshold=0.04), [0]),
+            (mdp.point_in_obb("Scissor052", "Box191", check_axes=(0, 1)), [1]),
+        ]
     },
     disable_env_checker=True,
 )
@@ -99,6 +104,11 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": LWEnvCfg,
         "usd_file": str(DATA_PATH / "MoveLatteCup_Sence/scene.usda"),
+        "progress_criteria": [
+            mdp.reach("Cup063_02", threshold=0.2),
+            (mdp.lift("Cup063_02", threshold=0.04), [0]),
+            (mdp.point_in_obb("Cup063_02", "ChoppingBoard001_02", check_axes=(0, 1)), [1]),
+        ]
     },
     disable_env_checker=True,
 )
@@ -109,6 +119,62 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": LWEnvCfg,
         "usd_file": str(DATA_PATH / "TapeIntoContainer_Scene/scene.usda"),
+        "progress_criteria": [
+            mdp.reach("PackagingTape011", threshold=0.2),
+            (mdp.lift("PackagingTape011", threshold=0.04), [0]),
+            (mdp.point_in_obb("PackagingTape011", "Box193", check_axes=(0, 1)), [1]),
+        ]
     },
     disable_env_checker=True,
 )
+
+# gym.register(
+#     id="DROID-MoveLatteCup",
+#     entry_point=ManagerBasedRLSplatEnv,
+#     disable_env_checker=True,
+#     order_enforce=False,
+#     kwargs={
+#         "env_cfg_entry_point": DroidCfg,
+#         "usd_file": str(DATA_PATH / "move_latte_cup/scene.usda"),
+#         "rubric": Rubric(
+#             criteria=[
+#                 checkers.reach("latteartcup_eval", threshold=0.2),
+#                 (checkers.lift("latteartcup_eval", threshold=0.04), [0]),
+#                 (checkers.is_within_xy("latteartcup_eval", "cuttingboard_eval", percent_threshold=0.8), [1]),
+#             ]
+#         ),
+#     },
+# )
+
+# gym.register(
+#     id="DROID-OrganizeTools",
+#     entry_point=ManagerBasedRLSplatEnv,
+#     disable_env_checker=True,
+#     order_enforce=False,
+#     kwargs={
+#         "env_cfg_entry_point": DroidCfg,
+#         "usd_file": str(DATA_PATH / "organize_tools/scene.usda"),
+#         "rubric": Rubric(
+#             criteria=[
+#                 checkers.reach("scissor", threshold=0.2),
+#                 (checkers.lift("scissor", threshold=0.04), [0]),
+#                 (checkers.is_within_xy("scissor", "container_01", percent_threshold=0.8), [1]),
+#             ]
+#         ),
+#     },
+# )
+
+# gym.register(
+#     id="DROID-TapeIntoContainer",
+#     entry_point=ManagerBasedRLSplatEnv,
+#     disable_env_checker=True,
+#     order_enforce=False,
+#     kwargs={
+#         "env_cfg_entry_point": DroidCfg,
+#         "usd_file": str(DATA_PATH / "tape_into_container/scene.usda"),
+#         "rubric": Rubric(
+#             criteria=[
+#                 checkers.reach("tape_00", threshold=0.2),
+#                 (checkers.lift("tape_00", threshold=0.04), [0]),
+#                 (checkers.is_within_xy("tape_00", "container_02", percent_threshold=0.8), [1]),
+#             ]

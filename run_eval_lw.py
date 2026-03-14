@@ -16,6 +16,8 @@ def main(
         episodes: int = 3,
         num_envs: int = 1,
         headless: bool = True,
+        policy_host: str = "localhost",
+        policy_port: int = 8000,
         ):
     # launch omniverse app with arguments (inside function to prevent overriding tyro)
     from isaaclab.app import AppLauncher
@@ -63,7 +65,11 @@ def main(
     obs, info = env.reset()
     instruction = info["instruction"]
     print(f"Instruction: {instruction}")
-    client = DroidJointPosClient(num_envs=num_envs)
+    client = DroidJointPosClient(
+        remote_host=policy_host,
+        remote_port=policy_port,
+        num_envs=num_envs,
+    )
 
     max_steps = env.unwrapped.max_episode_length
 
