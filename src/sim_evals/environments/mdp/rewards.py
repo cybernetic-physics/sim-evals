@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import numpy as np
 from typing import Callable
 import isaacsim.core.utils.bounds as bounds_utils
 from isaaclab.envs import ManagerBasedRLEnv
@@ -41,7 +42,7 @@ def lift(obj_name, threshold=0.05, default_height=None):
     return checker
 
 
-def point_in_obb(obj_name, receptacle_name, check_axes=(0, 1, 2)):
+def point_in_obb(obj_name, receptacle_name, check_axes=(0, 1, 2), require_gripper_open=False, gripper_open_threshold=0.05):
     """Returns a checker: (env) -> (num_envs,) bool tensor.
 
     Tests if obj's centroid is inside receptacle's OBB.
@@ -51,6 +52,9 @@ def point_in_obb(obj_name, receptacle_name, check_axes=(0, 1, 2)):
         obj_name: Scene entity name of the object whose centroid is tested.
         receptacle_name: Scene entity name of the receptacle whose OBB defines the region.
         check_axes: OBB axis indices to check. Default (0, 1, 2) = all three.
+        require_gripper_open: If True, only counts when gripper is open.
+        gripper_open_threshold: Gripper joint pos (normalized 0-1) below which
+            the gripper is considered open. Default 0.1.
     """
     _obb_cache = {}
 
@@ -71,13 +75,22 @@ def point_in_obb(obj_name, receptacle_name, check_axes=(0, 1, 2)):
             receptacle.data.root_quat_w,
             env.num_envs,
         )
-        return _check_point_in_obb(
+        inside = _check_point_in_obb(
             env.scene[obj_name].data.root_pos_w,
             centroids_w,
             axes_w,
             _obb_cache["half_extents"],
             check_axes=check_axes,
         )
+
+        if require_gripper_open:
+            robot = env.scene["robot"]
+            finger_idx = robot.data.joint_names.index("finger_joint")
+            gripper_pos = robot.data.joint_pos[:, finger_idx] / (np.pi / 4)  # normalize to 0-1
+            gripper_open = gripper_pos < gripper_open_threshold
+            inside = inside & gripper_open
+
+        return inside
 
     return checker
 

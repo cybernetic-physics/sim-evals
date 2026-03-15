@@ -38,13 +38,13 @@ gym.register(
         "env_cfg_entry_point": LWEnvCfg,
         "usd_file": str(DATA_PATH / "lw_block_stack/scene.usda"),
         "progress_criteria": [
-            mdp.reach("green_cube", threshold=0.2),
-            mdp.reach("wood_cube", threshold=0.2),
-            (mdp.lift("green_cube", default_height=0.06, threshold=0.03), [0]),
-            (mdp.lift("wood_cube", default_height=0.06, threshold=0.03), [1]),
-            (mdp.point_in_obb("green_cube", "tray", check_axes=(0, 1)), [2]),
-            (mdp.point_in_obb("wood_cube", "tray", check_axes=(0, 1)), [3]),
-            (mdp.point_in_obb("green_cube", "wood_cube", check_axes=(0, 1)), [4, 5]),
+            # mdp.reach("green_cube", threshold=0.2),
+            # mdp.reach("wood_cube", threshold=0.2),
+            # (mdp.lift("green_cube", default_height=0.06, threshold=0.03), [0]),
+            # (mdp.lift("wood_cube", default_height=0.06, threshold=0.03), [1]),
+            mdp.point_in_obb("green_cube", "tray", check_axes=(0, 1), require_gripper_open=True),
+            mdp.point_in_obb("wood_cube", "tray", check_axes=(0, 1), require_gripper_open=True),
+            (mdp.point_in_obb("green_cube", "wood_cube", check_axes=(0, 1), require_gripper_open=True), [0, 1]),
         ]
     },
     disable_env_checker=True,
@@ -57,12 +57,12 @@ gym.register(
         "env_cfg_entry_point": LWEnvCfg,
         "usd_file": str(DATA_PATH / "lw_food_bus/scene.usda"),
         "progress_criteria": [
-            mdp.reach("ice_cream_", threshold=0.2),
-            mdp.reach("grapes", threshold=0.2),
-            (mdp.lift("ice_cream_", threshold=0.06), [0]),
-            (mdp.lift("grapes", threshold=0.06), [1]),
-            (mdp.point_in_obb("ice_cream_", "bowl", check_axes=(0, 1, 2)), [2]),
-            (mdp.point_in_obb("grapes", "bowl", check_axes=(0, 1, 2)), [3]),
+            # mdp.reach("ice_cream_", threshold=0.2),
+            # mdp.reach("grapes", threshold=0.2),
+            # (mdp.lift("ice_cream_", threshold=0.06), [0]),
+            # (mdp.lift("grapes", threshold=0.06), [1]),
+            mdp.point_in_obb("ice_cream_", "bowl", check_axes=(0, 1, 2), require_gripper_open=True),
+            mdp.point_in_obb("grapes", "bowl", check_axes=(0, 1, 2), require_gripper_open=True),
         ]
     },
     disable_env_checker=True,
@@ -75,9 +75,9 @@ gym.register(
         "env_cfg_entry_point": LWEnvCfg,
         "usd_file": str(DATA_PATH / "lw_pan_clean/scene.usda"),
         "progress_criteria": [
-            mdp.reach("sponge", threshold=0.2),
-            (mdp.lift("sponge", threshold=0.09, default_height=0.0), [0]),
-            (mdp.point_in_obb("sponge", "pan", check_axes=(0, 1)), [1]),
+            # mdp.reach("sponge", threshold=0.2),
+            # (mdp.lift("sponge", threshold=0.09, default_height=0.0), [0]),
+            mdp.point_in_obb("sponge", "pan", check_axes=(0, 1), require_gripper_open=True),
         ]
     },
     disable_env_checker=True,
@@ -90,9 +90,9 @@ gym.register(
         "env_cfg_entry_point": LWEnvCfg,
         "usd_file": str(DATA_PATH / "OrganizeTools_Sence/scene.usda"),
         "progress_criteria": [
-            mdp.reach("Scissor052", threshold=0.2),
-            (mdp.lift("Scissor052", threshold=0.04), [0]),
-            (mdp.point_in_obb("Scissor052", "Box191", check_axes=(0, 1)), [1]),
+            # mdp.reach("Scissor052", threshold=0.2),
+            # (mdp.lift("Scissor052", threshold=0.04), [0]),
+            mdp.point_in_obb("Scissor052", "Box191", check_axes=(0, 1), require_gripper_open=True),
         ]
     },
     disable_env_checker=True,
@@ -105,9 +105,9 @@ gym.register(
         "env_cfg_entry_point": LWEnvCfg,
         "usd_file": str(DATA_PATH / "MoveLatteCup_Sence/scene.usda"),
         "progress_criteria": [
-            mdp.reach("Cup063_02", threshold=0.2),
-            (mdp.lift("Cup063_02", threshold=0.04), [0]),
-            (mdp.point_in_obb("Cup063_02", "ChoppingBoard001_02", check_axes=(0, 1)), [1]),
+            # mdp.reach("Cup063_02", threshold=0.2),
+            # (mdp.lift("Cup063_02", threshold=0.04), [0]),
+            mdp.point_in_obb("Cup063_02", "ChoppingBoard001_02", check_axes=(0, 1), require_gripper_open=True),
         ]
     },
     disable_env_checker=True,
@@ -120,9 +120,9 @@ gym.register(
         "env_cfg_entry_point": LWEnvCfg,
         "usd_file": str(DATA_PATH / "TapeIntoContainer_Scene/scene.usda"),
         "progress_criteria": [
-            mdp.reach("PackagingTape011", threshold=0.2),
-            (mdp.lift("PackagingTape011", threshold=0.04), [0]),
-            (mdp.point_in_obb("PackagingTape011", "Box193", check_axes=(0, 1)), [1]),
+            # mdp.reach("PackagingTape011", threshold=0.2),
+            # (mdp.lift("PackagingTape011", threshold=0.04), [0]),
+            mdp.point_in_obb("PackagingTape011", "Box193", check_axes=(0, 1), require_gripper_open=True),
         ]
     },
     disable_env_checker=True,
