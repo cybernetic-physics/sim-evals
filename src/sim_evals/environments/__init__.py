@@ -75,9 +75,7 @@ gym.register(
         "env_cfg_entry_point": LWEnvCfg,
         "usd_file": str(DATA_PATH / "lw_pan_clean/scene.usda"),
         "progress_criteria": [
-            # mdp.reach("sponge", threshold=0.2),
-            # (mdp.lift("sponge", threshold=0.09, default_height=0.0), [0]),
-            mdp.point_in_obb("sponge", "pan", check_axes=(0, 1), require_gripper_open=True),
+            mdp.proximity("sponge", "pan", threshold=0.1, check_axes=(0, 1), require_gripper_open=False),
         ]
     },
     disable_env_checker=True,

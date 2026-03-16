@@ -28,6 +28,41 @@ def reach(obj_name, threshold=0.05):
     return checker
 
 
+def proximity(obj_name, target_name, threshold=0.1, check_axes=(0, 1), require_gripper_open=False, gripper_open_threshold=0.05):
+    """Returns a checker: (env) -> (num_envs,) bool tensor.
+
+    Tests if obj's centroid is within threshold distance of target's centroid
+    along the specified axes.
+
+    Args:
+        obj_name: Scene entity name of the object to test.
+        target_name: Scene entity name of the target object.
+        threshold: Maximum distance along checked axes.
+        check_axes: Which world axes to check distance on. Default (0, 1) = XY.
+        require_gripper_open: If True, only counts when gripper is open.
+        gripper_open_threshold: Gripper joint pos (normalized 0-1) below which
+            the gripper is considered open.
+    """
+
+    def checker(env):
+        obj_pos = env.scene[obj_name].data.root_pos_w  # (num_envs, 3)
+        target_pos = env.scene[target_name].data.root_pos_w  # (num_envs, 3)
+        diff = obj_pos - target_pos
+        axes = list(check_axes)
+        dist = torch.norm(diff[:, axes], dim=-1)
+        result = dist < threshold
+
+        if require_gripper_open:
+            robot = env.scene["robot"]
+            finger_idx = robot.data.joint_names.index("finger_joint")
+            gripper_pos = robot.data.joint_pos[:, finger_idx] / (np.pi / 4)
+            result = result & (gripper_pos < gripper_open_threshold)
+
+        return result
+
+    return checker
+
+
 def lift(obj_name, threshold=0.05, default_height=None):
     """Returns a checker: (env) -> (num_envs,) bool tensor."""
     _default_height = default_height
@@ -75,20 +110,35 @@ def point_in_obb(obj_name, receptacle_name, check_axes=(0, 1, 2), require_grippe
             receptacle.data.root_quat_w,
             env.num_envs,
         )
+        obj_pos = env.scene[obj_name].data.root_pos_w
         inside = _check_point_in_obb(
-            env.scene[obj_name].data.root_pos_w,
+            obj_pos,
             centroids_w,
             axes_w,
             _obb_cache["half_extents"],
             check_axes=check_axes,
         )
 
+        # Debug
+        if env.episode_length_buf[0] % 100 == 0:
+            d = obj_pos - centroids_w
+            proj = torch.abs(torch.bmm(d.unsqueeze(1), axes_w.transpose(1, 2)).squeeze(1))
+            he = _obb_cache["half_extents"]
+            print(f"[point_in_obb] {obj_name}->{receptacle_name}: "
+                  f"obj={obj_pos[0].tolist()}, center={centroids_w[0].tolist()}, "
+                  f"proj={proj[0].tolist()}, he={he.tolist()}, inside={inside[0].item()}", end="")
+
         if require_gripper_open:
             robot = env.scene["robot"]
             finger_idx = robot.data.joint_names.index("finger_joint")
             gripper_pos = robot.data.joint_pos[:, finger_idx] / (np.pi / 4)  # normalize to 0-1
             gripper_open = gripper_pos < gripper_open_threshold
+            if env.episode_length_buf[0] % 100 == 0:
+                print(f", gripper={gripper_pos[0].item():.3f}, open={gripper_open[0].item()}", end="")
             inside = inside & gripper_open
+
+        if env.episode_length_buf[0] % 100 == 0:
+            print(f", final={inside[0].item()}")
 
         return inside
 
@@ -115,7 +165,7 @@ def _check_point_in_obb(
         Boolean tensor (num_envs,).
     """
     d = points - centroids  # (num_envs, 3)
-    projections = torch.abs(torch.bmm(d.unsqueeze(1), axes).squeeze(1))  # (num_envs, 3)
+    projections = torch.abs(torch.bmm(d.unsqueeze(1), axes.transpose(1, 2)).squeeze(1))  # (num_envs, 3)
     check = list(check_axes)
     return (projections[:, check] <= half_extents[check].unsqueeze(0)).all(dim=1)
 
@@ -133,8 +183,10 @@ def _compute_obb_body_frame(
     centroid_world, axes_world, half_extents = bounds_utils.compute_obb(bbox_cache, base_path)
 
     device = obj.device
-    pos_world = obj.data.root_pos_w[0]
-    quat_world = obj.data.root_quat_w[0]
+    # Use default root state (matches USD stage) rather than current root_pos_w
+    # (which may have been moved by initial conditions that the USD stage doesn't reflect)
+    pos_world = obj.data.default_root_state[0, :3]
+    quat_world = obj.data.default_root_state[0, 3:7]
 
     centroid_world_t = torch.tensor(centroid_world, device=device, dtype=torch.float32)
     axes_world_t = torch.tensor(axes_world, device=device, dtype=torch.float32)
