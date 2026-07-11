@@ -63,6 +63,44 @@ Finally, run the evaluation script:
 python run_eval.py --episodes [INT] --scene [INT] --headless
 ```
 
+Each run writes one result object per episode to both `episodes.jsonl` and
+`episodes.json` alongside the episode videos under `runs/`. Results include the
+selected backend, termination state, inference latency summary, and structured
+errors. The upstream environments define only a 30-second timeout, not a task
+success term. Results therefore leave `success` unset and record the start/end
+object-to-target center distance as a diagnostic rather than inventing a pass
+threshold.
+
+### DreamZero-DROID through Cybernetics
+
+Install the Cybernetics SDK, configure its normal environment-based
+authentication, and run:
+
+```bash
+python run_eval.py --backend cybernetics --episodes 10 --scene 1 --headless
+```
+
+No credential is accepted as a command-line argument. The integration assumes
+`ServiceClient.create_sampling_client(base_model="dreamzero-droid")` returns a
+sampling client with the typed DROID helper:
+
+```python
+observation = cybernetics.DroidObservation.from_numpy(...)
+future = sampler.sample_droid(observation)
+response = future.result(timeout=2400)
+```
+
+The observation carries both exterior cameras, the wrist camera, seven arm
+joint positions, one gripper position, and the natural-language instruction.
+The response exposes a robot-space `action_chunk` with shape `[1, N, 8]`; the
+evaluation follows DreamZero's eight-action open-loop cadence. Each episode gets
+a fresh sampling session and the previous session is cancelled so backend frame
+history and causal cache ownership are released.
+
+The `flatdict` build override in `pyproject.toml` pins its isolated build to a
+setuptools release that still provides the undeclared `pkg_resources` module
+required by IsaacLab's dependency.
+
 ## Minimal Example
 
 ```python
