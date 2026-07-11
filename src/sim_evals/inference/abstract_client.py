@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Any
 
 
 class InferenceClient(ABC):
@@ -25,3 +26,9 @@ class InferenceClient(ABC):
         """
         pass
 
+    def episode_metrics(self) -> dict[str, Any]:
+        """Return JSON-serializable metrics for the current episode."""
+        return {}
+
+    def close(self) -> None:
+        """Release client-owned resources."""
