@@ -133,6 +133,7 @@ def main(
     cybernetics_model_path: str | None = None,
     cybernetics_request_timeout: float = 2400.0,
     cybernetics_session_timeout: float = 2400.0,
+    device: str = "cuda:0",
 ) -> None:
     """Run DROID episodes and write ``episodes.jsonl`` plus ``episodes.json``."""
     if episodes < 1:
@@ -146,9 +147,12 @@ def main(
     args_cli, _ = parser.parse_known_args()
     args_cli.enable_cameras = True
     args_cli.headless = headless
+    args_cli.device = device
+    print(f"Launching Isaac Sim on {device}", flush=True)
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
 
+    print("Loading DROID environment", flush=True)
     import sim_evals.environments  # noqa: F401
     from isaaclab_tasks.utils import parse_env_cfg
 
@@ -162,8 +166,10 @@ def main(
     env_cfg.set_scene(scene)
     env = gym.make("DROID", cfg=env_cfg)
 
+    print("Rendering initial DROID observations", flush=True)
     obs, _ = env.reset()
     obs, _ = env.reset()  # A second render cycle loads scene materials correctly.
+    print(f"Creating {backend} inference client", flush=True)
     client = _create_client(
         backend,
         remote_host=remote_host,
@@ -181,6 +187,7 @@ def main(
     )
     result_writer = EpisodeResultWriter(run_dir)
     max_steps = env.env.max_episode_length
+    print(f"Starting {episodes} evaluation episode(s)", flush=True)
 
     try:
         with torch.no_grad():
