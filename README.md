@@ -80,6 +80,13 @@ authentication, and run:
 python run_eval.py --backend cybernetics --episodes 10 --scene 1 --headless
 ```
 
+On a multi-GPU evaluator, select the Isaac physics device explicitly. This is
+useful when another policy server already owns the default GPU:
+
+```bash
+python run_eval.py --backend cybernetics --episodes 10 --scene 1 --headless --device cuda:1
+```
+
 No credential is accepted as a command-line argument. The integration assumes
 `ServiceClient.create_sampling_client(base_model="dreamzero-droid")` returns a
 sampling client with the typed DROID helper:
