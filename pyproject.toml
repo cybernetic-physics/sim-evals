@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
   "pip>=25.0",
   "mediapy>=1.2.4",
+  "pillow>=10.0.0",
   "openpi-client",
   "isaaclab[all,isaacsim]==2.2.0",
   "tyro>=0.9.17",
@@ -44,6 +45,7 @@ explicit = true
 
 [tool.basedpyright]
 extraPaths = [
+    "./src",
     "./submodules/IsaacLab/source/isaaclab",
     "./submodules/IsaacLab/source/isaaclab_assets",
     "./submodules/IsaacLab/source/isaaclab_tasks"

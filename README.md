@@ -108,6 +108,45 @@ The `flatdict` build override in `pyproject.toml` pins its isolated build to a
 setuptools release that still provides the undeclared `pkg_resources` module
 required by IsaacLab's dependency.
 
+### Hosted Cybernetic Physics DROID E2E
+
+`run_hosted_eval.py` keeps simulation and policy execution on their intended
+planes:
+
+- Cybernetic Physics launches the configured environment and owns every
+  `isaac.*` MCP scene read, camera capture, joint write, and simulation step.
+- DGX Spark is the sole DreamZero execution plane. The runner calls the public
+  Cybernetics `sample_droid` helper and does not load DreamZero into Isaac.
+
+Use a Cybernetics SDK release that provides
+`cybernetics.sim.SimulationClient.mcp_session`. Authenticate with the normal
+SDK login or environment-based credential flow; this runner deliberately has
+no credential arguments. The environment URI can be passed directly or through
+`CYBERNETICS_DROID_ENV_URI`:
+
+```bash
+export CYBERNETICS_DROID_ENV_URI=cybernetics://envs/ENV_ID/versions/VERSION_ID
+python run_hosted_eval.py --max-action-steps 450
+```
+
+The environment bundle should contain the three task scenes and the DROID USD
+at `/data/workspace/franka_robotiq_2f_85_flattened.usd`. Override the latter
+when the bundle uses another workspace path:
+
+```bash
+python run_hosted_eval.py \
+  --environment-uri cybernetics://envs/ENV_ID/versions/VERSION_ID \
+  --robot-usd-path /data/workspace/assets/droid.usd \
+  --instruction "put the can in the mug"
+```
+
+After the hosted session reaches the running state, the runner opens its MCP
+session and polls `isaac.get_scene_info` until the extension is ready. It then
+validates or reloads the DROID articulation, creates any missing exterior/wrist
+cameras, captures RGB PNG artifacts, reads named joint positions, samples one
+DreamZero action chunk, and applies up to eight actions before observing again.
+Sessions are stopped on success or failure unless `--keep-session` is set.
+
 ## Minimal Example
 
 ```python
