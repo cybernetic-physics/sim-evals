@@ -6,9 +6,13 @@ import base64
 import io
 import json
 import math
+import os
 import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Mapping, Protocol, cast
 
 import numpy as np
@@ -36,6 +40,14 @@ class SimulationLaunch(Protocol):
 class SimulationClientAPI(Protocol):
     def launch(self, environment_uri: str, **kwargs: Any) -> SimulationLaunch: ...
 
+    def wait_for_session(
+        self,
+        session_id: str,
+        *,
+        timeout_seconds: float,
+        poll_interval_seconds: float,
+    ) -> Mapping[str, Any]: ...
+
     def mcp_session(self, session_id: str) -> AbstractContextManager[MCPClient]: ...
 
     def stop_session(self, session_id: str) -> None: ...
@@ -51,6 +63,7 @@ class CameraSpec:
 @dataclass(frozen=True)
 class HostedDroidConfig:
     environment_uri: str
+    session_id: str | None = None
     instruction: str = "put the cube in the bowl"
     robot_prim_path: str = "/World/robot"
     robot_usd_path: str = "/data/workspace/franka_robotiq_2f_85_flattened.usd"
@@ -78,15 +91,19 @@ class HostedDroidConfig:
     max_action_steps: int = 450
     open_loop_horizon: int = 8
     physics_steps_per_action: int = 8
+    runtime_provider: str | None = None
     request_timeout_seconds: float = 2400.0
     launch_timeout_seconds: float = 1200.0
     readiness_timeout_seconds: float = 600.0
     readiness_poll_seconds: float = 5.0
     keep_session: bool = False
+    results_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.environment_uri.strip():
             raise ValueError("environment_uri must not be empty")
+        if self.session_id is not None and not self.session_id.strip():
+            raise ValueError("session_id must not be empty")
         if not self.instruction.strip():
             raise ValueError("instruction must not be empty")
         if len(self.cameras) != 3:
@@ -120,9 +137,96 @@ class HostedDroidRunResult:
         }
 
 
+_EVIDENCE_SCHEMA_VERSION = 1
+_EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
+
+
+class _EvidenceRecorder:
+    def __init__(self, results_dir: Path, config: HostedDroidConfig) -> None:
+        self.results_dir = results_dir
+        self.frames_dir = results_dir / "frames"
+        self.started_at = _utc_now()
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.frames_dir.mkdir(parents=True, exist_ok=True)
+        self._clear_previous_evidence()
+        self._write_json(
+            self.results_dir / "config.json",
+            {
+                "schema_version": _EVIDENCE_SCHEMA_VERSION,
+                "created_at": self.started_at,
+                "config": _config_dict(config),
+            },
+        )
+
+    def write_frame(self, sample_index: int, camera_index: int, raw: bytes) -> None:
+        name = _evidence_frame_name(sample_index, camera_index)
+        _atomic_write(self.frames_dir / name, raw)
+
+    def write_result(self, result: HostedDroidRunResult) -> None:
+        self._write_json(
+            self.results_dir / "result.json",
+            {
+                "schema_version": _EVIDENCE_SCHEMA_VERSION,
+                "status": "succeeded",
+                "started_at": self.started_at,
+                "finished_at": _utc_now(),
+                "result": result.to_dict(),
+                "evidence": self._evidence_dict(),
+            },
+        )
+
+    def write_error(self, error: BaseException, session_id: str | None) -> None:
+        payload: dict[str, Any] = {
+            "schema_version": _EVIDENCE_SCHEMA_VERSION,
+            "status": "failed",
+            "started_at": self.started_at,
+            "finished_at": _utc_now(),
+            "error": {
+                "type": type(error).__name__,
+                "message": str(error),
+            },
+            "evidence": self._evidence_dict(),
+        }
+        if session_id is not None:
+            payload["session_id"] = session_id
+        self._write_json(self.results_dir / "error.json", payload)
+
+    def _clear_previous_evidence(self) -> None:
+        for path in (
+            self.results_dir / "result.json",
+            self.results_dir / "error.json",
+        ):
+            path.unlink(missing_ok=True)
+        for path in self.frames_dir.glob("sample-*.png"):
+            path.unlink()
+
+    def _evidence_dict(self) -> dict[str, Any]:
+        frames = []
+        for path in sorted(self.frames_dir.glob("sample-*.png")):
+            stem = path.stem
+            sample_index = int(stem.split("-", 2)[1])
+            camera_name = stem.split("-", 2)[2]
+            frames.append(
+                {
+                    "sample_index": sample_index,
+                    "camera": camera_name,
+                    "path": str(path.relative_to(self.results_dir)),
+                }
+            )
+        return {"frames": frames}
+
+    @staticmethod
+    def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+        encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+        _atomic_write(path, encoded)
+
+
 ARM_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
 GRIPPER_JOINT_NAME = "finger_joint"
 GRIPPER_CLOSED_RADIANS = math.pi / 4
+_CAMERA_CAPTURE_ATTEMPTS = 10
+_CAMERA_CAPTURE_RETRY_STEPS = 2
+_CAMERA_CAPTURE_RETRY_SECONDS = 0.5
 
 
 class HostedDroidRunner:
@@ -144,41 +248,74 @@ class HostedDroidRunner:
         self._sleep = sleep
 
     def run(self) -> HostedDroidRunResult:
-        launch: SimulationLaunch | None = None
+        evidence = (
+            _EvidenceRecorder(self.config.results_dir, self.config)
+            if self.config.results_dir is not None
+            else None
+        )
+        session_id = self.config.session_id
+        owns_session = False
         try:
-            launch = self.simulation_client.launch(
-                self.config.environment_uri,
-                wait=True,
-                timeout_seconds=self.config.launch_timeout_seconds,
-                poll_interval_seconds=self.config.readiness_poll_seconds,
-            )
-            mcp_session = getattr(self.simulation_client, "mcp_session", None)
-            if not callable(mcp_session):
-                raise HostedDroidError(
-                    "Cybernetics SimulationClient must expose mcp_session(session_id)"
+            try:
+                if session_id is None:
+                    launch_kwargs: dict[str, Any] = {
+                        "wait": True,
+                        "timeout_seconds": self.config.launch_timeout_seconds,
+                        "poll_interval_seconds": self.config.readiness_poll_seconds,
+                    }
+                    if self.config.runtime_provider is not None:
+                        launch_kwargs["runtime_provider"] = self.config.runtime_provider
+                    launch = self.simulation_client.launch(
+                        self.config.environment_uri,
+                        **launch_kwargs,
+                    )
+                    session_id = launch.session_id
+                    owns_session = True
+                else:
+                    self.simulation_client.wait_for_session(
+                        session_id,
+                        timeout_seconds=self.config.launch_timeout_seconds,
+                        poll_interval_seconds=self.config.readiness_poll_seconds,
+                    )
+                mcp_session = getattr(self.simulation_client, "mcp_session", None)
+                if not callable(mcp_session):
+                    raise HostedDroidError(
+                        "Cybernetics SimulationClient must expose "
+                        "mcp_session(session_id)"
+                    )
+                mcp_session = cast(
+                    Callable[[str], AbstractContextManager[MCPClient]], mcp_session
                 )
-            mcp_session = cast(
-                Callable[[str], AbstractContextManager[MCPClient]], mcp_session
-            )
-            with mcp_session(launch.session_id) as mcp:
-                self._wait_for_isaac(mcp)
-                repaired_robot = self._ensure_robot(mcp)
-                created_cameras = self._ensure_cameras(mcp)
-                joint_indices = self._joint_indices(mcp)
-                self._call(mcp, "isaac.play_simulation", {})
-                self.sampling_api.reset_sampling_session()
-                samples, action_steps = self._rollout(mcp, joint_indices)
-            return HostedDroidRunResult(
-                session_id=launch.session_id,
-                samples=samples,
-                action_steps=action_steps,
-                repaired_robot=repaired_robot,
-                created_cameras=tuple(created_cameras),
-            )
-        finally:
-            self.sampling_api.close()
-            if launch is not None and not self.config.keep_session:
-                self.simulation_client.stop_session(launch.session_id)
+                with mcp_session(session_id) as mcp:
+                    self._wait_for_isaac(mcp)
+                    repaired_robot = self._ensure_robot(mcp)
+                    created_cameras = self._ensure_cameras(mcp)
+                    joint_indices = self._joint_indices(mcp)
+                    self._call(mcp, "isaac.play_simulation", {})
+                    self.sampling_api.reset_sampling_session()
+                    samples, action_steps = self._rollout(mcp, joint_indices, evidence)
+                result = HostedDroidRunResult(
+                    session_id=session_id,
+                    samples=samples,
+                    action_steps=action_steps,
+                    repaired_robot=repaired_robot,
+                    created_cameras=tuple(created_cameras),
+                )
+            finally:
+                self.sampling_api.close()
+                if (
+                    owns_session
+                    and session_id is not None
+                    and not self.config.keep_session
+                ):
+                    self.simulation_client.stop_session(session_id)
+        except BaseException as exc:
+            if evidence is not None:
+                evidence.write_error(exc, session_id)
+            raise
+        if evidence is not None:
+            evidence.write_result(result)
+        return result
 
     def _wait_for_isaac(self, mcp: MCPClient) -> None:
         deadline = self._monotonic() + self.config.readiness_timeout_seconds
@@ -298,11 +435,12 @@ class HostedDroidRunner:
         self,
         mcp: MCPClient,
         joint_indices: tuple[list[int], int],
+        evidence: _EvidenceRecorder | None = None,
     ) -> tuple[int, int]:
         samples = 0
         action_steps = 0
         while action_steps < self.config.max_action_steps:
-            observation = self._observation(mcp, joint_indices, samples)
+            observation = self._observation(mcp, joint_indices, samples, evidence)
             response = self.sampling_api.sample_droid(
                 observation,
                 timeout=self.config.request_timeout_seconds,
@@ -321,9 +459,16 @@ class HostedDroidRunner:
         mcp: MCPClient,
         joint_indices: tuple[list[int], int],
         sample_index: int,
+        evidence: _EvidenceRecorder | None = None,
     ) -> DroidObservation:
         images = [
-            self._capture_rgb(mcp, camera.prim_path, sample_index, camera_index)
+            self._capture_rgb(
+                mcp,
+                camera.prim_path,
+                sample_index,
+                camera_index,
+                evidence,
+            )
             for camera_index, camera in enumerate(self.config.cameras)
         ]
         positions_payload = self._call(
@@ -359,28 +504,49 @@ class HostedDroidRunner:
         camera_prim_path: str,
         sample_index: int,
         camera_index: int,
+        evidence: _EvidenceRecorder | None = None,
     ) -> np.ndarray:
         output_path = (
             f"/data/workspace/media/droid-{sample_index:05d}-{camera_index}.png"
         )
-        capture = self._call(
-            mcp,
-            "isaac.capture_camera_image",
-            {"prim_path": camera_prim_path, "output_path": output_path},
-        )
-        encoded = _encoded_image(capture)
-        if encoded is None:
-            artifact_path = capture.get("output_path", output_path)
-            artifact = self._call(
-                mcp,
-                "isaac.download_artifact",
-                {"path": artifact_path},
-            )
-            encoded = _encoded_image(artifact)
+        encoded: str | None = None
+        last_error: HostedDroidError | None = None
+        for attempt in range(1, _CAMERA_CAPTURE_ATTEMPTS + 1):
+            try:
+                capture = self._call(
+                    mcp,
+                    "isaac.capture_camera_image",
+                    {"prim_path": camera_prim_path, "output_path": output_path},
+                )
+                encoded = _encoded_image(capture)
+                if encoded is None:
+                    artifact_path = capture.get("output_path", output_path)
+                    artifact = self._call(
+                        mcp,
+                        "isaac.download_artifact",
+                        {"path": artifact_path},
+                    )
+                    encoded = _encoded_image(artifact)
+                if encoded is not None:
+                    break
+                raise HostedDroidError(
+                    f"Isaac did not return RGB bytes for camera {camera_prim_path}"
+                )
+            except HostedDroidError as exc:
+                last_error = exc
+                if attempt == _CAMERA_CAPTURE_ATTEMPTS:
+                    break
+                self._call(
+                    mcp,
+                    "isaac.step_simulation",
+                    {"num_steps": _CAMERA_CAPTURE_RETRY_STEPS},
+                )
+                self._sleep(_CAMERA_CAPTURE_RETRY_SECONDS)
         if encoded is None:
             raise HostedDroidError(
-                f"Isaac did not return RGB bytes for camera {camera_prim_path}"
-            )
+                f"camera {camera_prim_path} did not produce a rendered frame after "
+                f"{_CAMERA_CAPTURE_ATTEMPTS} attempts: {last_error}"
+            ) from last_error
         try:
             raw = base64.b64decode(encoded, validate=True)
             with Image.open(io.BytesIO(raw)) as image:
@@ -389,6 +555,8 @@ class HostedDroidRunner:
             raise HostedDroidError(
                 f"invalid RGB artifact for camera {camera_prim_path}: {exc}"
             ) from exc
+        if evidence is not None:
+            evidence.write_frame(sample_index, camera_index, raw)
         return np.ascontiguousarray(rgb)
 
     def _apply_action(
@@ -486,3 +654,56 @@ def _encoded_image(payload: Mapping[str, Any]) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
+    return {
+        "environment_uri": config.environment_uri,
+        "session_id": config.session_id,
+        "instruction": config.instruction,
+        "robot_prim_path": config.robot_prim_path,
+        "robot_usd_path": config.robot_usd_path,
+        "cameras": [
+            {
+                "prim_path": camera.prim_path,
+                "position": list(camera.position),
+                "rotation_degrees": list(camera.rotation_degrees),
+            }
+            for camera in config.cameras
+        ],
+        "image_width": config.image_width,
+        "image_height": config.image_height,
+        "max_action_steps": config.max_action_steps,
+        "open_loop_horizon": config.open_loop_horizon,
+        "physics_steps_per_action": config.physics_steps_per_action,
+        "runtime_provider": config.runtime_provider,
+        "request_timeout_seconds": config.request_timeout_seconds,
+        "launch_timeout_seconds": config.launch_timeout_seconds,
+        "readiness_timeout_seconds": config.readiness_timeout_seconds,
+        "readiness_poll_seconds": config.readiness_poll_seconds,
+        "keep_session": config.keep_session,
+        "results_dir": str(config.results_dir) if config.results_dir else None,
+    }
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _evidence_frame_name(sample_index: int, camera_index: int) -> str:
+    return f"sample-{sample_index:05d}-{_EVIDENCE_CAMERA_NAMES[camera_index]}.png"
+
+
+def _atomic_write(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
