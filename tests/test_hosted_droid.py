@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import traceback
 import unittest
 from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timezone
@@ -234,8 +235,14 @@ class FakeMCP:
 
 
 class FakeSimulationClient:
-    def __init__(self, mcp: FakeMCP) -> None:
+    def __init__(
+        self,
+        mcp: FakeMCP,
+        *,
+        stop_error: Exception | None = None,
+    ) -> None:
         self.mcp = mcp
+        self.stop_error = stop_error
         self.launch_calls: list[tuple[str, dict[str, Any]]] = []
         self.stopped: list[str] = []
         self.mcp_session_ids: list[str] = []
@@ -259,11 +266,17 @@ class FakeSimulationClient:
 
     def stop_session(self, session_id: str) -> None:
         self.stopped.append(session_id)
+        if self.stop_error is not None:
+            raise self.stop_error
 
 
 class FakeSampler:
     def __init__(
-        self, *, error: Exception | None = None, response: Any | None = None
+        self,
+        *,
+        error: Exception | None = None,
+        response: Any | None = None,
+        close_error: Exception | None = None,
     ) -> None:
         self.observations: list[DroidObservation] = []
         self.timeouts: list[float | None] = []
@@ -271,6 +284,7 @@ class FakeSampler:
         self.closed = False
         self.error = error
         self.response = response
+        self.close_error = close_error
 
     def reset_sampling_session(self) -> None:
         self.reset_calls += 1
@@ -298,6 +312,8 @@ class FakeSampler:
 
     def close(self) -> None:
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class HostedDroidRunnerTest(unittest.TestCase):
@@ -437,6 +453,84 @@ class HostedDroidRunnerTest(unittest.TestCase):
 
         self.assertTrue(sampler.closed)
         self.assertEqual(simulation.stopped, [])
+
+    def test_stop_conflict_does_not_mask_readiness_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "stop-conflict"
+            simulation = FakeSimulationClient(
+                FakeMCP(readiness_failures=10),
+                stop_error=RuntimeError("HTTP 409: session is already failed"),
+            )
+            sampler = FakeSampler()
+            times = iter([0.0, 1.0])
+            runner = HostedDroidRunner(
+                simulation,
+                sampler,
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    readiness_timeout_seconds=0.5,
+                    keep_session=False,
+                    results_dir=results_dir,
+                ),
+                monotonic=lambda: next(times),
+                sleep=lambda _: None,
+            )
+
+            try:
+                runner.run()
+            except HostedDroidError as exc:
+                message = str(exc)
+                traceback_functions = [
+                    frame.name for frame in traceback.extract_tb(exc.__traceback__)
+                ]
+            else:
+                self.fail("readiness failure was not raised")
+
+            self.assertIn("Isaac MCP was not ready", message)
+            self.assertEqual(traceback_functions[-1], "_wait_for_isaac")
+            self.assertNotIn("stop_session", traceback_functions)
+            self.assertTrue(sampler.closed)
+            self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
+            payload = json.loads((results_dir / "error.json").read_text())
+            self.assertEqual(payload["error"]["type"], "HostedDroidError")
+            self.assertIn("Isaac MCP was not ready", payload["error"]["message"])
+            self.assertEqual(
+                payload["evidence_errors"],
+                [
+                    "session stop failed: RuntimeError: "
+                    "HTTP 409: session is already failed"
+                ],
+            )
+
+    def test_failed_run_still_stops_session_after_sampler_close_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "close-failure"
+            simulation = FakeSimulationClient(FakeMCP(readiness_failures=10))
+            sampler = FakeSampler(close_error=RuntimeError("close failed"))
+            times = iter([0.0, 1.0])
+            runner = HostedDroidRunner(
+                simulation,
+                sampler,
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    readiness_timeout_seconds=0.5,
+                    keep_session=False,
+                    results_dir=results_dir,
+                ),
+                monotonic=lambda: next(times),
+                sleep=lambda _: None,
+            )
+
+            with self.assertRaisesRegex(HostedDroidError, "Isaac MCP was not ready"):
+                runner.run()
+
+            self.assertTrue(sampler.closed)
+            self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
+            payload = json.loads((results_dir / "error.json").read_text())
+            self.assertEqual(
+                payload["evidence_errors"],
+                ["sampling API close failed: RuntimeError: close failed"],
+            )
 
     def test_configuration_rejects_invalid_rollout_shape(self) -> None:
         with self.assertRaisesRegex(ValueError, "environment_uri"):
