@@ -32,6 +32,8 @@ class CyberneticsSDKDroidSamplingAPI:
         base_model: str = "dreamzero-droid",
         model_path: str | None = None,
         session_timeout: float = 2400.0,
+        policy_mode: str = "native",
+        include_predicted_video: bool = False,
     ) -> None:
         try:
             from cybernetics import DroidObservation as SDKDroidObservation
@@ -47,6 +49,10 @@ class CyberneticsSDKDroidSamplingAPI:
         self._base_model = base_model
         self._model_path = model_path
         self._session_timeout = session_timeout
+        if policy_mode not in {"native", "sde"}:
+            raise ValueError("policy_mode must be native or sde")
+        self._policy_mode = policy_mode
+        self._include_predicted_video = include_predicted_video
         self._sampling_client: Any | None = None
 
     def reset_sampling_session(self) -> None:
@@ -79,7 +85,11 @@ class CyberneticsSDKDroidSamplingAPI:
             gripper_position=observation.gripper_position,
             instruction=observation.instruction,
         )
-        result = sample(sdk_observation)
+        result = sample(
+            sdk_observation,
+            policy_mode=self._policy_mode,
+            include_predicted_video=self._include_predicted_video,
+        )
         if hasattr(result, "result"):
             return result.result(timeout=timeout)
         return result

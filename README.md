@@ -194,9 +194,21 @@ python run_hosted_eval.py \
 
 After the hosted session reaches the running state, the runner opens its MCP
 session and polls `isaac.get_scene_info` until the extension is ready. It then
-validates or reloads the DROID articulation, creates any missing exterior/wrist
-cameras, captures RGB PNG artifacts, reads named joint positions, samples one
-DreamZero action chunk, and applies up to eight actions before observing again.
+validates or reloads the DROID articulation, creates a fresh evaluator-owned
+generation of exterior/wrist cameras, captures RGB PNG artifacts, reads named
+joint positions, samples one DreamZero action chunk, and applies up to eight
+actions before observing again. Fresh camera paths avoid stale path-keyed render
+products on older hosted images; the extension also releases those cached
+wrappers when cameras are replaced or deleted. The runner selects the first
+external camera for the streamed viewer through `isaac.set_active_camera`, with
+an `isaac.execute_script` compatibility fallback for older hosted images. This
+viewer selection does not change any DROID observation camera pose or pixels.
+Explicit pre-dispatch `BRIDGE_OFFLINE` and `ISAAC_UNREACHABLE` responses are
+retried with the configured readiness poll interval. Other command failures are
+not replayed, so ambiguous or application-level errors still fail closed. An
+HTTP 502 is replayed only for absolute `isaac.set_joint_positions` targets,
+where sending the identical target again is idempotent; non-idempotent simulation
+steps still fail closed on transport ambiguity.
 Sessions launched successfully by the evaluator remain running after the
 rollout. Use `--stop-session` to opt into cleanup. Attached sessions always
 remain caller-owned.
@@ -210,7 +222,10 @@ is visible beside the session id.
 
 The runner writes `config.json` before launching the hosted session. During
 each observation it preserves the exact PNG bytes already downloaded through
-MCP for all three DROID camera roles. It then atomically writes one terminal
+MCP for all three DROID camera roles. Captures must be 640x360 and contain
+meaningful luminance variance plus both non-dark and non-white content; black,
+blank, clipped-sliver, and render-race frames retry and then fail closed before
+DreamZero is called. The runner then atomically writes one terminal
 record: `result.json` after success or `error.json` after failure. Errors include
 the exception type and message, plus the hosted session ID when launch reached
 that point. The evidence layout is:
@@ -218,18 +233,24 @@ that point. The evidence layout is:
 ```text
 <results-dir>/
 |-- config.json
+|-- actions.jsonl                       # sample chunks and applied actions
 |-- result.json                         # success only
 |-- error.json                          # failure only
-`-- frames/
+|-- frames/
     |-- sample-00000-exterior-1.png
     |-- sample-00000-exterior-2.png
     |-- sample-00000-wrist.png
     `-- sample-00001-*.png               # one triplet per later observation
+`-- samples/
+    |-- sample-00000-predicted-video.npy # when requested
+    `-- sample-00000-sde-trajectory.npz  # SDE tensor-map artifacts
 ```
 
-`config.json`, `result.json`, and `error.json` are versioned, machine-readable
-JSON. A failure after camera capture retains any frames already written, and its
-`evidence.frames` list names the files that are actually present.
+`config.json`, `result.json`, `error.json`, and every JSONL record are versioned
+and machine-readable. Each sample record contains the complete action chunk;
+each action is appended and `fsync`'d only after its MCP application succeeds.
+A failure therefore retains the exact partial action history and any frames or
+tensor artifacts already written.
 
 ## Minimal Example
 

@@ -35,6 +35,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-action-steps", type=int, default=450)
     parser.add_argument("--open-loop-horizon", type=int, default=8)
     parser.add_argument("--physics-steps-per-action", type=int, default=8)
+    parser.add_argument("--policy-mode", choices=("native", "sde"), default="native")
+    parser.add_argument(
+        "--include-predicted-video",
+        action="store_true",
+        help="request and archive DreamZero's bounded future-video prediction",
+    )
     parser.add_argument(
         "--runtime-provider",
         choices=("warm_pool", "vast"),
@@ -107,6 +113,8 @@ def main() -> None:
         open_loop_horizon=args.open_loop_horizon,
         physics_steps_per_action=args.physics_steps_per_action,
         runtime_provider=args.runtime_provider,
+        policy_mode=args.policy_mode,
+        include_predicted_video=args.include_predicted_video,
         request_timeout_seconds=args.request_timeout_seconds,
         launch_timeout_seconds=args.launch_timeout_seconds,
         readiness_timeout_seconds=args.readiness_timeout_seconds,
@@ -116,6 +124,8 @@ def main() -> None:
     sampler = CyberneticsSDKDroidSamplingAPI(
         base_model="dreamzero-droid",
         session_timeout=args.request_timeout_seconds,
+        policy_mode=args.policy_mode,
+        include_predicted_video=args.include_predicted_video,
     )
     with SimulationClient() as simulation_client:
         result = HostedDroidRunner(simulation_client, sampler, config).run()

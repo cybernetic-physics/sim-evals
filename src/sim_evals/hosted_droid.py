@@ -8,6 +8,7 @@ import json
 import math
 import os
 import time
+import uuid
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -23,6 +24,16 @@ from .inference.cybernetics_dreamzero import (
     _action_chunk,
 )
 from .inference.droid_observation import DroidObservation
+
+_TRANSIENT_MCP_FAILURE_MARKERS = (
+    "BRIDGE_OFFLINE",
+    "ISAAC_UNREACHABLE",
+    "Isaac Sim MCP extension is not ready yet",
+    "No bridge connected",
+)
+_IDEMPOTENT_TRANSPORT_RETRY_TOOLS = frozenset({"isaac.set_joint_positions"})
+_TRANSIENT_TRANSPORT_FAILURE_MARKERS = ("HTTP 502",)
+_TRANSIENT_MCP_RETRIES = 12
 
 
 class HostedDroidError(RuntimeError):
@@ -57,7 +68,12 @@ class SimulationClientAPI(Protocol):
 class CameraSpec:
     prim_path: str
     position: tuple[float, float, float]
-    rotation_degrees: tuple[float, float, float]
+    orientation_wxyz: tuple[float, float, float, float]
+    focal_length: float
+    clipping_range: tuple[float, float] = (0.05, 100.0)
+    focus_distance: float = 28.0
+    horizontal_aperture: float = 5.376
+    vertical_aperture: float = 3.024
 
 
 @dataclass(frozen=True)
@@ -67,31 +83,15 @@ class HostedDroidConfig:
     instruction: str = "put the cube in the bowl"
     robot_prim_path: str = "/World/robot"
     robot_usd_path: str = "/data/workspace/franka_robotiq_2f_85_flattened.usd"
-    cameras: tuple[CameraSpec, ...] = field(
-        default_factory=lambda: (
-            CameraSpec(
-                "/World/external_cam",
-                (0.05, 0.57, 0.66),
-                (52.727, 0.019, -127.934),
-            ),
-            CameraSpec(
-                "/World/external_cam_2",
-                (0.05, -0.57, 0.66),
-                (52.727, -0.019, -52.039),
-            ),
-            CameraSpec(
-                "/World/robot/Gripper/Robotiq_2F_85/base_link/wrist_cam",
-                (0.011, -0.031, -0.074),
-                (-108.255, -1.007, 89.892),
-            ),
-        )
-    )
+    cameras: tuple[CameraSpec, ...] = field(default_factory=lambda: _default_cameras())
     image_width: int = 640
     image_height: int = 360
     max_action_steps: int = 450
     open_loop_horizon: int = 8
     physics_steps_per_action: int = 8
     runtime_provider: str | None = None
+    policy_mode: str = "native"
+    include_predicted_video: bool = False
     request_timeout_seconds: float = 2400.0
     launch_timeout_seconds: float = 1200.0
     readiness_timeout_seconds: float = 600.0
@@ -106,6 +106,8 @@ class HostedDroidConfig:
             raise ValueError("session_id must not be empty")
         if not self.instruction.strip():
             raise ValueError("instruction must not be empty")
+        if self.policy_mode not in {"native", "sde"}:
+            raise ValueError("policy_mode must be native or sde")
         if len(self.cameras) != 3:
             raise ValueError("DROID requires exactly three RGB cameras")
         for name, value in (
@@ -139,7 +141,7 @@ class HostedDroidRunResult:
         }
 
 
-_EVIDENCE_SCHEMA_VERSION = 1
+_EVIDENCE_SCHEMA_VERSION = 2
 _EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
 
 
@@ -147,9 +149,13 @@ class _EvidenceRecorder:
     def __init__(self, results_dir: Path, config: HostedDroidConfig) -> None:
         self.results_dir = results_dir
         self.frames_dir = results_dir / "frames"
+        self.samples_dir = results_dir / "samples"
+        self.actions_path = results_dir / "actions.jsonl"
+        self._action_record_count = 0
         self.started_at = _utc_now()
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.frames_dir.mkdir(parents=True, exist_ok=True)
+        self.samples_dir.mkdir(parents=True, exist_ok=True)
         self._clear_previous_evidence()
         self._write_json(
             self.results_dir / "config.json",
@@ -163,6 +169,95 @@ class _EvidenceRecorder:
     def write_frame(self, sample_index: int, camera_index: int, raw: bytes) -> None:
         name = _evidence_frame_name(sample_index, camera_index)
         _atomic_write(self.frames_dir / name, raw)
+
+    def write_sample(
+        self, sample_index: int, response: Any, action_chunk: np.ndarray
+    ) -> None:
+        record: dict[str, Any] = {
+            "schema_version": _EVIDENCE_SCHEMA_VERSION,
+            "record_type": "sample",
+            "sample_index": sample_index,
+            "action_chunk": action_chunk.astype(float).tolist(),
+        }
+        predicted_video = _response_field(response, "predicted_video")
+        if predicted_video is None:
+            predicted_video = _response_field(response, "video")
+        if predicted_video is not None:
+            array = _tensor_array(predicted_video, "predicted_video")
+            path = self.samples_dir / f"sample-{sample_index:05d}-predicted-video.npy"
+            output = io.BytesIO()
+            np.save(output, array, allow_pickle=False)
+            _atomic_write(path, output.getvalue())
+            record["predicted_video"] = {
+                "path": str(path.relative_to(self.results_dir)),
+                "shape": list(array.shape),
+                "dtype": str(array.dtype),
+            }
+
+        trajectory = _response_field(response, "trajectory")
+        if trajectory is not None:
+            if not isinstance(trajectory, list):
+                raise HostedDroidError("trajectory must be a list of tensor mappings")
+            arrays: dict[str, np.ndarray] = {}
+            steps: list[dict[str, Any]] = []
+            for step_index, step in enumerate(trajectory):
+                if not isinstance(step, Mapping):
+                    raise HostedDroidError(
+                        f"trajectory step {step_index} must be a tensor mapping"
+                    )
+                step_metadata: dict[str, Any] = {}
+                for key, value in step.items():
+                    array = _tensor_array(value, f"trajectory[{step_index}].{key}")
+                    archive_key = f"step_{step_index:03d}__{_archive_key(str(key))}"
+                    arrays[archive_key] = array
+                    step_metadata[str(key)] = {
+                        "archive_key": archive_key,
+                        "shape": list(array.shape),
+                        "dtype": str(array.dtype),
+                    }
+                steps.append(step_metadata)
+            path = self.samples_dir / f"sample-{sample_index:05d}-trajectory.npz"
+            output = io.BytesIO()
+            np.savez_compressed(output, **arrays)
+            _atomic_write(path, output.getvalue())
+            record["trajectory"] = {
+                "path": str(path.relative_to(self.results_dir)),
+                "steps": steps,
+            }
+        self._append_action_record(record)
+
+    def write_applied_action(
+        self,
+        *,
+        sample_index: int,
+        chunk_index: int,
+        action_index: int,
+        action: np.ndarray,
+    ) -> None:
+        self._append_action_record(
+            {
+                "schema_version": _EVIDENCE_SCHEMA_VERSION,
+                "record_type": "applied_action",
+                "sample_index": sample_index,
+                "chunk_index": chunk_index,
+                "action_index": action_index,
+                "action": action.astype(float).tolist(),
+            }
+        )
+
+    def _append_action_record(self, record: Mapping[str, Any]) -> None:
+        encoded = (json.dumps(record, sort_keys=True) + "\n").encode()
+        descriptor = os.open(
+            self.actions_path,
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o644,
+        )
+        try:
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        self._action_record_count += 1
 
     def write_result(self, result: HostedDroidRunResult) -> None:
         self._write_json(
@@ -197,9 +292,12 @@ class _EvidenceRecorder:
         for path in (
             self.results_dir / "result.json",
             self.results_dir / "error.json",
+            self.actions_path,
         ):
             path.unlink(missing_ok=True)
         for path in self.frames_dir.glob("sample-*.png"):
+            path.unlink()
+        for path in self.samples_dir.glob("sample-*.*"):
             path.unlink()
 
     def _evidence_dict(self) -> dict[str, Any]:
@@ -215,7 +313,21 @@ class _EvidenceRecorder:
                     "path": str(path.relative_to(self.results_dir)),
                 }
             )
-        return {"frames": frames}
+        sample_artifacts = [
+            str(path.relative_to(self.results_dir))
+            for path in sorted(self.samples_dir.glob("sample-*.*"))
+        ]
+        actions = None
+        if self.actions_path.is_file():
+            actions = {
+                "path": str(self.actions_path.relative_to(self.results_dir)),
+                "records": self._action_record_count,
+            }
+        return {
+            "frames": frames,
+            "actions": actions,
+            "sample_artifacts": sample_artifacts,
+        }
 
     @staticmethod
     def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -229,6 +341,39 @@ GRIPPER_CLOSED_RADIANS = math.pi / 4
 _CAMERA_CAPTURE_ATTEMPTS = 10
 _CAMERA_CAPTURE_RETRY_STEPS = 2
 _CAMERA_CAPTURE_RETRY_SECONDS = 0.5
+_CAMERA_WARMUP_STEPS = 32
+_CAMERA_WARMUP_SECONDS = 1.0
+_MIN_LUMINANCE_P99 = 12.0
+_MIN_LUMINANCE_STDDEV = 2.0
+_MIN_NON_DARK_FRACTION = 0.01
+_MIN_NON_WHITE_FRACTION = 0.02
+_NON_WHITE_LUMINANCE_CUTOFF = 245.0
+
+
+def _default_cameras() -> tuple[CameraSpec, ...]:
+    generation = uuid.uuid4().hex[:12]
+    external_root = f"/World/droid_eval_{generation}"
+    wrist_parent = "/World/robot/Gripper/Robotiq_2F_85/base_link"
+    return (
+        CameraSpec(
+            f"{external_root}/external_cam",
+            (0.05, 0.57, 0.66),
+            (-0.393, -0.195, 0.399, 0.805),
+            2.1,
+        ),
+        CameraSpec(
+            f"{external_root}/external_cam_2",
+            (0.05, -0.57, 0.66),
+            (0.805, 0.399, -0.195, -0.393),
+            2.1,
+        ),
+        CameraSpec(
+            f"{wrist_parent}/droid_eval_wrist_cam_{generation}",
+            (0.011, -0.031, -0.074),
+            (-0.420, 0.570, 0.576, -0.409),
+            2.8,
+        ),
+    )
 
 
 class HostedDroidRunner:
@@ -292,8 +437,15 @@ class HostedDroidRunner:
                     self._wait_for_isaac(mcp)
                     repaired_robot = self._ensure_robot(mcp)
                     created_cameras = self._ensure_cameras(mcp)
+                    self._set_viewer_camera(mcp, created_cameras[0])
                     joint_indices = self._joint_indices(mcp)
                     self._call(mcp, "isaac.play_simulation", {})
+                    self._call(
+                        mcp,
+                        "isaac.step_simulation",
+                        {"num_steps": _CAMERA_WARMUP_STEPS},
+                    )
+                    self._sleep(_CAMERA_WARMUP_SECONDS)
                     self.sampling_api.reset_sampling_session()
                     samples, action_steps = self._rollout(mcp, joint_indices, evidence)
                 result = HostedDroidRunResult(
@@ -386,31 +538,88 @@ class HostedDroidRunner:
     def _ensure_cameras(self, mcp: MCPClient) -> list[str]:
         created: list[str] = []
         for camera in self.config.cameras:
-            existing = self._try_call(
-                mcp,
-                "isaac.get_prim_info",
-                {"prim_path": camera.prim_path},
-            )
-            if existing is not None and existing.get("type") == "Camera":
-                continue
-            if existing is not None:
+            arguments = {
+                "prim_path": camera.prim_path,
+                "position": list(camera.position),
+                "orientation": list(camera.orientation_wxyz),
+                "resolution": [self.config.image_width, self.config.image_height],
+                "focal_length": camera.focal_length,
+                "clipping_range": list(camera.clipping_range),
+                "focus_distance": camera.focus_distance,
+                "horizontal_aperture": camera.horizontal_aperture,
+                "vertical_aperture": camera.vertical_aperture,
+            }
+            if self._try_call(mcp, "isaac.create_camera", arguments) is None:
+                self._configure_legacy_camera(mcp, camera)
                 self._call(
                     mcp,
-                    "isaac.delete_object",
-                    {"prim_path": camera.prim_path},
+                    "isaac.create_camera",
+                    {
+                        "prim_path": camera.prim_path,
+                        "resolution": [
+                            self.config.image_width,
+                            self.config.image_height,
+                        ],
+                    },
                 )
-            self._call(
-                mcp,
-                "isaac.create_camera",
-                {
-                    "prim_path": camera.prim_path,
-                    "position": list(camera.position),
-                    "rotation": list(camera.rotation_degrees),
-                    "resolution": [self.config.image_width, self.config.image_height],
-                },
-            )
             created.append(camera.prim_path)
         return created
+
+    def _set_viewer_camera(self, mcp: MCPClient, prim_path: str) -> None:
+        if (
+            self._try_call(
+                mcp,
+                "isaac.set_active_camera",
+                {"prim_path": prim_path},
+            )
+            is not None
+        ):
+            return
+        encoded_path = json.dumps(prim_path)
+        code = f"""
+import omni.kit.app
+from omni.kit.viewport.utility import get_active_viewport
+
+viewport = get_active_viewport()
+if viewport is None:
+    raise RuntimeError("no active viewport")
+viewport.camera_path = {encoded_path}
+omni.kit.app.get_app().update()
+print({{"status": "success", "active_camera": str(viewport.camera_path)}})
+"""
+        self._call(mcp, "isaac.execute_script", {"code": code})
+
+    def _configure_legacy_camera(self, mcp: MCPClient, camera: CameraSpec) -> None:
+        position = json.dumps(list(camera.position))
+        orientation = json.dumps(list(camera.orientation_wxyz))
+        prim_path = json.dumps(camera.prim_path)
+        code = f"""
+import omni.usd
+from pxr import Gf, UsdGeom
+
+stage = omni.usd.get_context().get_stage()
+camera = UsdGeom.Camera.Define(stage, {prim_path})
+prim = camera.GetPrim()
+xformable = UsdGeom.Xformable(prim)
+xformable.ClearXformOpOrder()
+position = {position}
+orientation = {orientation}
+xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+    Gf.Vec3d(*position)
+)
+xformable.AddOrientOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+    Gf.Quatd(orientation[0], Gf.Vec3d(*orientation[1:]))
+)
+camera.GetFocalLengthAttr().Set({camera.focal_length})
+camera.GetClippingRangeAttr().Set(
+    Gf.Vec2f({camera.clipping_range[0]}, {camera.clipping_range[1]})
+)
+camera.GetFocusDistanceAttr().Set({camera.focus_distance})
+camera.GetHorizontalApertureAttr().Set({camera.horizontal_aperture})
+camera.GetVerticalApertureAttr().Set({camera.vertical_aperture})
+print({{"status": "success", "prim_path": {prim_path}}})
+"""
+        self._call(mcp, "isaac.execute_script", {"code": code})
 
     def _joint_indices(self, mcp: MCPClient) -> tuple[list[int], int]:
         info = self._call(
@@ -449,11 +658,21 @@ class HostedDroidRunner:
                 timeout=self.config.request_timeout_seconds,
             )
             chunk = _action_chunk(response)[: self.config.open_loop_horizon]
+            sample_index = samples
+            if evidence is not None:
+                evidence.write_sample(sample_index, response, chunk)
             samples += 1
-            for action in chunk:
+            for chunk_index, action in enumerate(chunk):
                 if action_steps >= self.config.max_action_steps:
                     break
                 self._apply_action(mcp, joint_indices, action)
+                if evidence is not None:
+                    evidence.write_applied_action(
+                        sample_index=sample_index,
+                        chunk_index=chunk_index,
+                        action_index=action_steps,
+                        action=action,
+                    )
                 action_steps += 1
         return samples, action_steps
 
@@ -512,7 +731,6 @@ class HostedDroidRunner:
         output_path = (
             f"/data/workspace/media/droid-{sample_index:05d}-{camera_index}.png"
         )
-        encoded: str | None = None
         last_error: HostedDroidError | None = None
         for attempt in range(1, _CAMERA_CAPTURE_ATTEMPTS + 1):
             try:
@@ -530,11 +748,19 @@ class HostedDroidRunner:
                         {"path": artifact_path},
                     )
                     encoded = _encoded_image(artifact)
-                if encoded is not None:
-                    break
-                raise HostedDroidError(
-                    f"Isaac did not return RGB bytes for camera {camera_prim_path}"
+                if encoded is None:
+                    raise HostedDroidError(
+                        f"Isaac did not return RGB bytes for camera {camera_prim_path}"
+                    )
+                raw, rgb = _decode_valid_rgb(
+                    encoded,
+                    camera_prim_path=camera_prim_path,
+                    expected_width=self.config.image_width,
+                    expected_height=self.config.image_height,
                 )
+                if evidence is not None:
+                    evidence.write_frame(sample_index, camera_index, raw)
+                return rgb
             except HostedDroidError as exc:
                 last_error = exc
                 if attempt == _CAMERA_CAPTURE_ATTEMPTS:
@@ -545,22 +771,10 @@ class HostedDroidRunner:
                     {"num_steps": _CAMERA_CAPTURE_RETRY_STEPS},
                 )
                 self._sleep(_CAMERA_CAPTURE_RETRY_SECONDS)
-        if encoded is None:
-            raise HostedDroidError(
-                f"camera {camera_prim_path} did not produce a rendered frame after "
-                f"{_CAMERA_CAPTURE_ATTEMPTS} attempts: {last_error}"
-            ) from last_error
-        try:
-            raw = base64.b64decode(encoded, validate=True)
-            with Image.open(io.BytesIO(raw)) as image:
-                rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
-        except Exception as exc:
-            raise HostedDroidError(
-                f"invalid RGB artifact for camera {camera_prim_path}: {exc}"
-            ) from exc
-        if evidence is not None:
-            evidence.write_frame(sample_index, camera_index, raw)
-        return np.ascontiguousarray(rgb)
+        raise HostedDroidError(
+            f"camera {camera_prim_path} did not produce a valid rendered frame after "
+            f"{_CAMERA_CAPTURE_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
 
     def _apply_action(
         self,
@@ -598,6 +812,20 @@ class HostedDroidRunner:
             return None
 
     def _call(
+        self, mcp: MCPClient, name: str, arguments: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        for attempt in range(_TRANSIENT_MCP_RETRIES):
+            try:
+                return self._call_once(mcp, name, arguments)
+            except HostedDroidError as exc:
+                if not _is_retryable_mcp_failure(name, exc):
+                    raise
+                if attempt + 1 == _TRANSIENT_MCP_RETRIES:
+                    raise
+                self._sleep(min(self.config.readiness_poll_seconds, 5.0))
+        raise AssertionError("unreachable")
+
+    def _call_once(
         self, mcp: MCPClient, name: str, arguments: Mapping[str, Any]
     ) -> dict[str, Any]:
         try:
@@ -644,6 +872,15 @@ def _raise_tool_error(name: str, payload: Mapping[str, Any]) -> None:
         raise HostedDroidError(f"{name} failed: {message}")
 
 
+def _is_retryable_mcp_failure(name: str, exc: HostedDroidError) -> bool:
+    message = str(exc)
+    if any(marker in message for marker in _TRANSIENT_MCP_FAILURE_MARKERS):
+        return True
+    return name in _IDEMPOTENT_TRANSPORT_RETRY_TOOLS and any(
+        marker in message for marker in _TRANSIENT_TRANSPORT_FAILURE_MARKERS
+    )
+
+
 def _has_droid_joints(payload: Mapping[str, Any]) -> bool:
     names = payload.get("joint_names")
     return isinstance(names, list) and all(
@@ -659,6 +896,80 @@ def _encoded_image(payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _decode_valid_rgb(
+    encoded: str,
+    *,
+    camera_prim_path: str,
+    expected_width: int,
+    expected_height: int,
+) -> tuple[bytes, np.ndarray]:
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        with Image.open(io.BytesIO(raw)) as image:
+            if image.size != (expected_width, expected_height):
+                raise HostedDroidError(
+                    f"camera {camera_prim_path} returned {image.size[0]}x{image.size[1]}, "
+                    f"expected {expected_width}x{expected_height}"
+                )
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    except HostedDroidError:
+        raise
+    except Exception as exc:
+        raise HostedDroidError(
+            f"invalid RGB artifact for camera {camera_prim_path}: {exc}"
+        ) from exc
+
+    luminance = rgb.astype(np.float32).mean(axis=2)
+    p99 = float(np.percentile(luminance, 99))
+    stddev = float(luminance.std())
+    non_dark_fraction = float(np.count_nonzero(luminance > 8.0) / luminance.size)
+    non_white_fraction = float(
+        np.count_nonzero(luminance < _NON_WHITE_LUMINANCE_CUTOFF) / luminance.size
+    )
+    if (
+        p99 < _MIN_LUMINANCE_P99
+        or stddev < _MIN_LUMINANCE_STDDEV
+        or non_dark_fraction < _MIN_NON_DARK_FRACTION
+        or non_white_fraction < _MIN_NON_WHITE_FRACTION
+    ):
+        raise HostedDroidError(
+            f"camera {camera_prim_path} returned an unrendered or low-information frame "
+            f"(p99={p99:.2f}, stddev={stddev:.2f}, "
+            f"non_dark_fraction={non_dark_fraction:.4f}, "
+            f"non_white_fraction={non_white_fraction:.4f})"
+        )
+    return raw, np.ascontiguousarray(rgb)
+
+
+def _response_field(response: Any, name: str) -> Any:
+    if isinstance(response, Mapping):
+        return response.get(name)
+    return getattr(response, name, None)
+
+
+def _tensor_array(value: Any, name: str) -> np.ndarray:
+    if hasattr(value, "to_numpy"):
+        value = value.to_numpy()
+    elif isinstance(value, Mapping) and "data" in value:
+        shape = value.get("shape")
+        value = np.asarray(value["data"])
+        if shape is not None:
+            value = value.reshape(shape)
+    array = np.asarray(value)
+    if array.dtype.kind not in {"b", "f", "i", "u"}:
+        raise HostedDroidError(f"{name} must contain numeric tensor data")
+    if array.dtype.kind == "f" and not np.isfinite(array).all():
+        raise HostedDroidError(f"{name} must contain only finite values")
+    return np.ascontiguousarray(array)
+
+
+def _archive_key(value: str) -> str:
+    sanitized = "".join(
+        character if character.isalnum() else "_" for character in value
+    )
+    return sanitized or "tensor"
+
+
 def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
     return {
         "environment_uri": config.environment_uri,
@@ -670,7 +981,12 @@ def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
             {
                 "prim_path": camera.prim_path,
                 "position": list(camera.position),
-                "rotation_degrees": list(camera.rotation_degrees),
+                "orientation_wxyz": list(camera.orientation_wxyz),
+                "focal_length": camera.focal_length,
+                "clipping_range": list(camera.clipping_range),
+                "focus_distance": camera.focus_distance,
+                "horizontal_aperture": camera.horizontal_aperture,
+                "vertical_aperture": camera.vertical_aperture,
             }
             for camera in config.cameras
         ],
@@ -680,6 +996,8 @@ def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
         "open_loop_horizon": config.open_loop_horizon,
         "physics_steps_per_action": config.physics_steps_per_action,
         "runtime_provider": config.runtime_provider,
+        "policy_mode": config.policy_mode,
+        "include_predicted_video": config.include_predicted_video,
         "request_timeout_seconds": config.request_timeout_seconds,
         "launch_timeout_seconds": config.launch_timeout_seconds,
         "readiness_timeout_seconds": config.readiness_timeout_seconds,
