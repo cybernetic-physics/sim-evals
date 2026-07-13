@@ -25,8 +25,26 @@ from sim_evals.inference.droid_observation import DroidObservation
 from run_hosted_eval import _timestamped_results_dir
 
 
-def _png_base64(value: int) -> str:
-    image = Image.fromarray(np.full((3, 4, 3), value, dtype=np.uint8), mode="RGB")
+def _png_base64(
+    value: int,
+    *,
+    width: int = 640,
+    height: int = 360,
+    flat: bool = False,
+) -> str:
+    pixels = np.full((height, width, 3), value, dtype=np.uint8)
+    if not flat:
+        pixels[:, width // 2 :] = min(value + 20, 255)
+    image = Image.fromarray(pixels, mode="RGB")
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def _white_sliver_png_base64(*, width: int = 640, height: int = 360) -> str:
+    pixels = np.full((height, width, 3), 255, dtype=np.uint8)
+    pixels[height // 2 - 1 : height // 2 + 1, :] = 20
+    image = Image.fromarray(pixels, mode="RGB")
     output = io.BytesIO()
     image.save(output, format="PNG")
     return base64.b64encode(output.getvalue()).decode("ascii")
@@ -51,10 +69,20 @@ class FakeMCP:
         readiness_failures: int = 1,
         warm: bool = False,
         camera_capture_failures: int = 0,
+        camera_payloads: list[str] | None = None,
+        supports_camera_contract: bool = True,
+        supports_active_camera: bool = True,
+        transient_tool_failures: Mapping[str, int] | None = None,
+        transport_tool_failures: Mapping[str, int] | None = None,
     ) -> None:
         self.readiness_failures = readiness_failures
         self.camera_capture_failures = camera_capture_failures
         self.robot_loaded = warm
+        self.camera_payloads = list(camera_payloads or [])
+        self.supports_camera_contract = supports_camera_contract
+        self.supports_active_camera = supports_active_camera
+        self.transient_tool_failures = dict(transient_tool_failures or {})
+        self.transport_tool_failures = dict(transport_tool_failures or {})
         self.prims = (
             {
                 "/World/robot",
@@ -69,6 +97,16 @@ class FakeMCP:
 
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         self.calls.append((name, dict(arguments)))
+        transient_failures = self.transient_tool_failures.get(name, 0)
+        if transient_failures > 0:
+            self.transient_tool_failures[name] = transient_failures - 1
+            raise RuntimeError(
+                "ISAAC_UNREACHABLE: Isaac Sim MCP extension is not ready yet"
+            )
+        transport_failures = self.transport_tool_failures.get(name, 0)
+        if transport_failures > 0:
+            self.transport_tool_failures[name] = transport_failures - 1
+            raise RuntimeError(f"MCP tool {name!r} failed with HTTP 502")
         if name == "isaac.get_scene_info":
             if self.readiness_failures:
                 self.readiness_failures -= 1
@@ -95,8 +133,19 @@ class FakeMCP:
             self.prims.discard(arguments["prim_path"])
             return {"status": "success"}
         if name == "isaac.create_camera":
+            if "orientation" in arguments and not self.supports_camera_contract:
+                return {"status": "error", "message": "unsupported camera contract"}
             self.prims.add(arguments["prim_path"])
             return {"status": "success"}
+        if name == "isaac.set_active_camera":
+            if not self.supports_active_camera:
+                return {"status": "error", "message": "unsupported active camera"}
+            return {
+                "status": "success",
+                "active_camera": arguments["prim_path"],
+            }
+        if name == "isaac.execute_script":
+            return {"status": "success", "result": {"status": "success"}}
         if name in {
             "isaac.play_simulation",
             "isaac.step_simulation",
@@ -113,7 +162,11 @@ class FakeMCP:
             return {
                 "status": "success",
                 "encoding": "base64",
-                "data": _png_base64(20 + camera_index),
+                "data": (
+                    self.camera_payloads.pop(0)
+                    if self.camera_payloads
+                    else _png_base64(20 + camera_index)
+                ),
             }
         if name == "isaac.get_joint_positions":
             positions = [0.0] * len(self.joint_names)
@@ -155,12 +208,15 @@ class FakeSimulationClient:
 
 
 class FakeSampler:
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(
+        self, *, error: Exception | None = None, response: Any | None = None
+    ) -> None:
         self.observations: list[DroidObservation] = []
         self.timeouts: list[float | None] = []
         self.reset_calls = 0
         self.closed = False
         self.error = error
+        self.response = response
 
     def reset_sampling_session(self) -> None:
         self.reset_calls += 1
@@ -172,6 +228,8 @@ class FakeSampler:
         self.timeouts.append(timeout)
         if self.error is not None:
             raise self.error
+        if self.response is not None:
+            return self.response
         return {
             "action_chunk": np.asarray(
                 [
@@ -221,9 +279,11 @@ class HostedDroidRunnerTest(unittest.TestCase):
         observation = sampler.observations[0]
         np.testing.assert_allclose(observation.joint_position, np.arange(1, 8) / 10)
         np.testing.assert_allclose(observation.gripper_position, [0.5])
-        np.testing.assert_array_equal(observation.exterior_image_1_left, 20)
-        np.testing.assert_array_equal(observation.exterior_image_2_left, 21)
-        np.testing.assert_array_equal(observation.wrist_image_left, 22)
+        self.assertEqual(observation.exterior_image_1_left.shape, (360, 640, 3))
+        self.assertEqual(int(observation.exterior_image_1_left[0, 0, 0]), 20)
+        self.assertEqual(int(observation.exterior_image_1_left[0, -1, 0]), 40)
+        self.assertEqual(int(observation.exterior_image_2_left[0, 0, 0]), 21)
+        self.assertEqual(int(observation.wrist_image_left[0, 0, 0]), 22)
 
         load_calls = [args for name, args in mcp.calls if name == "isaac.load_usd"]
         self.assertEqual(load_calls[0]["prim_path"], "/World/robot")
@@ -242,7 +302,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
         ]
         self.assertEqual(step_calls[-1]["num_steps"], 8)
 
-    def test_keeps_valid_scene_and_keeps_session_by_default(self) -> None:
+    def test_keeps_valid_robot_and_uses_fresh_cameras_by_default(self) -> None:
         mcp = FakeMCP(readiness_failures=0, warm=True)
         simulation = FakeSimulationClient(mcp)
         sampler = FakeSampler()
@@ -255,10 +315,17 @@ class HostedDroidRunnerTest(unittest.TestCase):
 
         self.assertFalse(result.repaired_robot)
         self.assertTrue(result.session_retained)
-        self.assertEqual(result.created_cameras, ())
+        self.assertEqual(len(result.created_cameras), 3)
         self.assertEqual(simulation.stopped, [])
         self.assertFalse(any(name == "isaac.load_usd" for name, _ in mcp.calls))
-        self.assertFalse(any(name == "isaac.create_camera" for name, _ in mcp.calls))
+        self.assertEqual(
+            len([name for name, _ in mcp.calls if name == "isaac.create_camera"]),
+            3,
+        )
+        self.assertEqual(
+            len([name for name, _ in mcp.calls if name == "isaac.delete_object"]),
+            0,
+        )
 
     def test_resumes_caller_owned_session_without_launching_or_stopping(self) -> None:
         mcp = FakeMCP(readiness_failures=0, warm=True)
@@ -322,6 +389,13 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 environment_uri="cybernetics://envs/env_droid",
                 open_loop_horizon=0,
             )
+        first = HostedDroidConfig(environment_uri="cybernetics://envs/env_droid")
+        second = HostedDroidConfig(environment_uri="cybernetics://envs/env_droid")
+        self.assertTrue(
+            {camera.prim_path for camera in first.cameras}.isdisjoint(
+                camera.prim_path for camera in second.cameras
+            )
+        )
 
     def test_writes_config_result_and_first_rgb_triplet(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -342,7 +416,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             config_payload = json.loads(
                 (results_dir / "config.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(config_payload["schema_version"], 1)
+            self.assertEqual(config_payload["schema_version"], 2)
             self.assertEqual(
                 config_payload["config"]["environment_uri"],
                 config.environment_uri,
@@ -355,6 +429,24 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertEqual(result_payload["status"], "succeeded")
             self.assertEqual(result_payload["result"], result.to_dict())
             self.assertEqual(len(result_payload["evidence"]["frames"]), 6)
+            self.assertEqual(
+                result_payload["evidence"]["actions"],
+                {"path": "actions.jsonl", "records": 5},
+            )
+            action_records = [
+                json.loads(line)
+                for line in (results_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                [record["record_type"] for record in action_records],
+                [
+                    "sample",
+                    "applied_action",
+                    "applied_action",
+                    "sample",
+                    "applied_action",
+                ],
+            )
             self.assertFalse((results_dir / "error.json").exists())
 
             frame_names = (
@@ -370,6 +462,53 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertTrue(
                 (results_dir / "frames" / "sample-00001-exterior-1.png").is_file()
             )
+
+    def test_archives_predicted_video_and_sde_trajectory_tensors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "policy-artifacts"
+            response = {
+                "action_chunk": np.zeros((1, 1, 8), dtype=np.float32),
+                "predicted_video": np.arange(24, dtype=np.float32).reshape(
+                    1, 2, 3, 2, 2
+                ),
+                "trajectory": [
+                    {
+                        "log_prob_old": np.asarray([-1.25], dtype=np.float32),
+                        "step_index": np.asarray([0], dtype=np.int64),
+                    }
+                ],
+            }
+            runner = HostedDroidRunner(
+                FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True)),
+                FakeSampler(response=response),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=1,
+                    policy_mode="sde",
+                    include_predicted_video=True,
+                    results_dir=results_dir,
+                ),
+                sleep=lambda _: None,
+            )
+
+            runner.run()
+
+            records = [
+                json.loads(line)
+                for line in (results_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(records), 2)
+            sample = records[0]
+            self.assertEqual(sample["record_type"], "sample")
+            self.assertEqual(sample["predicted_video"]["shape"], [1, 2, 3, 2, 2])
+            video = np.load(results_dir / sample["predicted_video"]["path"])
+            np.testing.assert_array_equal(video, response["predicted_video"])
+            trajectory_path = results_dir / sample["trajectory"]["path"]
+            with np.load(trajectory_path) as trajectory:
+                np.testing.assert_array_equal(
+                    trajectory["step_000__log_prob_old"], [-1.25]
+                )
+                np.testing.assert_array_equal(trajectory["step_000__step_index"], [0])
 
     def test_writes_structured_error_after_frames_are_downloaded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -428,6 +567,256 @@ class HostedDroidRunnerTest(unittest.TestCase):
         ]
         self.assertEqual(len(capture_calls), 5)
         self.assertEqual(len(retry_steps), 2)
+
+    def test_retries_idempotent_joint_target_after_transport_502(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            transport_tool_failures={"isaac.set_joint_positions": 1},
+        )
+        result = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        self.assertEqual(result.action_steps, 1)
+        joint_targets = [
+            arguments
+            for name, arguments in mcp.calls
+            if name == "isaac.set_joint_positions"
+        ]
+        self.assertEqual(len(joint_targets), 2)
+        self.assertEqual(joint_targets[0], joint_targets[1])
+
+    def test_does_not_retry_non_idempotent_step_after_transport_502(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            transport_tool_failures={"isaac.step_simulation": 1},
+        )
+        runner = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(environment_uri="cybernetics://envs/env_droid"),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaisesRegex(HostedDroidError, "HTTP 502"):
+            runner._call(mcp, "isaac.step_simulation", {"num_steps": 1})
+
+        step_calls = [name for name, _ in mcp.calls if name == "isaac.step_simulation"]
+        self.assertEqual(len(step_calls), 1)
+
+    def test_all_black_frames_fail_closed_before_sampling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "black-frame"
+            mcp = FakeMCP(
+                readiness_failures=0,
+                warm=True,
+                camera_payloads=[_png_base64(0, flat=True)] * 10,
+            )
+            sampler = FakeSampler()
+            runner = HostedDroidRunner(
+                FakeSimulationClient(mcp),
+                sampler,
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=1,
+                    results_dir=results_dir,
+                ),
+                sleep=lambda _: None,
+            )
+
+            with self.assertRaisesRegex(HostedDroidError, "low-information frame"):
+                runner.run()
+
+            self.assertEqual(sampler.observations, [])
+            self.assertFalse((results_dir / "result.json").exists())
+            self.assertTrue((results_dir / "error.json").is_file())
+            self.assertEqual(list((results_dir / "frames").glob("*.png")), [])
+
+    def test_black_frames_retry_until_textured_frame_is_ready(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            camera_payloads=[
+                _png_base64(0, flat=True),
+                _png_base64(0, flat=True),
+                _png_base64(30),
+            ],
+        )
+        sampler = FakeSampler()
+
+        result = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            sampler,
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        self.assertEqual(result.action_steps, 1)
+        self.assertEqual(len(sampler.observations), 1)
+        self.assertEqual(
+            len(
+                [name for name, _ in mcp.calls if name == "isaac.capture_camera_image"]
+            ),
+            5,
+        )
+
+    def test_near_white_geometry_sliver_fails_closed_before_sampling(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            camera_payloads=[_white_sliver_png_base64()] * 10,
+        )
+        sampler = FakeSampler()
+
+        with self.assertRaisesRegex(HostedDroidError, "low-information frame"):
+            HostedDroidRunner(
+                FakeSimulationClient(mcp),
+                sampler,
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=1,
+                ),
+                sleep=lambda _: None,
+            ).run()
+
+        self.assertEqual(sampler.observations, [])
+
+    def test_camera_contract_includes_droid_optics_and_legacy_fallback(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            supports_camera_contract=False,
+        )
+
+        HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        enhanced = [
+            arguments
+            for name, arguments in mcp.calls
+            if name == "isaac.create_camera" and "orientation" in arguments
+        ]
+        scripts = [
+            arguments["code"]
+            for name, arguments in mcp.calls
+            if name == "isaac.execute_script"
+        ]
+        self.assertEqual(len(enhanced), 3)
+        self.assertEqual(enhanced[0]["orientation"], [-0.393, -0.195, 0.399, 0.805])
+        self.assertEqual(enhanced[0]["focal_length"], 2.1)
+        self.assertEqual(enhanced[0]["clipping_range"], [0.05, 100.0])
+        self.assertEqual(enhanced[0]["horizontal_aperture"], 5.376)
+        self.assertEqual(enhanced[2]["focal_length"], 2.8)
+        self.assertEqual(len(scripts), 3)
+        self.assertTrue(all("AddOrientOp" in script for script in scripts))
+        self.assertTrue(all("GetClippingRangeAttr" in script for script in scripts))
+        fallback_calls = [
+            (name, arguments)
+            for name, arguments in mcp.calls
+            if name in {"isaac.create_camera", "isaac.execute_script"}
+        ]
+        for camera_index in range(3):
+            offset = camera_index * 3
+            self.assertIn("orientation", fallback_calls[offset][1])
+            self.assertEqual(fallback_calls[offset + 1][0], "isaac.execute_script")
+            self.assertEqual(fallback_calls[offset + 2][0], "isaac.create_camera")
+            self.assertNotIn("orientation", fallback_calls[offset + 2][1])
+
+    def test_rollout_frames_streamed_viewer_with_first_external_camera(self) -> None:
+        mcp = FakeMCP(readiness_failures=0, warm=True)
+        config = HostedDroidConfig(
+            environment_uri="cybernetics://envs/env_droid",
+            max_action_steps=1,
+        )
+
+        HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            config,
+            sleep=lambda _: None,
+        ).run()
+
+        viewer_calls = [
+            arguments
+            for name, arguments in mcp.calls
+            if name == "isaac.set_active_camera"
+        ]
+        self.assertEqual(len(viewer_calls), 1)
+        self.assertEqual(
+            viewer_calls[0]["prim_path"],
+            config.cameras[0].prim_path,
+        )
+
+    def test_rollout_falls_back_to_execute_script_for_active_camera(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            supports_active_camera=False,
+        )
+
+        HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        scripts = [
+            arguments["code"]
+            for name, arguments in mcp.calls
+            if name == "isaac.execute_script"
+        ]
+        self.assertEqual(len(scripts), 1)
+        self.assertIn("viewport.camera_path", scripts[0])
+
+    def test_rollout_retries_transient_bridge_readiness_failures(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            transient_tool_failures={
+                "isaac.capture_camera_image": 2,
+                "isaac.step_simulation": 2,
+            },
+        )
+
+        result = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        self.assertEqual(result.action_steps, 1)
+        self.assertGreaterEqual(
+            len(
+                [name for name, _ in mcp.calls if name == "isaac.capture_camera_image"]
+            ),
+            5,
+        )
 
     def test_timestamped_results_directory_is_utc_and_collision_resistant(self) -> None:
         now = datetime(2026, 7, 12, 14, 5, 6, 123456, tzinfo=timezone.utc)

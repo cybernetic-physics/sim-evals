@@ -57,6 +57,7 @@ class FakeSamplingAPI:
 class CyberneticsDreamZeroClientTest(unittest.TestCase):
     def test_concrete_bridge_uses_typed_sdk_sample_and_cancels_session(self) -> None:
         sampled: list[object] = []
+        sampled_options: list[dict[str, object]] = []
         cancelled: list[str] = []
         closed: list[bool] = []
 
@@ -73,8 +74,9 @@ class CyberneticsDreamZeroClientTest(unittest.TestCase):
                 return self.value
 
         class Sampler:
-            def sample_droid(self, observation):
+            def sample_droid(self, observation, **kwargs):
                 sampled.append(observation)
+                sampled_options.append(kwargs)
                 return Future({"action_chunk": np.zeros((1, 1, 8))})
 
         class RestClient:
@@ -100,13 +102,19 @@ class CyberneticsDreamZeroClientTest(unittest.TestCase):
             _observation(), "put the cube in the bowl"
         )
         with patch.dict("sys.modules", {"cybernetics": fake_sdk}):
-            api = CyberneticsSDKDroidSamplingAPI()
+            api = CyberneticsSDKDroidSamplingAPI(
+                policy_mode="sde", include_predicted_video=True
+            )
             api.reset_sampling_session()
             response = api.sample_droid(observation, timeout=19)
             api.close()
 
         self.assertEqual(response["action_chunk"].shape, (1, 1, 8))
         self.assertEqual(sampled[0]["instruction"], "put the cube in the bowl")
+        self.assertEqual(
+            sampled_options,
+            [{"policy_mode": "sde", "include_predicted_video": True}],
+        )
         self.assertEqual(cancelled, ["session-1"])
         self.assertEqual(closed, [True])
 
