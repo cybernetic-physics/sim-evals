@@ -129,6 +129,56 @@ export CYBERNETICS_DROID_ENV_URI=cybernetics://envs/ENV_ID/versions/VERSION_ID
 python run_hosted_eval.py --max-action-steps 450
 ```
 
+On macOS, use an isolated environment because the local IsaacLab dependencies
+are Linux-only. Point `CYBERNETICS_SDK_CHECKOUT` at a current Cybernetics SDK
+source checkout. This command runs only the hosted client and Pillow, and uses
+a caller-selected run directory so the evidence path is stable and easy to
+archive:
+
+```bash
+cd ~/wagmi/sim-evals
+export CYBERNETICS_SDK_CHECKOUT=/path/to/cybernetic-physics/sdk/python
+PYTHONPATH="$PWD/src" \
+CYBERNETICS_BASE_URL=https://api.cyberneticphysics.com \
+uv run --isolated --no-project \
+  --with "$CYBERNETICS_SDK_CHECKOUT" \
+  --with pillow \
+  python "$PWD/run_hosted_eval.py" \
+  --environment-uri cybernetics://envs/ENV_ID/versions/VERSION_ID \
+  --instruction "put the cube in the bowl" \
+  --max-action-steps 450 \
+  --open-loop-horizon 8 \
+  --physics-steps-per-action 8 \
+  --results-dir "$PWD/runs/hosted-droid/droid-replication"
+```
+
+Normal accounts use the shared warm pool and should omit `--runtime-provider`.
+For an operator acceptance run, a service or system-admin credential may add
+`--runtime-provider vast` to request dedicated Cybernetic Physics simulation
+capacity while keeping scene launch, MCP, and teardown under the same SDK.
+
+A cold dedicated host can outlive a client-side launch timeout while the
+control plane continues provisioning the same session. Resume that session
+without renting duplicate capacity:
+
+```bash
+python run_hosted_eval.py \
+  --environment-uri cybernetics://envs/ENV_ID/versions/VERSION_ID \
+  --session-id sess_EXISTING \
+  --launch-timeout-seconds 2700 \
+  --results-dir "$PWD/runs/hosted-droid/resumed-session"
+```
+
+An attached session is caller-owned, so the evaluator never stops it. Stop it
+through the Cybernetics SDK after preserving the evidence. Sessions launched by
+the evaluator are stopped after the rollout unless `--keep-session` is set.
+
+Omit `--results-dir` to create a collision-resistant UTC directory such as
+`runs/hosted-droid/20260712T140506.123456Z`. The final console JSON reports the
+directory used. A selected directory represents one run slot; rerunning into
+the same path replaces the known result, error, and frame evidence files while
+leaving unrelated files alone.
+
 The environment bundle should contain the three task scenes and the DROID USD
 at `/data/workspace/franka_robotiq_2f_85_flattened.usd`. Override the latter
 when the bundle uses another workspace path:
@@ -145,7 +195,31 @@ session and polls `isaac.get_scene_info` until the extension is ready. It then
 validates or reloads the DROID articulation, creates any missing exterior/wrist
 cameras, captures RGB PNG artifacts, reads named joint positions, samples one
 DreamZero action chunk, and applies up to eight actions before observing again.
-Sessions are stopped on success or failure unless `--keep-session` is set.
+Sessions launched successfully by the evaluator are stopped after the rollout
+unless `--keep-session` is set. Attached sessions remain caller-owned.
+
+The runner writes `config.json` before launching the hosted session. During
+each observation it preserves the exact PNG bytes already downloaded through
+MCP for all three DROID camera roles. It then atomically writes one terminal
+record: `result.json` after success or `error.json` after failure. Errors include
+the exception type and message, plus the hosted session ID when launch reached
+that point. The evidence layout is:
+
+```text
+<results-dir>/
+|-- config.json
+|-- result.json                         # success only
+|-- error.json                          # failure only
+`-- frames/
+    |-- sample-00000-exterior-1.png
+    |-- sample-00000-exterior-2.png
+    |-- sample-00000-wrist.png
+    `-- sample-00001-*.png               # one triplet per later observation
+```
+
+`config.json`, `result.json`, and `error.json` are versioned, machine-readable
+JSON. A failure after camera capture retains any frames already written, and its
+`evidence.frames` list names the files that are actually present.
 
 ## Minimal Example
 
