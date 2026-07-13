@@ -584,6 +584,7 @@ class HostedDroidRunner:
         )
         session_id = self.config.session_id
         owns_session = False
+        cleanup_errors: list[str] = []
         try:
             try:
                 if session_id is None:
@@ -657,7 +658,12 @@ class HostedDroidRunner:
                     physics_steps_per_action=physics_steps_per_action,
                     control_hz=control_hz,
                 )
-            finally:
+            except BaseException:
+                cleanup_errors.extend(
+                    self._cleanup_after_failure(session_id, owns_session)
+                )
+                raise
+            else:
                 self.sampling_api.close()
                 if (
                     owns_session
@@ -669,7 +675,7 @@ class HostedDroidRunner:
                 evidence.finalize_video(self.config.video_fps)
         except BaseException as exc:
             if evidence is not None:
-                evidence_errors: list[str] = []
+                evidence_errors = list(cleanup_errors)
                 if self.config.record_video and not evidence.video_path.is_file():
                     try:
                         evidence.finalize_video(self.config.video_fps)
@@ -687,6 +693,27 @@ class HostedDroidRunner:
         if evidence is not None:
             evidence.write_result(result)
         return result
+
+    def _cleanup_after_failure(
+        self,
+        session_id: str | None,
+        owns_session: bool,
+    ) -> list[str]:
+        cleanup_errors: list[str] = []
+        try:
+            self.sampling_api.close()
+        except Exception as exc:
+            cleanup_errors.append(
+                f"sampling API close failed: {type(exc).__name__}: {exc}"
+            )
+        if owns_session and session_id is not None and not self.config.keep_session:
+            try:
+                self.simulation_client.stop_session(session_id)
+            except Exception as exc:
+                cleanup_errors.append(
+                    f"session stop failed: {type(exc).__name__}: {exc}"
+                )
+        return cleanup_errors
 
     def _wait_for_isaac(self, mcp: MCPClient) -> None:
         deadline = self._monotonic() + self.config.readiness_timeout_seconds
