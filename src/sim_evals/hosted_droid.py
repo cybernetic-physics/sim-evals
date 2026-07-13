@@ -143,7 +143,7 @@ class HostedDroidRunResult:
         }
 
 
-_EVIDENCE_SCHEMA_VERSION = 2
+_EVIDENCE_SCHEMA_VERSION = 3
 _EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
 
 
@@ -173,12 +173,18 @@ class _EvidenceRecorder:
         _atomic_write(self.frames_dir / name, raw)
 
     def write_sample(
-        self, sample_index: int, response: Any, action_chunk: np.ndarray
+        self,
+        sample_index: int,
+        response: Any,
+        sampled_action_chunk: np.ndarray,
+        action_chunk: np.ndarray,
     ) -> None:
         record: dict[str, Any] = {
             "schema_version": _EVIDENCE_SCHEMA_VERSION,
             "record_type": "sample",
             "sample_index": sample_index,
+            "sampled_action_chunk_shape": list(sampled_action_chunk.shape),
+            "sampled_action_chunk": sampled_action_chunk.astype(float).tolist(),
             "action_chunk": action_chunk.astype(float).tolist(),
         }
         predicted_video = _response_field(response, "predicted_video")
@@ -703,10 +709,16 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 observation,
                 timeout=self.config.request_timeout_seconds,
             )
-            chunk = _action_chunk(response)[: self.config.open_loop_horizon]
+            sampled_chunk = _action_chunk(response)
+            chunk = sampled_chunk[: self.config.open_loop_horizon]
             sample_index = samples
             if evidence is not None:
-                evidence.write_sample(sample_index, response, chunk)
+                evidence.write_sample(
+                    sample_index,
+                    response,
+                    sampled_chunk,
+                    chunk,
+                )
             samples += 1
             for chunk_index, action in enumerate(chunk):
                 if action_steps >= self.config.max_action_steps:

@@ -436,7 +436,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             config_payload = json.loads(
                 (results_dir / "config.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(config_payload["schema_version"], 2)
+            self.assertEqual(config_payload["schema_version"], 3)
             self.assertEqual(
                 config_payload["config"]["environment_uri"],
                 config.environment_uri,
@@ -467,6 +467,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
                     "applied_action",
                 ],
             )
+            first_sample = action_records[0]
+            self.assertEqual(first_sample["sampled_action_chunk_shape"], [2, 8])
+            self.assertEqual(len(first_sample["sampled_action_chunk"]), 2)
+            self.assertEqual(len(first_sample["action_chunk"]), 2)
             self.assertFalse((results_dir / "error.json").exists())
 
             frame_names = (
@@ -529,6 +533,33 @@ class HostedDroidRunnerTest(unittest.TestCase):
                     trajectory["step_000__log_prob_old"], [-1.25]
                 )
                 np.testing.assert_array_equal(trajectory["step_000__step_index"], [0])
+
+    def test_archives_full_sampled_chunk_before_open_loop_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "full-policy-output"
+            sampled_chunk = np.arange(32, dtype=np.float32).reshape(1, 4, 8)
+            runner = HostedDroidRunner(
+                FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True)),
+                FakeSampler(response={"action_chunk": sampled_chunk}),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=1,
+                    open_loop_horizon=2,
+                    results_dir=results_dir,
+                ),
+                sleep=lambda _: None,
+            )
+
+            runner.run()
+
+            sample = json.loads(
+                (results_dir / "actions.jsonl").read_text().splitlines()[0]
+            )
+            self.assertEqual(sample["sampled_action_chunk_shape"], [4, 8])
+            np.testing.assert_array_equal(
+                sample["sampled_action_chunk"], sampled_chunk[0]
+            )
+            np.testing.assert_array_equal(sample["action_chunk"], sampled_chunk[0, :2])
 
     def test_writes_structured_error_after_frames_are_downloaded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
