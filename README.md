@@ -104,7 +104,7 @@ evaluation follows DreamZero's eight-action open-loop cadence. Each episode gets
 a fresh sampling session and the previous session is cancelled so backend frame
 history and causal cache ownership are released.
 
-Hosted evidence schema v3 preserves both the full normalized model output in
+Hosted evidence schema v4 preserves both the full normalized model output in
 `sampled_action_chunk` and the configured open-loop execution slice in
 `action_chunk`. `sampled_action_chunk_shape` records the normalized `[N, 8]`
 shape before horizon or maximum-step truncation.
@@ -259,10 +259,11 @@ that point. The evidence layout is:
 `config.json`, `result.json`, `error.json`, and every JSONL record are versioned
 and machine-readable. Each sample record contains the full sampled action chunk
 and bounded execution slice. An `action_target` record is privately written and
-`fsync`'d after Isaac accepts the absolute joint target; `applied_action` follows
-only after the exact configured number of physics steps completes. A failure
-therefore distinguishes accepted targets from fully stepped actions while
-retaining any frames or tensor artifacts already written.
+`fsync`'d after Isaac accepts the transformed joint positions and indices;
+`applied_action` repeats that exact target only after the configured physics
+steps complete. Both records retain the original policy action. A failure thus
+distinguishes accepted targets from fully stepped actions while retaining any
+frames or tensor artifacts already written.
 
 ## Minimal Example
 

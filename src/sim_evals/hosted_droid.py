@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import io
 import json
 import math
@@ -145,7 +144,7 @@ class HostedDroidRunResult:
         }
 
 
-_EVIDENCE_SCHEMA_VERSION = 3
+_EVIDENCE_SCHEMA_VERSION = 4
 _EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
 
 
@@ -219,10 +218,8 @@ class _EvidenceRecorder:
                 for key, value in step.items():
                     array = _tensor_array(value, f"trajectory[{step_index}].{key}")
                     source_key = str(key)
-                    archive_key = f"step_{step_index:03d}__{_archive_key(source_key)}"
-                    if archive_key in arrays:
-                        suffix = hashlib.sha256(source_key.encode()).hexdigest()[:12]
-                        archive_key = f"{archive_key}__{suffix}"
+                    encoded_key = source_key.encode("utf-8").hex()
+                    archive_key = f"step_{step_index:03d}__key_{encoded_key}"
                     arrays[archive_key] = array
                     step_metadata[source_key] = {
                         "archive_key": archive_key,
@@ -246,7 +243,9 @@ class _EvidenceRecorder:
         sample_index: int,
         chunk_index: int,
         action_index: int,
-        action: np.ndarray,
+        policy_action: np.ndarray,
+        joint_positions: list[float],
+        joint_indices: list[int],
     ) -> None:
         self._append_action_record(
             {
@@ -255,17 +254,21 @@ class _EvidenceRecorder:
                 "sample_index": sample_index,
                 "chunk_index": chunk_index,
                 "action_index": action_index,
-                "action": action.astype(float).tolist(),
+                "policy_action": policy_action.astype(float).tolist(),
+                "joint_positions": joint_positions,
+                "joint_indices": joint_indices,
             }
         )
 
     def write_action_target(
         self,
+        joint_positions: list[float],
+        joint_indices: list[int],
         *,
         sample_index: int,
         chunk_index: int,
         action_index: int,
-        action: np.ndarray,
+        policy_action: np.ndarray,
     ) -> None:
         self._append_action_record(
             {
@@ -274,7 +277,9 @@ class _EvidenceRecorder:
                 "sample_index": sample_index,
                 "chunk_index": chunk_index,
                 "action_index": action_index,
-                "action": action.astype(float).tolist(),
+                "policy_action": policy_action.astype(float).tolist(),
+                "joint_positions": joint_positions,
+                "joint_indices": joint_indices,
             }
         )
 
@@ -753,16 +758,18 @@ print({{"status": "success", "prim_path": {prim_path}}})
             for chunk_index, action in enumerate(chunk):
                 if action_steps >= self.config.max_action_steps:
                     break
-                on_target_accepted: Callable[[], None] | None = None
+                on_target_accepted: Callable[[list[float], list[int]], None] | None = (
+                    None
+                )
                 if evidence is not None:
                     on_target_accepted = partial(
                         evidence.write_action_target,
                         sample_index=sample_index,
                         chunk_index=chunk_index,
                         action_index=action_steps,
-                        action=action,
+                        policy_action=action,
                     )
-                self._apply_action(
+                joint_positions, applied_joint_indices = self._apply_action(
                     mcp,
                     joint_indices,
                     action,
@@ -773,7 +780,9 @@ print({{"status": "success", "prim_path": {prim_path}}})
                         sample_index=sample_index,
                         chunk_index=chunk_index,
                         action_index=action_steps,
-                        action=action,
+                        policy_action=action,
+                        joint_positions=joint_positions,
+                        joint_indices=applied_joint_indices,
                     )
                 action_steps += 1
         return samples, action_steps
@@ -885,21 +894,23 @@ print({{"status": "success", "prim_path": {prim_path}}})
         joint_indices: tuple[list[int], int],
         action: np.ndarray,
         *,
-        on_target_accepted: Callable[[], None] | None = None,
-    ) -> None:
+        on_target_accepted: Callable[[list[float], list[int]], None] | None = None,
+    ) -> tuple[list[float], list[int]]:
         arm_indices, gripper_index = joint_indices
         gripper = float(np.clip(action[7], 0.0, 1.0) * GRIPPER_CLOSED_RADIANS)
+        applied_joint_indices = [*arm_indices, gripper_index]
+        joint_positions = [*action[:7].astype(float).tolist(), gripper]
         self._call(
             mcp,
             "isaac.set_joint_positions",
             {
                 "prim_path": self.config.robot_prim_path,
-                "joint_positions": [*action[:7].astype(float).tolist(), gripper],
-                "joint_indices": [*arm_indices, gripper_index],
+                "joint_positions": joint_positions,
+                "joint_indices": applied_joint_indices,
             },
         )
         if on_target_accepted is not None:
-            on_target_accepted()
+            on_target_accepted(joint_positions, applied_joint_indices)
         step = self._call(
             mcp,
             "isaac.step_simulation",
@@ -921,6 +932,7 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 f"expected {self.config.physics_steps_per_action} frames, "
                 f"stepped={stepped!r}, timed_out={step.get('timed_out')!r}"
             )
+        return joint_positions, applied_joint_indices
 
     def _try_call(
         self, mcp: MCPClient, name: str, arguments: Mapping[str, Any]
@@ -1084,13 +1096,6 @@ def _tensor_array(value: Any, name: str) -> np.ndarray:
     if array.dtype.kind == "f" and not np.isfinite(array).all():
         raise HostedDroidError(f"{name} must contain only finite values")
     return np.ascontiguousarray(array)
-
-
-def _archive_key(value: str) -> str:
-    sanitized = "".join(
-        character if character.isalnum() else "_" for character in value
-    )
-    return sanitized or "tensor"
 
 
 def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
