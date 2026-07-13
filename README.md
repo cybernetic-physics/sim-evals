@@ -243,7 +243,7 @@ that point. The evidence layout is:
 ```text
 <results-dir>/
 |-- config.json
-|-- actions.jsonl                       # sample chunks and applied actions
+|-- actions.jsonl                       # samples, accepted targets, applied actions
 |-- result.json                         # success only
 |-- error.json                          # failure only
 |-- frames/
@@ -257,10 +257,12 @@ that point. The evidence layout is:
 ```
 
 `config.json`, `result.json`, `error.json`, and every JSONL record are versioned
-and machine-readable. Each sample record contains the complete action chunk;
-each action is appended and `fsync`'d only after its MCP application succeeds.
-A failure therefore retains the exact partial action history and any frames or
-tensor artifacts already written.
+and machine-readable. Each sample record contains the full sampled action chunk
+and bounded execution slice. An `action_target` record is privately written and
+`fsync`'d after Isaac accepts the absolute joint target; `applied_action` follows
+only after the exact configured number of physics steps completes. A failure
+therefore distinguishes accepted targets from fully stepped actions while
+retaining any frames or tensor artifacts already written.
 
 ## Minimal Example
 

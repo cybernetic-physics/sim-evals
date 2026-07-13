@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import AbstractContextManager, contextmanager
@@ -10,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator, Mapping, cast
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -451,7 +453,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertEqual(len(result_payload["evidence"]["frames"]), 6)
             self.assertEqual(
                 result_payload["evidence"]["actions"],
-                {"path": "actions.jsonl", "records": 5},
+                {"path": "actions.jsonl", "records": 8},
             )
             action_records = [
                 json.loads(line)
@@ -461,9 +463,12 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 [record["record_type"] for record in action_records],
                 [
                     "sample",
+                    "action_target",
                     "applied_action",
+                    "action_target",
                     "applied_action",
                     "sample",
+                    "action_target",
                     "applied_action",
                 ],
             )
@@ -471,6 +476,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertEqual(first_sample["sampled_action_chunk_shape"], [2, 8])
             self.assertEqual(len(first_sample["sampled_action_chunk"]), 2)
             self.assertEqual(len(first_sample["action_chunk"]), 2)
+            self.assertEqual(
+                (results_dir / "actions.jsonl").stat().st_mode & 0o777,
+                0o600,
+            )
             self.assertFalse((results_dir / "error.json").exists())
 
             frame_names = (
@@ -498,6 +507,8 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 "trajectory": [
                     {
                         "log_prob_old": np.asarray([-1.25], dtype=np.float32),
+                        "log/prob": np.asarray([1.0], dtype=np.float32),
+                        "log_prob": np.asarray([2.0], dtype=np.float32),
                         "step_index": np.asarray([0], dtype=np.int64),
                     }
                 ],
@@ -521,7 +532,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 json.loads(line)
                 for line in (results_dir / "actions.jsonl").read_text().splitlines()
             ]
-            self.assertEqual(len(records), 2)
+            self.assertEqual(len(records), 3)
             sample = records[0]
             self.assertEqual(sample["record_type"], "sample")
             self.assertEqual(sample["predicted_video"]["shape"], [1, 2, 3, 2, 2])
@@ -533,6 +544,12 @@ class HostedDroidRunnerTest(unittest.TestCase):
                     trajectory["step_000__log_prob_old"], [-1.25]
                 )
                 np.testing.assert_array_equal(trajectory["step_000__step_index"], [0])
+                colliding = sample["trajectory"]["steps"][0]
+                slash_key = colliding["log/prob"]["archive_key"]
+                underscore_key = colliding["log_prob"]["archive_key"]
+                self.assertNotEqual(slash_key, underscore_key)
+                np.testing.assert_array_equal(trajectory[slash_key], [1.0])
+                np.testing.assert_array_equal(trajectory[underscore_key], [2.0])
 
     def test_archives_full_sampled_chunk_before_open_loop_truncation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -619,6 +636,30 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertEqual(len(capture_calls), 5)
         self.assertEqual(len(retry_steps), 2)
 
+    def test_camera_transport_retry_does_not_advance_physics(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            transport_tool_failures={"isaac.capture_camera_image": 1},
+        )
+        result = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        self.assertEqual(result.action_steps, 1)
+        retry_steps = [
+            arguments
+            for name, arguments in mcp.calls
+            if name == "isaac.step_simulation" and arguments == {"num_steps": 2}
+        ]
+        self.assertEqual(retry_steps, [])
+
     def test_retries_idempotent_joint_target_after_transport_502(self) -> None:
         mcp = FakeMCP(
             readiness_failures=0,
@@ -674,9 +715,46 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 json.loads(line)
                 for line in (results_dir / "actions.jsonl").read_text().splitlines()
             ]
-            self.assertEqual([record["record_type"] for record in records], ["sample"])
+            self.assertEqual(
+                [record["record_type"] for record in records],
+                ["sample", "action_target"],
+            )
             self.assertFalse((results_dir / "result.json").exists())
             self.assertTrue((results_dir / "error.json").is_file())
+
+    def test_jsonl_writer_retries_short_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "short-writes"
+            real_write = os.write
+            writes = 0
+
+            def short_write(descriptor: int, data: bytes | memoryview) -> int:
+                nonlocal writes
+                writes += 1
+                length = max(1, len(data) // 2)
+                return real_write(descriptor, data[:length])
+
+            with patch("sim_evals.hosted_droid.os.write", side_effect=short_write):
+                HostedDroidRunner(
+                    FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True)),
+                    FakeSampler(),
+                    HostedDroidConfig(
+                        environment_uri="cybernetics://envs/env_droid",
+                        max_action_steps=1,
+                        results_dir=results_dir,
+                    ),
+                    sleep=lambda _: None,
+                ).run()
+
+            records = [
+                json.loads(line)
+                for line in (results_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertGreater(writes, len(records))
+            self.assertEqual(
+                [record["record_type"] for record in records],
+                ["sample", "action_target", "applied_action"],
+            )
 
     def test_retires_previous_evaluator_camera_generations(self) -> None:
         mcp = FakeMCP(readiness_failures=0, warm=True)
