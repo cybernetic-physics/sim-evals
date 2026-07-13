@@ -209,6 +209,11 @@ not replayed, so ambiguous or application-level errors still fail closed. An
 HTTP 502 is replayed only for absolute `isaac.set_joint_positions` targets,
 where sending the identical target again is idempotent; non-idempotent simulation
 steps still fail closed on transport ambiguity.
+An action is appended to evidence only after `step_simulation` reports the full
+requested frame count without `timed_out`; partial steps remain failure evidence,
+not acknowledged actions. Before creating a fresh camera generation, the runner
+deletes older evaluator-owned external roots and wrist cameras. The updated
+extension releases their render products, keeping retained sessions bounded.
 Sessions launched successfully by the evaluator remain running after the
 rollout. Use `--stop-session` to opt into cleanup. Attached sessions always
 remain caller-owned.

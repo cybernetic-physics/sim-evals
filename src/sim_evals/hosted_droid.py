@@ -34,6 +34,8 @@ _TRANSIENT_MCP_FAILURE_MARKERS = (
 _IDEMPOTENT_TRANSPORT_RETRY_TOOLS = frozenset({"isaac.set_joint_positions"})
 _TRANSIENT_TRANSPORT_FAILURE_MARKERS = ("HTTP 502",)
 _TRANSIENT_MCP_RETRIES = 12
+_DROID_EXTERNAL_CAMERA_ROOT_PREFIX = "/World/droid_eval_"
+_DROID_WRIST_CAMERA_PREFIX = "droid_eval_wrist_cam_"
 
 
 class HostedDroidError(RuntimeError):
@@ -436,6 +438,7 @@ class HostedDroidRunner:
                 with mcp_session(session_id) as mcp:
                     self._wait_for_isaac(mcp)
                     repaired_robot = self._ensure_robot(mcp)
+                    self._retire_previous_cameras(mcp)
                     created_cameras = self._ensure_cameras(mcp)
                     self._set_viewer_camera(mcp, created_cameras[0])
                     joint_indices = self._joint_indices(mcp)
@@ -564,6 +567,49 @@ class HostedDroidRunner:
                 )
             created.append(camera.prim_path)
         return created
+
+    def _retire_previous_cameras(self, mcp: MCPClient) -> None:
+        current_paths = {camera.prim_path for camera in self.config.cameras}
+        current_external_roots = {
+            path.rsplit("/", 1)[0]
+            for path in current_paths
+            if path.startswith(_DROID_EXTERNAL_CAMERA_ROOT_PREFIX)
+        }
+        stale_paths: set[str] = set()
+
+        world_prims = self._listed_prim_paths(mcp, "/World")
+        stale_paths.update(
+            path
+            for path in world_prims
+            if path.startswith(_DROID_EXTERNAL_CAMERA_ROOT_PREFIX)
+            and path not in current_external_roots
+        )
+
+        wrist_parent = "/World/robot/Gripper/Robotiq_2F_85/base_link"
+        wrist_prefix = f"{wrist_parent}/{_DROID_WRIST_CAMERA_PREFIX}"
+        wrist_prims = self._listed_prim_paths(mcp, wrist_parent)
+        stale_paths.update(
+            path
+            for path in wrist_prims
+            if path.startswith(wrist_prefix) and path not in current_paths
+        )
+
+        for path in sorted(stale_paths, key=lambda item: (-item.count("/"), item)):
+            self._call(mcp, "isaac.delete_object", {"prim_path": path})
+
+    def _listed_prim_paths(self, mcp: MCPClient, root_path: str) -> set[str]:
+        payload = self._call(mcp, "isaac.list_prims", {"root_path": root_path})
+        prims = payload.get("prims")
+        if not isinstance(prims, list):
+            raise HostedDroidError("isaac.list_prims did not return prims")
+        paths = {
+            prim.get("path")
+            for prim in prims
+            if isinstance(prim, Mapping) and isinstance(prim.get("path"), str)
+        }
+        if len(paths) != len(prims):
+            raise HostedDroidError("isaac.list_prims returned malformed prim records")
+        return cast(set[str], paths)
 
     def _set_viewer_camera(self, mcp: MCPClient, prim_path: str) -> None:
         if (
@@ -793,7 +839,7 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 "joint_indices": [*arm_indices, gripper_index],
             },
         )
-        self._call(
+        step = self._call(
             mcp,
             "isaac.step_simulation",
             {
@@ -802,6 +848,18 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 "observe_cap": 1,
             },
         )
+        stepped = step.get("stepped")
+        if (
+            isinstance(stepped, bool)
+            or not isinstance(stepped, int)
+            or stepped != self.config.physics_steps_per_action
+            or step.get("timed_out") is True
+        ):
+            raise HostedDroidError(
+                "isaac.step_simulation applied an incomplete action: "
+                f"expected {self.config.physics_steps_per_action} frames, "
+                f"stepped={stepped!r}, timed_out={step.get('timed_out')!r}"
+            )
 
     def _try_call(
         self, mcp: MCPClient, name: str, arguments: Mapping[str, Any]

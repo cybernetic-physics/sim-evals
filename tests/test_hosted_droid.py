@@ -74,6 +74,7 @@ class FakeMCP:
         supports_active_camera: bool = True,
         transient_tool_failures: Mapping[str, int] | None = None,
         transport_tool_failures: Mapping[str, int] | None = None,
+        step_payloads: list[dict[str, Any]] | None = None,
     ) -> None:
         self.readiness_failures = readiness_failures
         self.camera_capture_failures = camera_capture_failures
@@ -83,6 +84,7 @@ class FakeMCP:
         self.supports_active_camera = supports_active_camera
         self.transient_tool_failures = dict(transient_tool_failures or {})
         self.transport_tool_failures = dict(transport_tool_failures or {})
+        self.step_payloads = list(step_payloads or [])
         self.prims = (
             {
                 "/World/robot",
@@ -125,12 +127,30 @@ class FakeMCP:
                 "prim_path": arguments["prim_path"],
                 "type": prim_type,
             }
+        if name == "isaac.list_prims":
+            root = str(arguments["root_path"]).rstrip("/")
+            prefix = f"{root}/"
+            prims = []
+            for path in sorted(self.prims):
+                if not path.startswith(prefix):
+                    continue
+                relative = path[len(prefix) :]
+                first = relative.split("/", 1)[0]
+                child_path = f"{prefix}{first}"
+                if not any(item["path"] == child_path for item in prims):
+                    prims.append({"path": child_path, "type": "Xform"})
+            return {"status": "success", "prims": prims}
         if name == "isaac.load_usd":
             self.robot_loaded = True
             self.prims.add(arguments["prim_path"])
             return {"status": "success"}
         if name == "isaac.delete_object":
-            self.prims.discard(arguments["prim_path"])
+            path = str(arguments["prim_path"])
+            self.prims = {
+                prim
+                for prim in self.prims
+                if prim != path and not prim.startswith(f"{path}/")
+            }
             return {"status": "success"}
         if name == "isaac.create_camera":
             if "orientation" in arguments and not self.supports_camera_contract:
@@ -146,11 +166,11 @@ class FakeMCP:
             }
         if name == "isaac.execute_script":
             return {"status": "success", "result": {"status": "success"}}
-        if name in {
-            "isaac.play_simulation",
-            "isaac.step_simulation",
-            "isaac.set_joint_positions",
-        }:
+        if name == "isaac.step_simulation":
+            if self.step_payloads:
+                return {"status": "success", **self.step_payloads.pop(0)}
+            return {"status": "success", "stepped": arguments["num_steps"]}
+        if name in {"isaac.play_simulation", "isaac.set_joint_positions"}:
             return {"status": "success"}
         if name == "isaac.capture_camera_image":
             if self.camera_capture_failures:
@@ -592,6 +612,71 @@ class HostedDroidRunnerTest(unittest.TestCase):
         ]
         self.assertEqual(len(joint_targets), 2)
         self.assertEqual(joint_targets[0], joint_targets[1])
+
+    def test_partial_action_step_fails_without_applied_action_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "partial-step"
+            mcp = FakeMCP(
+                readiness_failures=0,
+                warm=True,
+                step_payloads=[
+                    {"stepped": 32},
+                    {"stepped": 5, "timed_out": True},
+                ],
+            )
+            runner = HostedDroidRunner(
+                FakeSimulationClient(mcp),
+                FakeSampler(),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=1,
+                    physics_steps_per_action=12,
+                    results_dir=results_dir,
+                ),
+                sleep=lambda _: None,
+            )
+
+            with self.assertRaisesRegex(HostedDroidError, "incomplete action"):
+                runner.run()
+
+            records = [
+                json.loads(line)
+                for line in (results_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual([record["record_type"] for record in records], ["sample"])
+            self.assertFalse((results_dir / "result.json").exists())
+            self.assertTrue((results_dir / "error.json").is_file())
+
+    def test_retires_previous_evaluator_camera_generations(self) -> None:
+        mcp = FakeMCP(readiness_failures=0, warm=True)
+        mcp.prims.update(
+            {
+                "/World/droid_eval_old/external_cam",
+                "/World/droid_eval_old/external_cam_2",
+                "/World/robot/Gripper/Robotiq_2F_85/base_link/droid_eval_wrist_cam_old",
+            }
+        )
+        result = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        deleted = [
+            arguments["prim_path"]
+            for name, arguments in mcp.calls
+            if name == "isaac.delete_object"
+        ]
+        self.assertIn("/World/droid_eval_old", deleted)
+        self.assertIn(
+            "/World/robot/Gripper/Robotiq_2F_85/base_link/droid_eval_wrist_cam_old",
+            deleted,
+        )
+        self.assertTrue(set(result.created_cameras).isdisjoint(deleted))
 
     def test_does_not_retry_non_idempotent_step_after_transport_502(self) -> None:
         mcp = FakeMCP(
