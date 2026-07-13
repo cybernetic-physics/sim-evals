@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import math
@@ -37,6 +38,15 @@ _TRANSIENT_TRANSPORT_FAILURE_MARKERS = ("HTTP 502",)
 _TRANSIENT_MCP_RETRIES = 12
 _DROID_EXTERNAL_CAMERA_ROOT_PREFIX = "/World/droid_eval_"
 _DROID_WRIST_CAMERA_PREFIX = "droid_eval_wrist_cam_"
+_PI0_DROID_POLICY_PROFILE: dict[str, Any] = {
+    "base_model": "pi0-droid",
+    "openpi_config": "pi0_droid_jointpos_polaris",
+    "checkpoint_uri": "gs://openpi-assets/checkpoints/polaris/pi0_droid_jointpos_polaris",
+    "openpi_source_commit": "714ec9aa5e4e9b73b98c6bf3a328f377268e26f9",
+    "action_space": "droid_joint_position",
+    "action_horizon": 10,
+    "action_dim": 8,
+}
 
 
 class HostedDroidError(RuntimeError):
@@ -83,6 +93,7 @@ class CameraSpec:
 class HostedDroidConfig:
     environment_uri: str
     session_id: str | None = None
+    base_model: str = "dreamzero-droid"
     instruction: str = "put the cube in the bowl"
     robot_prim_path: str = "/World/robot"
     robot_usd_path: str = "/data/workspace/franka_robotiq_2f_85_flattened.usd"
@@ -91,7 +102,8 @@ class HostedDroidConfig:
     image_height: int = 360
     max_action_steps: int = 450
     open_loop_horizon: int = 8
-    physics_steps_per_action: int = 8
+    physics_steps_per_action: int | None = None
+    target_control_hz: float = 15.0
     runtime_provider: str | None = None
     policy_mode: str = "native"
     include_predicted_video: bool = False
@@ -100,6 +112,8 @@ class HostedDroidConfig:
     readiness_timeout_seconds: float = 600.0
     readiness_poll_seconds: float = 5.0
     keep_session: bool = True
+    record_video: bool = False
+    video_fps: int = 15
     results_dir: Path | None = None
 
     def __post_init__(self) -> None:
@@ -109,6 +123,8 @@ class HostedDroidConfig:
             raise ValueError("session_id must not be empty")
         if not self.instruction.strip():
             raise ValueError("instruction must not be empty")
+        if not self.base_model.strip():
+            raise ValueError("base_model must not be empty")
         if self.policy_mode not in {"native", "sde"}:
             raise ValueError("policy_mode must be native or sde")
         if len(self.cameras) != 3:
@@ -118,10 +134,17 @@ class HostedDroidConfig:
             ("image_height", self.image_height),
             ("max_action_steps", self.max_action_steps),
             ("open_loop_horizon", self.open_loop_horizon),
-            ("physics_steps_per_action", self.physics_steps_per_action),
+            ("video_fps", self.video_fps),
         ):
             if value < 1:
                 raise ValueError(f"{name} must be at least 1")
+        if (
+            self.physics_steps_per_action is not None
+            and self.physics_steps_per_action < 1
+        ):
+            raise ValueError("physics_steps_per_action must be at least 1")
+        if not math.isfinite(self.target_control_hz) or self.target_control_hz <= 0:
+            raise ValueError("target_control_hz must be positive and finite")
 
 
 @dataclass(frozen=True)
@@ -132,6 +155,9 @@ class HostedDroidRunResult:
     repaired_robot: bool
     created_cameras: tuple[str, ...]
     session_retained: bool
+    physics_dt: float
+    physics_steps_per_action: int
+    control_hz: float
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,24 +167,34 @@ class HostedDroidRunResult:
             "repaired_robot": self.repaired_robot,
             "created_cameras": list(self.created_cameras),
             "session_retained": self.session_retained,
+            "physics_dt": self.physics_dt,
+            "physics_steps_per_action": self.physics_steps_per_action,
+            "control_hz": self.control_hz,
         }
 
 
-_EVIDENCE_SCHEMA_VERSION = 4
+_EVIDENCE_SCHEMA_VERSION = 5
 _EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
 
 
 class _EvidenceRecorder:
     def __init__(self, results_dir: Path, config: HostedDroidConfig) -> None:
         self.results_dir = results_dir
+        self.config = config
         self.frames_dir = results_dir / "frames"
         self.samples_dir = results_dir / "samples"
         self.actions_path = results_dir / "actions.jsonl"
+        self.video_frames_dir = results_dir / "video-frames"
+        self.video_path = results_dir / "rollout.mp4"
+        self.video_manifest_path = self.video_frames_dir / "manifest.json"
+        self.runtime_path = results_dir / "runtime.json"
+        self._video_metadata: dict[str, Any] | None = None
         self._action_record_count = 0
         self.started_at = _utc_now()
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.frames_dir.mkdir(parents=True, exist_ok=True)
         self.samples_dir.mkdir(parents=True, exist_ok=True)
+        self.video_frames_dir.mkdir(parents=True, exist_ok=True)
         self._clear_previous_evidence()
         self._write_json(
             self.results_dir / "config.json",
@@ -172,6 +208,82 @@ class _EvidenceRecorder:
     def write_frame(self, sample_index: int, camera_index: int, raw: bytes) -> None:
         name = _evidence_frame_name(sample_index, camera_index)
         _atomic_write(self.frames_dir / name, raw)
+
+    def write_video_frame(self, action_index: int, rgb: np.ndarray) -> None:
+        output = io.BytesIO()
+        Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB").save(
+            output, format="PNG"
+        )
+        _atomic_write(
+            self.video_frames_dir / f"action-{action_index:05d}.png",
+            output.getvalue(),
+        )
+
+    def write_runtime_metadata(self, metadata: Mapping[str, Any]) -> None:
+        self._write_json(
+            self.runtime_path,
+            {
+                "schema_version": _EVIDENCE_SCHEMA_VERSION,
+                **metadata,
+            },
+        )
+
+    def finalize_video(self, fps: int) -> None:
+        paths = sorted(self.video_frames_dir.glob("action-*.png"))
+        if not paths:
+            return
+        import mediapy
+
+        frames: list[np.ndarray] = []
+        frame_manifest: list[dict[str, Any]] = []
+        for path in paths:
+            raw = path.read_bytes()
+            frame = np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"))
+            frames.append(frame)
+            frame_manifest.append(
+                {
+                    "path": str(path.relative_to(self.results_dir)),
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+        height, width = frames[0].shape[:2]
+        if any(frame.shape != (height, width, 3) for frame in frames):
+            raise HostedDroidError("video source frames do not share one RGB shape")
+        self._write_json(
+            self.video_manifest_path,
+            {
+                "schema_version": _EVIDENCE_SCHEMA_VERSION,
+                "source_camera": self.config.cameras[0].prim_path,
+                "frames": frame_manifest,
+            },
+        )
+        temporary_path = self.video_path.with_suffix(".tmp.mp4")
+        temporary_path.unlink(missing_ok=True)
+        mediapy.write_video(temporary_path, frames, fps=fps, codec="h264")
+        decoded = np.asarray(mediapy.read_video(temporary_path))
+        if decoded.shape != (len(frames), height, width, 3):
+            raise HostedDroidError(
+                "encoded rollout video failed decode validation: "
+                f"expected {[len(frames), height, width, 3]}, got {list(decoded.shape)}"
+            )
+        os.replace(temporary_path, self.video_path)
+        video_bytes = self.video_path.read_bytes()
+        self._video_metadata = {
+            "path": str(self.video_path.relative_to(self.results_dir)),
+            "bytes": len(video_bytes),
+            "sha256": hashlib.sha256(video_bytes).hexdigest(),
+            "frames": len(frames),
+            "fps": fps,
+            "duration_seconds": len(frames) / fps,
+            "width": width,
+            "height": height,
+            "codec": "h264",
+            "source_camera": self.config.cameras[0].prim_path,
+            "source_frames_manifest": str(
+                self.video_manifest_path.relative_to(self.results_dir)
+            ),
+        }
 
     def write_sample(
         self,
@@ -202,6 +314,11 @@ class _EvidenceRecorder:
                 "shape": list(array.shape),
                 "dtype": str(array.dtype),
             }
+        policy_metadata = _response_field(response, "policy_metadata")
+        if policy_metadata is not None:
+            if not isinstance(policy_metadata, Mapping):
+                raise HostedDroidError("policy_metadata must be a mapping")
+            record["policy_metadata"] = dict(policy_metadata)
 
         trajectory = _response_field(response, "trajectory")
         if trajectory is not None:
@@ -246,6 +363,7 @@ class _EvidenceRecorder:
         policy_action: np.ndarray,
         joint_positions: list[float],
         joint_indices: list[int],
+        simulation_timing: Mapping[str, Any],
     ) -> None:
         self._append_action_record(
             {
@@ -257,6 +375,7 @@ class _EvidenceRecorder:
                 "policy_action": policy_action.astype(float).tolist(),
                 "joint_positions": joint_positions,
                 "joint_indices": joint_indices,
+                "simulation_timing": dict(simulation_timing),
             }
         )
 
@@ -315,7 +434,13 @@ class _EvidenceRecorder:
             },
         )
 
-    def write_error(self, error: BaseException, session_id: str | None) -> None:
+    def write_error(
+        self,
+        error: BaseException,
+        session_id: str | None,
+        *,
+        evidence_errors: list[str] | None = None,
+    ) -> None:
         payload: dict[str, Any] = {
             "schema_version": _EVIDENCE_SCHEMA_VERSION,
             "status": "failed",
@@ -329,6 +454,8 @@ class _EvidenceRecorder:
         }
         if session_id is not None:
             payload["session_id"] = session_id
+        if evidence_errors:
+            payload["evidence_errors"] = evidence_errors
         self._write_json(self.results_dir / "error.json", payload)
 
     def _clear_previous_evidence(self) -> None:
@@ -336,12 +463,18 @@ class _EvidenceRecorder:
             self.results_dir / "result.json",
             self.results_dir / "error.json",
             self.actions_path,
+            self.runtime_path,
         ):
             path.unlink(missing_ok=True)
         for path in self.frames_dir.glob("sample-*.png"):
             path.unlink()
         for path in self.samples_dir.glob("sample-*.*"):
             path.unlink()
+        for path in self.video_frames_dir.glob("action-*.png"):
+            path.unlink()
+        self.video_path.unlink(missing_ok=True)
+        self.video_path.with_suffix(".tmp.mp4").unlink(missing_ok=True)
+        self.video_manifest_path.unlink(missing_ok=True)
 
     def _evidence_dict(self) -> dict[str, Any]:
         frames = []
@@ -370,6 +503,12 @@ class _EvidenceRecorder:
             "frames": frames,
             "actions": actions,
             "sample_artifacts": sample_artifacts,
+            "runtime": (
+                str(self.runtime_path.relative_to(self.results_dir))
+                if self.runtime_path.is_file()
+                else None
+            ),
+            "video": self._video_metadata if self.video_path.is_file() else None,
         }
 
     @staticmethod
@@ -420,7 +559,7 @@ def _default_cameras() -> tuple[CameraSpec, ...]:
 
 
 class HostedDroidRunner:
-    """Run DreamZero on DGX Spark against a hosted Isaac MCP session."""
+    """Run a Cybernetics DROID policy against a hosted Isaac MCP session."""
 
     def __init__(
         self,
@@ -483,15 +622,30 @@ class HostedDroidRunner:
                     created_cameras = self._ensure_cameras(mcp)
                     self._set_viewer_camera(mcp, created_cameras[0])
                     joint_indices = self._joint_indices(mcp)
-                    self._call(mcp, "isaac.play_simulation", {})
-                    self._call(
+                    physics_dt, physics_steps_per_action = self._control_cadence(mcp)
+                    control_hz = 1.0 / (physics_dt * physics_steps_per_action)
+                    if evidence is not None:
+                        evidence.write_runtime_metadata(
+                            {
+                                "base_model": self.config.base_model,
+                                "physics_dt": physics_dt,
+                                "physics_steps_per_action": physics_steps_per_action,
+                                "target_control_hz": self.config.target_control_hz,
+                                "control_hz": control_hz,
+                            }
+                        )
+                    self._step_while_playing(
                         mcp,
-                        "isaac.step_simulation",
-                        {"num_steps": _CAMERA_WARMUP_STEPS},
+                        num_steps=_CAMERA_WARMUP_STEPS,
                     )
                     self._sleep(_CAMERA_WARMUP_SECONDS)
                     self.sampling_api.reset_sampling_session()
-                    samples, action_steps = self._rollout(mcp, joint_indices, evidence)
+                    samples, action_steps = self._rollout(
+                        mcp,
+                        joint_indices,
+                        physics_steps_per_action,
+                        evidence,
+                    )
                 result = HostedDroidRunResult(
                     session_id=session_id,
                     samples=samples,
@@ -499,6 +653,9 @@ class HostedDroidRunner:
                     repaired_robot=repaired_robot,
                     created_cameras=tuple(created_cameras),
                     session_retained=not owns_session or self.config.keep_session,
+                    physics_dt=physics_dt,
+                    physics_steps_per_action=physics_steps_per_action,
+                    control_hz=control_hz,
                 )
             finally:
                 self.sampling_api.close()
@@ -508,9 +665,24 @@ class HostedDroidRunner:
                     and not self.config.keep_session
                 ):
                     self.simulation_client.stop_session(session_id)
+            if evidence is not None and self.config.record_video:
+                evidence.finalize_video(self.config.video_fps)
         except BaseException as exc:
             if evidence is not None:
-                evidence.write_error(exc, session_id)
+                evidence_errors: list[str] = []
+                if self.config.record_video and not evidence.video_path.is_file():
+                    try:
+                        evidence.finalize_video(self.config.video_fps)
+                    except Exception as evidence_exc:
+                        evidence_errors.append(
+                            f"video finalization failed: {type(evidence_exc).__name__}: "
+                            f"{evidence_exc}"
+                        )
+                evidence.write_error(
+                    exc,
+                    session_id,
+                    evidence_errors=evidence_errors,
+                )
             raise
         if evidence is not None:
             evidence.write_result(result)
@@ -734,6 +906,7 @@ print({{"status": "success", "prim_path": {prim_path}}})
         self,
         mcp: MCPClient,
         joint_indices: tuple[list[int], int],
+        physics_steps_per_action: int,
         evidence: _EvidenceRecorder | None = None,
     ) -> tuple[int, int]:
         samples = 0
@@ -745,6 +918,7 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 timeout=self.config.request_timeout_seconds,
             )
             sampled_chunk = _action_chunk(response)
+            _validate_policy_response(self.config.base_model, response, sampled_chunk)
             chunk = sampled_chunk[: self.config.open_loop_horizon]
             sample_index = samples
             if evidence is not None:
@@ -769,10 +943,15 @@ print({{"status": "success", "prim_path": {prim_path}}})
                         action_index=action_steps,
                         policy_action=action,
                     )
-                joint_positions, applied_joint_indices = self._apply_action(
+                (
+                    joint_positions,
+                    applied_joint_indices,
+                    simulation_timing,
+                ) = self._apply_action(
                     mcp,
                     joint_indices,
                     action,
+                    physics_steps_per_action,
                     on_target_accepted=on_target_accepted,
                 )
                 if evidence is not None:
@@ -783,7 +962,17 @@ print({{"status": "success", "prim_path": {prim_path}}})
                         policy_action=action,
                         joint_positions=joint_positions,
                         joint_indices=applied_joint_indices,
+                        simulation_timing=simulation_timing,
                     )
+                    if self.config.record_video:
+                        video_rgb = self._capture_rgb(
+                            mcp,
+                            self.config.cameras[0].prim_path,
+                            action_steps,
+                            0,
+                            None,
+                        )
+                        evidence.write_video_frame(action_steps, video_rgb)
                 action_steps += 1
         return samples, action_steps
 
@@ -877,10 +1066,9 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 if attempt == _CAMERA_CAPTURE_ATTEMPTS:
                     break
                 if not _is_transport_failure(exc):
-                    self._call(
+                    self._step_while_playing(
                         mcp,
-                        "isaac.step_simulation",
-                        {"num_steps": _CAMERA_CAPTURE_RETRY_STEPS},
+                        num_steps=_CAMERA_CAPTURE_RETRY_STEPS,
                     )
                 self._sleep(_CAMERA_CAPTURE_RETRY_SECONDS)
         raise HostedDroidError(
@@ -888,16 +1076,88 @@ print({{"status": "success", "prim_path": {prim_path}}})
             f"{_CAMERA_CAPTURE_ATTEMPTS} attempts: {last_error}"
         ) from last_error
 
+    def _control_cadence(self, mcp: MCPClient) -> tuple[float, int]:
+        state = self._simulation_state(mcp)
+        physics_dt = state["physics_dt"]
+        configured_steps = self.config.physics_steps_per_action
+        if configured_steps is not None:
+            return physics_dt, configured_steps
+        steps = max(1, round(1.0 / (self.config.target_control_hz * physics_dt)))
+        return physics_dt, steps
+
+    def _simulation_state(self, mcp: MCPClient) -> dict[str, Any]:
+        state = self._call(mcp, "isaac.get_simulation_state", {})
+        physics_dt = state.get("physics_dt")
+        current_time = state.get("current_time")
+        timeline_state = state.get("timeline_state")
+        if (
+            isinstance(physics_dt, bool)
+            or not isinstance(physics_dt, (int, float))
+            or not math.isfinite(float(physics_dt))
+            or float(physics_dt) <= 0
+        ):
+            raise HostedDroidError(
+                f"isaac.get_simulation_state returned invalid physics_dt: {physics_dt!r}"
+            )
+        if (
+            isinstance(current_time, bool)
+            or not isinstance(current_time, (int, float))
+            or not math.isfinite(float(current_time))
+        ):
+            raise HostedDroidError(
+                "isaac.get_simulation_state returned invalid current_time: "
+                f"{current_time!r}"
+            )
+        if timeline_state not in {"playing", "paused", "stopped"}:
+            raise HostedDroidError(
+                "isaac.get_simulation_state returned invalid timeline_state: "
+                f"{timeline_state!r}"
+            )
+        return {
+            "physics_dt": float(physics_dt),
+            "current_time": float(current_time),
+            "timeline_state": timeline_state,
+        }
+
+    def _step_while_playing(
+        self,
+        mcp: MCPClient,
+        *,
+        num_steps: int,
+        observe_joints: list[str] | None = None,
+        observe_cap: int | None = None,
+    ) -> dict[str, Any]:
+        self._call(mcp, "isaac.play_simulation", {})
+        try:
+            arguments: dict[str, Any] = {"num_steps": num_steps}
+            if observe_joints is not None:
+                arguments["observe_joints"] = observe_joints
+            if observe_cap is not None:
+                arguments["observe_cap"] = observe_cap
+            result = self._call(mcp, "isaac.step_simulation", arguments)
+        except BaseException as step_exc:
+            try:
+                self._call(mcp, "isaac.pause_simulation", {})
+            except Exception as pause_exc:
+                raise HostedDroidError(
+                    f"simulation step failed ({step_exc}); pause also failed: {pause_exc}"
+                ) from step_exc
+            raise
+        else:
+            self._call(mcp, "isaac.pause_simulation", {})
+            return result
+
     def _apply_action(
         self,
         mcp: MCPClient,
         joint_indices: tuple[list[int], int],
         action: np.ndarray,
+        physics_steps_per_action: int,
         *,
         on_target_accepted: Callable[[list[float], list[int]], None] | None = None,
-    ) -> tuple[list[float], list[int]]:
+    ) -> tuple[list[float], list[int], dict[str, Any]]:
         arm_indices, gripper_index = joint_indices
-        gripper = float(np.clip(action[7], 0.0, 1.0) * GRIPPER_CLOSED_RADIANS)
+        gripper = GRIPPER_CLOSED_RADIANS if float(action[7]) > 0.5 else 0.0
         applied_joint_indices = [*arm_indices, gripper_index]
         joint_positions = [*action[:7].astype(float).tolist(), gripper]
         self._call(
@@ -911,28 +1171,42 @@ print({{"status": "success", "prim_path": {prim_path}}})
         )
         if on_target_accepted is not None:
             on_target_accepted(joint_positions, applied_joint_indices)
-        step = self._call(
+        before = self._simulation_state(mcp)
+        step = self._step_while_playing(
             mcp,
-            "isaac.step_simulation",
-            {
-                "num_steps": self.config.physics_steps_per_action,
-                "observe_joints": [self.config.robot_prim_path],
-                "observe_cap": 1,
-            },
+            num_steps=physics_steps_per_action,
+            observe_joints=[self.config.robot_prim_path],
+            observe_cap=1,
         )
+        after = self._simulation_state(mcp)
         stepped = step.get("stepped")
         if (
             isinstance(stepped, bool)
             or not isinstance(stepped, int)
-            or stepped != self.config.physics_steps_per_action
+            or stepped != physics_steps_per_action
             or step.get("timed_out") is True
         ):
             raise HostedDroidError(
                 "isaac.step_simulation applied an incomplete action: "
-                f"expected {self.config.physics_steps_per_action} frames, "
+                f"expected {physics_steps_per_action} frames, "
                 f"stepped={stepped!r}, timed_out={step.get('timed_out')!r}"
             )
-        return joint_positions, applied_joint_indices
+        observed_seconds = after["current_time"] - before["current_time"]
+        if observed_seconds < 0:
+            raise HostedDroidError("simulation time moved backward while applying action")
+        expected_seconds = physics_steps_per_action * before["physics_dt"]
+        return (
+            joint_positions,
+            applied_joint_indices,
+            {
+                "before": before,
+                "after": after,
+                "stepped": stepped,
+                "expected_simulation_seconds": expected_seconds,
+                "observed_simulation_seconds": observed_seconds,
+                "timeline_drift_seconds": observed_seconds - expected_seconds,
+            },
+        )
 
     def _try_call(
         self, mcp: MCPClient, name: str, arguments: Mapping[str, Any]
@@ -1098,10 +1372,29 @@ def _tensor_array(value: Any, name: str) -> np.ndarray:
     return np.ascontiguousarray(array)
 
 
+def _validate_policy_response(
+    base_model: str,
+    response: Any,
+    action_chunk: np.ndarray,
+) -> None:
+    if base_model != "pi0-droid":
+        return
+    metadata = _response_field(response, "policy_metadata")
+    if not isinstance(metadata, Mapping) or dict(metadata) != _PI0_DROID_POLICY_PROFILE:
+        raise HostedDroidError(
+            "pi0-droid response did not prove the pinned joint-position policy profile"
+        )
+    if action_chunk.shape != (10, 8):
+        raise HostedDroidError(
+            f"pi0-droid must return action_chunk [10,8], got {list(action_chunk.shape)}"
+        )
+
+
 def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
     return {
         "environment_uri": config.environment_uri,
         "session_id": config.session_id,
+        "base_model": config.base_model,
         "instruction": config.instruction,
         "robot_prim_path": config.robot_prim_path,
         "robot_usd_path": config.robot_usd_path,
@@ -1123,6 +1416,7 @@ def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
         "max_action_steps": config.max_action_steps,
         "open_loop_horizon": config.open_loop_horizon,
         "physics_steps_per_action": config.physics_steps_per_action,
+        "target_control_hz": config.target_control_hz,
         "runtime_provider": config.runtime_provider,
         "policy_mode": config.policy_mode,
         "include_predicted_video": config.include_predicted_video,
@@ -1131,6 +1425,8 @@ def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
         "readiness_timeout_seconds": config.readiness_timeout_seconds,
         "readiness_poll_seconds": config.readiness_poll_seconds,
         "keep_session": config.keep_session,
+        "record_video": config.record_video,
+        "video_fps": config.video_fps,
         "results_dir": str(config.results_dir) if config.results_dir else None,
     }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -52,6 +53,18 @@ def _white_sliver_png_base64(*, width: int = 640, height: int = 360) -> str:
     return base64.b64encode(output.getvalue()).decode("ascii")
 
 
+def _pi0_policy_profile() -> dict[str, Any]:
+    return {
+        "base_model": "pi0-droid",
+        "openpi_config": "pi0_droid_jointpos_polaris",
+        "checkpoint_uri": "gs://openpi-assets/checkpoints/polaris/pi0_droid_jointpos_polaris",
+        "openpi_source_commit": "714ec9aa5e4e9b73b98c6bf3a328f377268e26f9",
+        "action_space": "droid_joint_position",
+        "action_horizon": 10,
+        "action_dim": 8,
+    }
+
+
 class FakeMCP:
     joint_names = [
         "right_outer_knuckle_joint",
@@ -87,6 +100,9 @@ class FakeMCP:
         self.transient_tool_failures = dict(transient_tool_failures or {})
         self.transport_tool_failures = dict(transport_tool_failures or {})
         self.step_payloads = list(step_payloads or [])
+        self.physics_dt = 1.0 / 60.0
+        self.current_time = 0.0
+        self.timeline_state = "stopped"
         self.prims = (
             {
                 "/World/robot",
@@ -170,9 +186,25 @@ class FakeMCP:
             return {"status": "success", "result": {"status": "success"}}
         if name == "isaac.step_simulation":
             if self.step_payloads:
-                return {"status": "success", **self.step_payloads.pop(0)}
-            return {"status": "success", "stepped": arguments["num_steps"]}
-        if name in {"isaac.play_simulation", "isaac.set_joint_positions"}:
+                result = {"status": "success", **self.step_payloads.pop(0)}
+            else:
+                result = {"status": "success", "stepped": arguments["num_steps"]}
+            self.current_time += int(result.get("stepped", 0)) * self.physics_dt
+            return result
+        if name == "isaac.get_simulation_state":
+            return {
+                "status": "success",
+                "timeline_state": self.timeline_state,
+                "current_time": self.current_time,
+                "physics_dt": self.physics_dt,
+            }
+        if name == "isaac.play_simulation":
+            self.timeline_state = "playing"
+            return {"status": "success"}
+        if name == "isaac.pause_simulation":
+            self.timeline_state = "paused"
+            return {"status": "success"}
+        if name == "isaac.set_joint_positions":
             return {"status": "success"}
         if name == "isaac.capture_camera_image":
             if self.camera_capture_failures:
@@ -322,7 +354,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
         step_calls = [
             args for name, args in mcp.calls if name == "isaac.step_simulation"
         ]
-        self.assertEqual(step_calls[-1]["num_steps"], 8)
+        self.assertEqual(step_calls[-1]["num_steps"], 4)
+        self.assertAlmostEqual(result.physics_dt, 1.0 / 60.0)
+        self.assertEqual(result.physics_steps_per_action, 4)
+        self.assertAlmostEqual(result.control_hz, 15.0)
 
     def test_keeps_valid_robot_and_uses_fresh_cameras_by_default(self) -> None:
         mcp = FakeMCP(readiness_failures=0, warm=True)
@@ -438,7 +473,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             config_payload = json.loads(
                 (results_dir / "config.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(config_payload["schema_version"], 4)
+            self.assertEqual(config_payload["schema_version"], 5)
             self.assertEqual(
                 config_payload["config"]["environment_uri"],
                 config.environment_uri,
@@ -562,6 +597,166 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 self.assertNotEqual(slash_key, underscore_key)
                 np.testing.assert_array_equal(trajectory[slash_key], [1.0])
                 np.testing.assert_array_equal(trajectory[underscore_key], [2.0])
+
+    def test_records_post_action_frames_as_rollout_mp4(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "video-results"
+            written: dict[str, Any] = {}
+
+            def write_video(path, frames, *, fps, codec):
+                written["frames"] = list(frames)
+                written["fps"] = fps
+                written["codec"] = codec
+                Path(path).write_bytes(b"validated-mp4")
+
+            def read_video(_path):
+                return np.stack(written["frames"])
+
+            runner = HostedDroidRunner(
+                FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True)),
+                FakeSampler(
+                    response={
+                        "action_chunk": np.zeros((1, 10, 8), dtype=np.float32),
+                        "policy_metadata": _pi0_policy_profile(),
+                    }
+                ),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    base_model="pi0-droid",
+                    max_action_steps=3,
+                    open_loop_horizon=3,
+                    record_video=True,
+                    video_fps=12,
+                    results_dir=results_dir,
+                ),
+                sleep=lambda _: None,
+            )
+
+            with patch.dict(
+                "sys.modules",
+                {
+                    "mediapy": SimpleNamespace(
+                        write_video=write_video,
+                        read_video=read_video,
+                    )
+                },
+            ):
+                runner.run()
+
+            self.assertEqual(len(written["frames"]), 3)
+            self.assertEqual(written["fps"], 12)
+            self.assertEqual(written["codec"], "h264")
+            self.assertEqual(
+                (results_dir / "rollout.mp4").read_bytes(), b"validated-mp4"
+            )
+            self.assertEqual(
+                len(list((results_dir / "video-frames").glob("action-*.png"))),
+                3,
+            )
+            result_payload = json.loads(
+                (results_dir / "result.json").read_text(encoding="utf-8")
+            )
+            video = result_payload["evidence"]["video"]
+            self.assertEqual(video["path"], "rollout.mp4")
+            self.assertEqual(video["frames"], 3)
+            self.assertEqual(video["fps"], 12)
+            self.assertEqual(video["codec"], "h264")
+            self.assertEqual(video["width"], 640)
+            self.assertEqual(video["height"], 360)
+            self.assertEqual(
+                video["sha256"], hashlib.sha256(b"validated-mp4").hexdigest()
+            )
+            manifest = json.loads(
+                (results_dir / video["source_frames_manifest"]).read_text()
+            )
+            self.assertEqual(len(manifest["frames"]), 3)
+
+    def test_video_failure_does_not_mask_original_rollout_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "video-error"
+            runner = HostedDroidRunner(
+                FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True)),
+                FakeSampler(error=RuntimeError("policy failed")),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=1,
+                    record_video=True,
+                    results_dir=results_dir,
+                ),
+                sleep=lambda _: None,
+            )
+
+            with patch(
+                "sim_evals.hosted_droid._EvidenceRecorder.finalize_video",
+                side_effect=RuntimeError("encoder failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "policy failed"):
+                    runner.run()
+
+            payload = json.loads((results_dir / "error.json").read_text())
+            self.assertEqual(payload["error"]["message"], "policy failed")
+            self.assertEqual(
+                payload["evidence_errors"],
+                ["video finalization failed: RuntimeError: encoder failed"],
+            )
+
+    def test_pi0_response_requires_pinned_joint_position_profile(self) -> None:
+        runner = HostedDroidRunner(
+            FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True)),
+            FakeSampler(
+                response={"action_chunk": np.zeros((1, 10, 8), dtype=np.float32)}
+            ),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                base_model="pi0-droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaisesRegex(HostedDroidError, "did not prove"):
+            runner.run()
+
+    def test_control_cadence_derives_eight_steps_at_120_hz(self) -> None:
+        mcp = FakeMCP(readiness_failures=0, warm=True)
+        mcp.physics_dt = 1.0 / 120.0
+        result = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        self.assertEqual(result.physics_steps_per_action, 8)
+        self.assertAlmostEqual(result.control_hz, 15.0)
+
+    def test_gripper_actions_match_reference_binary_threshold(self) -> None:
+        mcp = FakeMCP(readiness_failures=0, warm=True)
+        actions = np.zeros((1, 3, 8), dtype=np.float32)
+        actions[0, :, 7] = [0.49, 0.5, 0.51]
+        HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(response={"action_chunk": actions}),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=3,
+                open_loop_horizon=3,
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        set_calls = [
+            arguments
+            for name, arguments in mcp.calls
+            if name == "isaac.set_joint_positions"
+        ]
+        self.assertEqual(
+            [call["joint_positions"][-1] for call in set_calls],
+            [0.0, 0.0, GRIPPER_CLOSED_RADIANS],
+        )
 
     def test_archives_full_sampled_chunk_before_open_loop_truncation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -71,7 +71,7 @@ success term. Results therefore leave `success` unset and record the start/end
 object-to-target center distance as a diagnostic rather than inventing a pass
 threshold.
 
-### DreamZero-DROID through Cybernetics
+### DROID Policies through Cybernetics
 
 Install the Cybernetics SDK, configure its normal environment-based
 authentication, and run:
@@ -88,8 +88,8 @@ python run_eval.py --backend cybernetics --episodes 10 --scene 1 --headless --de
 ```
 
 No credential is accepted as a command-line argument. The integration assumes
-`ServiceClient.create_sampling_client(base_model="dreamzero-droid")` returns a
-sampling client with the typed DROID helper:
+`ServiceClient.create_sampling_client(base_model="dreamzero-droid")` or
+`base_model="pi0-droid"` returns a sampling client with the typed DROID helper:
 
 ```python
 observation = cybernetics.DroidObservation.from_numpy(...)
@@ -99,12 +99,12 @@ response = future.result(timeout=2400)
 
 The observation carries both exterior cameras, the wrist camera, seven arm
 joint positions, one gripper position, and the natural-language instruction.
-The response exposes a robot-space `action_chunk` with shape `[1, N, 8]`; the
-evaluation follows DreamZero's eight-action open-loop cadence. Each episode gets
-a fresh sampling session and the previous session is cancelled so backend frame
-history and causal cache ownership are released.
+The response exposes a robot-space `action_chunk` with shape `[1, N, 8]`. Use an
+eight-action open-loop cadence for DreamZero and ten for the PolaRiS PI0
+joint-position policy. Each episode gets a fresh sampling session and the
+previous session is cancelled so backend policy state is released.
 
-Hosted evidence schema v4 preserves both the full normalized model output in
+Hosted evidence schema v5 preserves both the full normalized model output in
 `sampled_action_chunk` and the configured open-loop execution slice in
 `action_chunk`. `sampled_action_chunk_shape` records the normalized `[N, 8]`
 shape before horizon or maximum-step truncation.
@@ -120,8 +120,8 @@ planes:
 
 - Cybernetic Physics launches the configured environment and owns every
   `isaac.*` MCP scene read, camera capture, joint write, and simulation step.
-- DGX Spark is the sole DreamZero execution plane. The runner calls the public
-  Cybernetics `sample_droid` helper and does not load DreamZero into Isaac.
+- Worldlines owns policy execution. The runner calls the public Cybernetics
+  `sample_droid` helper and never loads a policy into Isaac.
 
 Use a Cybernetics SDK release that provides
 `cybernetics.sim.SimulationClient.mcp_session`. Authenticate with the normal
@@ -133,6 +133,23 @@ no credential arguments. The environment URI can be passed directly or through
 export CYBERNETICS_DROID_ENV_URI=cybernetics://envs/ENV_ID/versions/VERSION_ID
 python run_hosted_eval.py --max-action-steps 450
 ```
+
+For the inference-only PI0 joint-position policy, record a 100-action rollout
+and intentionally stop the launched simulator after the MP4 is durable:
+
+```bash
+python run_hosted_eval.py \
+  --base-model pi0-droid \
+  --environment-uri "$CYBERNETICS_DROID_ENV_URI" \
+  --open-loop-horizon 10 \
+  --max-action-steps 100 \
+  --record-video \
+  --video-fps 15 \
+  --stop-session \
+  --results-dir "$PWD/runs/hosted-production/pi0-droid-scene1"
+```
+
+PI0 does not support `--policy-mode sde` or `--include-predicted-video`.
 
 On macOS, use an isolated environment because the local IsaacLab dependencies
 are Linux-only. Point `CYBERNETICS_SDK_CHECKOUT` at a current Cybernetics SDK
@@ -153,7 +170,6 @@ uv run --isolated --no-project \
   --instruction "put the cube in the bowl" \
   --max-action-steps 450 \
   --open-loop-horizon 8 \
-  --physics-steps-per-action 8 \
   --results-dir "$PWD/runs/hosted-droid/droid-replication"
 ```
 
@@ -201,8 +217,8 @@ After the hosted session reaches the running state, the runner opens its MCP
 session and polls `isaac.get_scene_info` until the extension is ready. It then
 validates or reloads the DROID articulation, creates a fresh evaluator-owned
 generation of exterior/wrist cameras, captures RGB PNG artifacts, reads named
-joint positions, samples one DreamZero action chunk, and applies up to eight
-actions before observing again. Fresh camera paths avoid stale path-keyed render
+joint positions, samples one policy action chunk, and applies the configured
+open-loop slice before observing again. Fresh camera paths avoid stale path-keyed render
 products on older hosted images; the extension also releases those cached
 wrappers when cameras are replaced or deleted. The runner selects the first
 external camera for the streamed viewer through `isaac.set_active_camera`, with
@@ -223,6 +239,15 @@ Sessions launched successfully by the evaluator remain running after the
 rollout. Use `--stop-session` to opt into cleanup. Attached sessions always
 remain caller-owned.
 
+The runner reads `physics_dt` from `isaac.get_simulation_state` and derives the
+integer number of physics updates nearest to 15 Hz. It requests play immediately
+before each bounded `step_simulation` call and pause immediately afterward, then
+keeps policy inference and camera capture paused. `runtime.json` and every
+applied-action record preserve the measured cadence and before/after simulation
+time, exposing any timeline drift between commands. Use `--physics-steps-per-action` only
+for a deliberate override. Gripper actions match the reference environment:
+values greater than `0.5` close to `pi/4`; all other values open to zero.
+
 Before this retained-by-default contract, omitting `--keep-session` caused a
 successful evaluator to call `SimulationClient.stop_session()` in its cleanup
 path. The platform then correctly displayed the session as `TERMINATED` with
@@ -235,7 +260,7 @@ each observation it preserves the exact PNG bytes already downloaded through
 MCP for all three DROID camera roles. Captures must be 640x360 and contain
 meaningful luminance variance plus both non-dark and non-white content; black,
 blank, clipped-sliver, and render-race frames retry and then fail closed before
-DreamZero is called. The runner then atomically writes one terminal
+the policy is called. The runner then atomically writes one terminal
 record: `result.json` after success or `error.json` after failure. Errors include
 the exception type and message, plus the hosted session ID when launch reached
 that point. The evidence layout is:
@@ -246,11 +271,16 @@ that point. The evidence layout is:
 |-- actions.jsonl                       # samples, accepted targets, applied actions
 |-- result.json                         # success only
 |-- error.json                          # failure only
+|-- rollout.mp4                         # post-action exterior-camera rollout
+|-- runtime.json                        # measured physics dt and control cadence
 |-- frames/
     |-- sample-00000-exterior-1.png
     |-- sample-00000-exterior-2.png
     |-- sample-00000-wrist.png
     `-- sample-00001-*.png               # one triplet per later observation
+|-- video-frames/
+    |-- action-00000.png                 # lossless MP4 source frame per action
+    `-- manifest.json                    # frame hashes and selected camera
 `-- samples/
     |-- sample-00000-predicted-video.npy # when requested
     `-- sample-00000-trajectory.npz      # SDE tensor-map artifacts
@@ -264,6 +294,12 @@ and bounded execution slice. An `action_target` record is privately written and
 steps complete. Both records retain the original policy action. A failure thus
 distinguishes accepted targets from fully stepped actions while retaining any
 frames or tensor artifacts already written.
+
+PI0 sample records also require and preserve the loaded policy provenance:
+OpenPI source commit, config, checkpoint URI, action space, horizon, and action
+dimension. A missing or mismatched profile fails before any action is applied.
+The MP4 manifest records H.264 codec, FPS, dimensions, duration, byte length,
+SHA-256, source camera, frame count, and the lossless source-frame manifest.
 
 ## Minimal Example
 

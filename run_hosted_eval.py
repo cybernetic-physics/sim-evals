@@ -1,4 +1,4 @@
-"""Run DreamZero-DROID against hosted Cybernetic Physics Isaac Sim."""
+"""Run a Cybernetics DROID policy against hosted Isaac Sim."""
 
 from __future__ import annotations
 
@@ -14,6 +14,11 @@ from sim_evals.inference.cybernetics_dreamzero import CyberneticsSDKDroidSamplin
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--base-model",
+        default=os.environ.get("CYBERNETICS_DROID_BASE_MODEL", "dreamzero-droid"),
+        choices=("dreamzero-droid", "pi0-droid"),
+    )
     parser.add_argument(
         "--environment-uri",
         default=os.environ.get("CYBERNETICS_DROID_ENV_URI"),
@@ -33,8 +38,13 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--max-action-steps", type=int, default=450)
-    parser.add_argument("--open-loop-horizon", type=int, default=8)
-    parser.add_argument("--physics-steps-per-action", type=int, default=8)
+    parser.add_argument("--open-loop-horizon", type=int)
+    parser.add_argument(
+        "--physics-steps-per-action",
+        type=int,
+        help="override automatic 15 Hz cadence derived from the hosted physics dt",
+    )
+    parser.add_argument("--target-control-hz", type=float, default=15.0)
     parser.add_argument("--policy-mode", choices=("native", "sde"), default="native")
     parser.add_argument(
         "--include-predicted-video",
@@ -73,6 +83,21 @@ def _parser() -> argparse.ArgumentParser:
         help="explicitly stop a session launched by this evaluator after evaluation",
     )
     parser.set_defaults(keep_session=True)
+    video = parser.add_mutually_exclusive_group()
+    video.add_argument(
+        "--record-video",
+        dest="record_video",
+        action="store_true",
+        help="save an action-by-action rollout MP4 (default)",
+    )
+    video.add_argument(
+        "--no-record-video",
+        dest="record_video",
+        action="store_false",
+        help="disable rollout MP4 capture",
+    )
+    parser.set_defaults(record_video=True)
+    parser.add_argument("--video-fps", type=int, default=15)
     parser.add_argument(
         "--results-dir",
         type=Path,
@@ -94,6 +119,13 @@ def main() -> None:
     args = _parser().parse_args()
     if not args.environment_uri:
         raise SystemExit("--environment-uri or CYBERNETICS_DROID_ENV_URI is required")
+    if args.base_model == "pi0-droid" and args.policy_mode != "native":
+        raise SystemExit("pi0-droid supports only --policy-mode native")
+    if args.base_model == "pi0-droid" and args.include_predicted_video:
+        raise SystemExit("pi0-droid does not produce predicted video")
+    open_loop_horizon = args.open_loop_horizon
+    if open_loop_horizon is None:
+        open_loop_horizon = 10 if args.base_model == "pi0-droid" else 8
     results_dir = args.results_dir or _timestamped_results_dir()
 
     try:
@@ -107,11 +139,13 @@ def main() -> None:
     config = HostedDroidConfig(
         environment_uri=args.environment_uri,
         session_id=args.session_id,
+        base_model=args.base_model,
         instruction=args.instruction,
         robot_usd_path=args.robot_usd_path,
         max_action_steps=args.max_action_steps,
-        open_loop_horizon=args.open_loop_horizon,
+        open_loop_horizon=open_loop_horizon,
         physics_steps_per_action=args.physics_steps_per_action,
+        target_control_hz=args.target_control_hz,
         runtime_provider=args.runtime_provider,
         policy_mode=args.policy_mode,
         include_predicted_video=args.include_predicted_video,
@@ -119,10 +153,12 @@ def main() -> None:
         launch_timeout_seconds=args.launch_timeout_seconds,
         readiness_timeout_seconds=args.readiness_timeout_seconds,
         keep_session=args.keep_session,
+        record_video=args.record_video,
+        video_fps=args.video_fps,
         results_dir=results_dir,
     )
     sampler = CyberneticsSDKDroidSamplingAPI(
-        base_model="dreamzero-droid",
+        base_model=args.base_model,
         session_timeout=args.request_timeout_seconds,
         policy_mode=args.policy_mode,
         include_predicted_video=args.include_predicted_video,

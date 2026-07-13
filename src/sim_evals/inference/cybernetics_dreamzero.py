@@ -1,4 +1,4 @@
-"""Cybernetics DreamZero-DROID inference client."""
+"""Cybernetics hosted DROID policy inference client."""
 
 from __future__ import annotations
 
@@ -131,15 +131,17 @@ def _action_chunk(response: Any) -> np.ndarray:
         chunk = chunk[0]
     if chunk.ndim != 2 or chunk.shape[0] < 1 or chunk.shape[1] != 8:
         raise ValueError(
-            f"DreamZero-DROID action_chunk must have shape [N,8], got {chunk.shape}"
+            f"Cybernetics DROID action_chunk must have shape [N,8], got {chunk.shape}"
         )
     if not np.isfinite(chunk).all():
-        raise ValueError("DreamZero-DROID action_chunk must contain only finite values")
+        raise ValueError(
+            "Cybernetics DROID action_chunk must contain only finite values"
+        )
     return np.ascontiguousarray(chunk)
 
 
 class Client(InferenceClient):
-    """Consume validated DreamZero-DROID joint-position action chunks."""
+    """Consume validated hosted DROID joint-position action chunks."""
 
     def __init__(
         self,
