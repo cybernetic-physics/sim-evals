@@ -104,6 +104,11 @@ evaluation follows DreamZero's eight-action open-loop cadence. Each episode gets
 a fresh sampling session and the previous session is cancelled so backend frame
 history and causal cache ownership are released.
 
+Hosted evidence schema v3 preserves both the full normalized model output in
+`sampled_action_chunk` and the configured open-loop execution slice in
+`action_chunk`. `sampled_action_chunk_shape` records the normalized `[N, 8]`
+shape before horizon or maximum-step truncation.
+
 The `flatdict` build override in `pyproject.toml` pins its isolated build to a
 setuptools release that still provides the undeclared `pkg_resources` module
 required by IsaacLab's dependency.
