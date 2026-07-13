@@ -253,7 +253,7 @@ that point. The evidence layout is:
     `-- sample-00001-*.png               # one triplet per later observation
 `-- samples/
     |-- sample-00000-predicted-video.npy # when requested
-    `-- sample-00000-sde-trajectory.npz  # SDE tensor-map artifacts
+    `-- sample-00000-trajectory.npz      # SDE tensor-map artifacts
 ```
 
 `config.json`, `result.json`, `error.json`, and every JSONL record are versioned
