@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import math
@@ -12,6 +13,7 @@ import uuid
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Mapping, Protocol, cast
@@ -216,9 +218,13 @@ class _EvidenceRecorder:
                 step_metadata: dict[str, Any] = {}
                 for key, value in step.items():
                     array = _tensor_array(value, f"trajectory[{step_index}].{key}")
-                    archive_key = f"step_{step_index:03d}__{_archive_key(str(key))}"
+                    source_key = str(key)
+                    archive_key = f"step_{step_index:03d}__{_archive_key(source_key)}"
+                    if archive_key in arrays:
+                        suffix = hashlib.sha256(source_key.encode()).hexdigest()[:12]
+                        archive_key = f"{archive_key}__{suffix}"
                     arrays[archive_key] = array
-                    step_metadata[str(key)] = {
+                    step_metadata[source_key] = {
                         "archive_key": archive_key,
                         "shape": list(array.shape),
                         "dtype": str(array.dtype),
@@ -253,15 +259,39 @@ class _EvidenceRecorder:
             }
         )
 
+    def write_action_target(
+        self,
+        *,
+        sample_index: int,
+        chunk_index: int,
+        action_index: int,
+        action: np.ndarray,
+    ) -> None:
+        self._append_action_record(
+            {
+                "schema_version": _EVIDENCE_SCHEMA_VERSION,
+                "record_type": "action_target",
+                "sample_index": sample_index,
+                "chunk_index": chunk_index,
+                "action_index": action_index,
+                "action": action.astype(float).tolist(),
+            }
+        )
+
     def _append_action_record(self, record: Mapping[str, Any]) -> None:
         encoded = (json.dumps(record, sort_keys=True) + "\n").encode()
         descriptor = os.open(
             self.actions_path,
             os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-            0o644,
+            0o600,
         )
         try:
-            os.write(descriptor, encoded)
+            remaining = memoryview(encoded)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written == 0:
+                    raise OSError("actions.jsonl write made no progress")
+                remaining = remaining[written:]
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -723,7 +753,21 @@ print({{"status": "success", "prim_path": {prim_path}}})
             for chunk_index, action in enumerate(chunk):
                 if action_steps >= self.config.max_action_steps:
                     break
-                self._apply_action(mcp, joint_indices, action)
+                on_target_accepted: Callable[[], None] | None = None
+                if evidence is not None:
+                    on_target_accepted = partial(
+                        evidence.write_action_target,
+                        sample_index=sample_index,
+                        chunk_index=chunk_index,
+                        action_index=action_steps,
+                        action=action,
+                    )
+                self._apply_action(
+                    mcp,
+                    joint_indices,
+                    action,
+                    on_target_accepted=on_target_accepted,
+                )
                 if evidence is not None:
                     evidence.write_applied_action(
                         sample_index=sample_index,
@@ -823,11 +867,12 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 last_error = exc
                 if attempt == _CAMERA_CAPTURE_ATTEMPTS:
                     break
-                self._call(
-                    mcp,
-                    "isaac.step_simulation",
-                    {"num_steps": _CAMERA_CAPTURE_RETRY_STEPS},
-                )
+                if not _is_transport_failure(exc):
+                    self._call(
+                        mcp,
+                        "isaac.step_simulation",
+                        {"num_steps": _CAMERA_CAPTURE_RETRY_STEPS},
+                    )
                 self._sleep(_CAMERA_CAPTURE_RETRY_SECONDS)
         raise HostedDroidError(
             f"camera {camera_prim_path} did not produce a valid rendered frame after "
@@ -839,6 +884,8 @@ print({{"status": "success", "prim_path": {prim_path}}})
         mcp: MCPClient,
         joint_indices: tuple[list[int], int],
         action: np.ndarray,
+        *,
+        on_target_accepted: Callable[[], None] | None = None,
     ) -> None:
         arm_indices, gripper_index = joint_indices
         gripper = float(np.clip(action[7], 0.0, 1.0) * GRIPPER_CLOSED_RADIANS)
@@ -851,6 +898,8 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 "joint_indices": [*arm_indices, gripper_index],
             },
         )
+        if on_target_accepted is not None:
+            on_target_accepted()
         step = self._call(
             mcp,
             "isaac.step_simulation",
@@ -949,6 +998,10 @@ def _is_retryable_mcp_failure(name: str, exc: HostedDroidError) -> bool:
     return name in _IDEMPOTENT_TRANSPORT_RETRY_TOOLS and any(
         marker in message for marker in _TRANSIENT_TRANSPORT_FAILURE_MARKERS
     )
+
+
+def _is_transport_failure(exc: HostedDroidError) -> bool:
+    return any(marker in str(exc) for marker in _TRANSIENT_TRANSPORT_FAILURE_MARKERS)
 
 
 def _has_droid_joints(payload: Mapping[str, Any]) -> bool:
