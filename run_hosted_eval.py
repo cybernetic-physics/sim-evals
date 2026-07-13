@@ -53,7 +53,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-timeout-seconds", type=float, default=2400.0)
     parser.add_argument("--launch-timeout-seconds", type=float, default=1200.0)
     parser.add_argument("--readiness-timeout-seconds", type=float, default=600.0)
-    parser.add_argument("--keep-session", action="store_true")
+    lifecycle = parser.add_mutually_exclusive_group()
+    lifecycle.add_argument(
+        "--keep-session",
+        dest="keep_session",
+        action="store_true",
+        help="retain the hosted session after evaluation (default)",
+    )
+    lifecycle.add_argument(
+        "--stop-session",
+        dest="keep_session",
+        action="store_false",
+        help="explicitly stop a session launched by this evaluator after evaluation",
+    )
+    parser.set_defaults(keep_session=True)
     parser.add_argument(
         "--results-dir",
         type=Path,

@@ -198,6 +198,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             max_action_steps=2,
             readiness_poll_seconds=0,
             runtime_provider="vast",
+            keep_session=False,
         )
 
         result = HostedDroidRunner(
@@ -208,6 +209,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertEqual(result.samples, 1)
         self.assertEqual(result.action_steps, 2)
         self.assertTrue(result.repaired_robot)
+        self.assertFalse(result.session_retained)
         self.assertEqual(len(result.created_cameras), 3)
         self.assertEqual(simulation.mcp_session_ids, ["sess_hosted_droid"])
         self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
@@ -240,19 +242,19 @@ class HostedDroidRunnerTest(unittest.TestCase):
         ]
         self.assertEqual(step_calls[-1]["num_steps"], 8)
 
-    def test_keeps_valid_scene_and_optionally_keeps_session(self) -> None:
+    def test_keeps_valid_scene_and_keeps_session_by_default(self) -> None:
         mcp = FakeMCP(readiness_failures=0, warm=True)
         simulation = FakeSimulationClient(mcp)
         sampler = FakeSampler()
         config = HostedDroidConfig(
             environment_uri="cybernetics://envs/env_droid",
             max_action_steps=1,
-            keep_session=True,
         )
 
         result = HostedDroidRunner(simulation, sampler, config).run()
 
         self.assertFalse(result.repaired_robot)
+        self.assertTrue(result.session_retained)
         self.assertEqual(result.created_cameras, ())
         self.assertEqual(simulation.stopped, [])
         self.assertFalse(any(name == "isaac.load_usd" for name, _ in mcp.calls))
@@ -272,6 +274,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
         result = HostedDroidRunner(simulation, sampler, config).run()
 
         self.assertEqual(result.session_id, "sess_slow_cold_start")
+        self.assertTrue(result.session_retained)
         self.assertEqual(simulation.launch_calls, [])
         self.assertEqual(simulation.stopped, [])
         self.assertEqual(simulation.mcp_session_ids, ["sess_slow_cold_start"])
@@ -288,7 +291,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             ],
         )
 
-    def test_readiness_timeout_closes_sampler_and_session(self) -> None:
+    def test_readiness_timeout_closes_sampler_and_keeps_session(self) -> None:
         mcp = FakeMCP(readiness_failures=10)
         simulation = FakeSimulationClient(mcp)
         sampler = FakeSampler()
@@ -309,7 +312,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             runner.run()
 
         self.assertTrue(sampler.closed)
-        self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
+        self.assertEqual(simulation.stopped, [])
 
     def test_configuration_rejects_invalid_rollout_shape(self) -> None:
         with self.assertRaisesRegex(ValueError, "environment_uri"):
@@ -392,7 +395,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertEqual(len(error_payload["evidence"]["frames"]), 3)
             self.assertFalse((results_dir / "result.json").exists())
             self.assertTrue(sampler.closed)
-            self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
+            self.assertEqual(simulation.stopped, [])
 
     def test_retries_camera_capture_after_render_steps(self) -> None:
         mcp = FakeMCP(

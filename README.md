@@ -171,7 +171,9 @@ python run_hosted_eval.py \
 
 An attached session is caller-owned, so the evaluator never stops it. Stop it
 through the Cybernetics SDK after preserving the evidence. Sessions launched by
-the evaluator are stopped after the rollout unless `--keep-session` is set.
+the evaluator are also retained by default so the live scene remains available
+for inspection after the rollout. Pass `--stop-session` only when teardown is
+intentional. The older explicit `--keep-session` spelling remains accepted.
 
 Omit `--results-dir` to create a collision-resistant UTC directory such as
 `runs/hosted-droid/20260712T140506.123456Z`. The final console JSON reports the
@@ -195,8 +197,16 @@ session and polls `isaac.get_scene_info` until the extension is ready. It then
 validates or reloads the DROID articulation, creates any missing exterior/wrist
 cameras, captures RGB PNG artifacts, reads named joint positions, samples one
 DreamZero action chunk, and applies up to eight actions before observing again.
-Sessions launched successfully by the evaluator are stopped after the rollout
-unless `--keep-session` is set. Attached sessions remain caller-owned.
+Sessions launched successfully by the evaluator remain running after the
+rollout. Use `--stop-session` to opt into cleanup. Attached sessions always
+remain caller-owned.
+
+Before this retained-by-default contract, omitting `--keep-session` caused a
+successful evaluator to call `SimulationClient.stop_session()` in its cleanup
+path. The platform then correctly displayed the session as `TERMINATED` with
+`stop_reason=user_stopped`; that state was evaluator-requested teardown, not an
+Isaac crash. Result evidence now includes `session_retained` so lifecycle intent
+is visible beside the session id.
 
 The runner writes `config.json` before launching the hosted session. During
 each observation it preserves the exact PNG bytes already downloaded through

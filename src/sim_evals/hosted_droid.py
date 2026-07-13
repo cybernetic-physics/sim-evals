@@ -96,7 +96,7 @@ class HostedDroidConfig:
     launch_timeout_seconds: float = 1200.0
     readiness_timeout_seconds: float = 600.0
     readiness_poll_seconds: float = 5.0
-    keep_session: bool = False
+    keep_session: bool = True
     results_dir: Path | None = None
 
     def __post_init__(self) -> None:
@@ -126,6 +126,7 @@ class HostedDroidRunResult:
     action_steps: int
     repaired_robot: bool
     created_cameras: tuple[str, ...]
+    session_retained: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +135,7 @@ class HostedDroidRunResult:
             "action_steps": self.action_steps,
             "repaired_robot": self.repaired_robot,
             "created_cameras": list(self.created_cameras),
+            "session_retained": self.session_retained,
         }
 
 
@@ -300,6 +302,7 @@ class HostedDroidRunner:
                     action_steps=action_steps,
                     repaired_robot=repaired_robot,
                     created_cameras=tuple(created_cameras),
+                    session_retained=not owns_session or self.config.keep_session,
                 )
             finally:
                 self.sampling_api.close()
