@@ -438,7 +438,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             config_payload = json.loads(
                 (results_dir / "config.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(config_payload["schema_version"], 3)
+            self.assertEqual(config_payload["schema_version"], 4)
             self.assertEqual(
                 config_payload["config"]["environment_uri"],
                 config.environment_uri,
@@ -476,6 +476,13 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertEqual(first_sample["sampled_action_chunk_shape"], [2, 8])
             self.assertEqual(len(first_sample["sampled_action_chunk"]), 2)
             self.assertEqual(len(first_sample["action_chunk"]), 2)
+            second_target = action_records[3]
+            self.assertEqual(second_target["policy_action"][7], 1.0)
+            self.assertAlmostEqual(
+                second_target["joint_positions"][-1],
+                GRIPPER_CLOSED_RADIANS,
+            )
+            self.assertEqual(len(second_target["joint_indices"]), 8)
             self.assertEqual(
                 (results_dir / "actions.jsonl").stat().st_mode & 0o777,
                 0o600,
@@ -540,11 +547,16 @@ class HostedDroidRunnerTest(unittest.TestCase):
             np.testing.assert_array_equal(video, response["predicted_video"])
             trajectory_path = results_dir / sample["trajectory"]["path"]
             with np.load(trajectory_path) as trajectory:
+                step_metadata = sample["trajectory"]["steps"][0]
                 np.testing.assert_array_equal(
-                    trajectory["step_000__log_prob_old"], [-1.25]
+                    trajectory[step_metadata["log_prob_old"]["archive_key"]],
+                    [-1.25],
                 )
-                np.testing.assert_array_equal(trajectory["step_000__step_index"], [0])
-                colliding = sample["trajectory"]["steps"][0]
+                np.testing.assert_array_equal(
+                    trajectory[step_metadata["step_index"]["archive_key"]],
+                    [0],
+                )
+                colliding = step_metadata
                 slash_key = colliding["log/prob"]["archive_key"]
                 underscore_key = colliding["log_prob"]["archive_key"]
                 self.assertNotEqual(slash_key, underscore_key)
