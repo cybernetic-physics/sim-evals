@@ -1448,11 +1448,21 @@ class HostedDroidRunner:
             _DROID_GRIPPER_VELOCITY_LIMIT_RADIANS
         )
         code = f"""
+import carb
 import json
+import omni.timeline
 import omni.usd
 from pxr import PhysxSchema, Usd, UsdPhysics
 
 stage = omni.usd.get_context().get_stage()
+timeline = omni.timeline.get_timeline_interface()
+settings = carb.settings.get_settings()
+settings.set("/app/player/useFixedTimeStepping", True)
+settings.set("/app/player/CompensatePlayDelayInSecs", 0.0)
+settings.set("/persistent/simulation/minFrameRate", int({_DROID_PHYSICS_HZ}))
+timeline.set_play_every_frame(True)
+timeline.set_ticks_per_frame(1)
+timeline.set_time_codes_per_second({_DROID_PHYSICS_HZ})
 robot_path = {robot_path}
 root = stage.GetPrimAtPath(robot_path)
 if not root.IsValid():
@@ -1523,6 +1533,9 @@ print(json.dumps({{
     "status": "success",
     "profile": "{_DROID_DYNAMICS_PROFILE}",
     "physics_hz": {_DROID_PHYSICS_HZ},
+    "fixed_time_stepping": True,
+    "play_every_frame": True,
+    "timeline_ticks_per_frame": 1,
     "configured_joints": sorted(configured_joints),
     "configured_gripper": configured_gripper,
     "articulation_roots": articulation_roots,
