@@ -134,6 +134,13 @@ atomic eight-substep MCP call that ends paused and must advance exactly one 15
 Hz control interval; timeline drift fails the run instead of silently holding
 targets too long.
 
+Task-acceptance runs require runtime articulation provenance for both DOF order
+and every joint observation; authored USD drive targets are not accepted as
+measured robot state. Before the first policy observation, the commanded
+benchmark pose must remain within the configured arm/gripper tolerances for two
+consecutive control intervals. Camera retries occur while paused and never add
+unrecorded physics steps between an applied action and its task-state evidence.
+
 Use a Cybernetics SDK release that provides
 `cybernetics.sim.SimulationClient.mcp_session`. Authenticate with the normal
 SDK login or environment-based credential flow; this runner deliberately has

@@ -140,6 +140,8 @@ class FakeMCP:
         step_payloads: list[dict[str, Any]] | None = None,
         task_state_payloads: list[dict[str, Any]] | None = None,
         closed_gripper_observation: float | None = None,
+        runtime_info_source: str | None = "runtime_articulation",
+        runtime_joint_source: str | None = "runtime_articulation",
     ) -> None:
         self.readiness_failures = readiness_failures
         self.camera_capture_failures = camera_capture_failures
@@ -152,6 +154,8 @@ class FakeMCP:
         self.step_payloads = list(step_payloads or [])
         self.task_state_payloads = list(task_state_payloads or [])
         self.closed_gripper_observation = closed_gripper_observation
+        self.runtime_info_source = runtime_info_source
+        self.runtime_joint_source = runtime_joint_source
         self.physics_dt = 1.0 / 60.0
         self.current_time = 0.0
         self.timeline_state = "stopped"
@@ -195,7 +199,13 @@ class FakeMCP:
         if name == "isaac.get_robot_info":
             if not self.robot_loaded:
                 return {"status": "error", "message": "robot missing"}
-            return {"status": "success", "joint_names": list(self.joint_names)}
+            if arguments.get("require_runtime") and self.runtime_info_source is None:
+                return {"status": "error", "message": "runtime articulation unavailable"}
+            return {
+                "status": "success",
+                "joint_names": list(self.joint_names),
+                "measurement_source": self.runtime_info_source,
+            }
         if name == "isaac.get_prim_info":
             if arguments["prim_path"] not in self.prims:
                 return {"status": "error", "message": "prim missing"}
@@ -310,9 +320,12 @@ class FakeMCP:
                 ),
             }
         if name == "isaac.get_joint_positions":
+            if arguments.get("require_runtime") and self.runtime_joint_source is None:
+                return {"status": "error", "message": "runtime articulation unavailable"}
             return {
                 "status": "success",
                 "joint_positions": list(self.joint_positions),
+                "measurement_source": self.runtime_joint_source,
             }
         raise AssertionError(f"unexpected MCP tool: {name}")
 
@@ -469,6 +482,14 @@ class HostedDroidRunnerTest(unittest.TestCase):
         ]
         self.assertEqual(step_calls[-1]["num_steps"], 4)
         self.assertTrue(all(call["pause_after"] for call in step_calls))
+        robot_info_calls = [
+            args for name, args in mcp.calls if name == "isaac.get_robot_info"
+        ]
+        joint_state_calls = [
+            args for name, args in mcp.calls if name == "isaac.get_joint_positions"
+        ]
+        self.assertTrue(all(call["require_runtime"] for call in robot_info_calls))
+        self.assertTrue(all(call["require_runtime"] for call in joint_state_calls))
         dynamics_script = next(
             str(arguments["code"])
             for name, arguments in mcp.calls
@@ -1441,7 +1462,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertTrue(sampler.closed)
             self.assertEqual(simulation.stopped, [])
 
-    def test_retries_camera_capture_after_render_steps(self) -> None:
+    def test_retries_camera_capture_without_advancing_physics(self) -> None:
         mcp = FakeMCP(
             readiness_failures=0,
             warm=True,
@@ -1471,7 +1492,26 @@ class HostedDroidRunnerTest(unittest.TestCase):
             if name == "isaac.step_simulation" and arguments["num_steps"] == 2
         ]
         self.assertEqual(len(capture_calls), 5)
-        self.assertEqual(len(retry_steps), 2)
+        self.assertEqual(retry_steps, [])
+
+    def test_fails_closed_without_runtime_joint_measurement(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            runtime_joint_source=None,
+        )
+        runner = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaisesRegex(HostedDroidError, "runtime articulation"):
+            runner.run()
 
     def test_camera_transport_retry_does_not_advance_physics(self) -> None:
         mcp = FakeMCP(
@@ -1529,7 +1569,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 readiness_failures=0,
                 warm=True,
                 step_payloads=[
+                    {"stepped": 1},
                     {"stepped": 32},
+                    {"stepped": 12},
+                    {"stepped": 12},
                     {"stepped": 5, "timed_out": True},
                 ],
             )
@@ -1564,7 +1607,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
             readiness_failures=0,
             warm=True,
             step_payloads=[
+                {"stepped": 1},
                 {"stepped": 32},
+                {"stepped": 4},
+                {"stepped": 4},
                 {"stepped": 4, "advanced_steps": 8},
             ],
         )
