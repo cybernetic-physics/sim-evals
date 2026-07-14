@@ -104,7 +104,7 @@ eight-action open-loop cadence for DreamZero and ten for the PolaRiS PI0
 joint-position policy. Each episode gets a fresh sampling session and the
 previous session is cancelled so backend policy state is released.
 
-Hosted evidence schema v5 preserves both the full normalized model output in
+Hosted evidence schema v6 preserves both the full normalized model output in
 `sampled_action_chunk` and the configured open-loop execution slice in
 `action_chunk`. `sampled_action_chunk_shape` records the normalized `[N, 8]`
 shape before horizon or maximum-step truncation.
@@ -134,15 +134,17 @@ export CYBERNETICS_DROID_ENV_URI=cybernetics://envs/ENV_ID/versions/VERSION_ID
 python run_hosted_eval.py --max-action-steps 450
 ```
 
-For the inference-only PI0 joint-position policy, record a 100-action rollout
-and intentionally stop the launched simulator after the MP4 is durable:
+For the inference-only PI0 joint-position policy, run the full scene-1 action
+cap and stop early only when the policy has lifted the cube, released it inside
+the bowl, and left it settled for three consecutive checks:
 
 ```bash
 python run_hosted_eval.py \
   --base-model pi0-droid \
   --environment-uri "$CYBERNETICS_DROID_ENV_URI" \
+  --task-success-predicate scene1-cube-in-bowl \
   --open-loop-horizon 10 \
-  --max-action-steps 100 \
+  --max-action-steps 450 \
   --record-video \
   --video-fps 15 \
   --stop-session \
@@ -150,6 +152,17 @@ python run_hosted_eval.py \
 ```
 
 PI0 does not support `--policy-mode sde` or `--include-predicted-video`.
+The task predicate is opt-in. Without it, completion continues to mean only
+that the requested policy actions were transported and applied. The predicate
+uses read-only USD bounds and Dynamic Control rigid-body velocity queries; it
+never moves the cube
+or bowl. It requires two consecutive lifted states with an observed closed
+gripper, rejects object jumps above the per-action motion bound, uses a
+conservative fraction of the bowl's world bounds, and requires observed release
+plus stable cube and bowl velocity. Missing PhysX velocity fails closed. Direct
+placement, a moving receptacle, or a still-closed gripper cannot pass. The final
+predicate read occurs after video capture so camera-recovery physics steps
+cannot invalidate an already-recorded verdict.
 
 On macOS, use an isolated environment because the local IsaacLab dependencies
 are Linux-only. Point `CYBERNETICS_SDK_CHECKOUT` at a current Cybernetics SDK
@@ -269,6 +282,7 @@ that point. The evidence layout is:
 <results-dir>/
 |-- config.json
 |-- actions.jsonl                       # samples, accepted targets, applied actions
+|-- task-states.jsonl                   # opt-in geometry and temporal acceptance proof
 |-- result.json                         # success only
 |-- error.json                          # failure only
 |-- rollout.mp4                         # post-action exterior-camera rollout

@@ -26,6 +26,7 @@ from sim_evals.hosted_droid import (
     MCPClient,
     finalize_hosted_video_evidence,
     recover_hosted_video_evidence,
+    scene1_cube_in_bowl_success_spec,
 )
 from sim_evals.inference.droid_observation import DroidObservation
 from run_hosted_eval import _timestamped_results_dir
@@ -68,6 +69,48 @@ def _pi0_policy_profile() -> dict[str, Any]:
     }
 
 
+def _task_state_payload(
+    *,
+    object_center: tuple[float, float, float],
+    linear_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    angular_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> dict[str, Any]:
+    object_half_size = (0.02, 0.02, 0.02)
+    receptacle_center = (0.405, 0.174, 0.09)
+    receptacle_half_size = (0.08, 0.08, 0.04)
+
+    def bounds(
+        center: tuple[float, float, float],
+        half_size: tuple[float, float, float],
+    ) -> dict[str, list[float]]:
+        return {
+            "minimum": [
+                center_value - half_value
+                for center_value, half_value in zip(center, half_size, strict=True)
+            ],
+            "maximum": [
+                center_value + half_value
+                for center_value, half_value in zip(center, half_size, strict=True)
+            ],
+        }
+
+    spec = scene1_cube_in_bowl_success_spec()
+    return {
+        "object_path": spec.object_prim_path,
+        "receptacle_path": spec.receptacle_prim_path,
+        "object_bounds": bounds(object_center, object_half_size),
+        "receptacle_bounds": bounds(receptacle_center, receptacle_half_size),
+        "object_velocity": {
+            "linear": list(linear_velocity),
+            "angular": list(angular_velocity),
+        },
+        "receptacle_velocity": {
+            "linear": [0.0, 0.0, 0.0],
+            "angular": [0.0, 0.0, 0.0],
+        },
+    }
+
+
 class FakeMCP:
     joint_names = [
         "right_outer_knuckle_joint",
@@ -93,6 +136,7 @@ class FakeMCP:
         transient_tool_failures: Mapping[str, int] | None = None,
         transport_tool_failures: Mapping[str, int] | None = None,
         step_payloads: list[dict[str, Any]] | None = None,
+        task_state_payloads: list[dict[str, Any]] | None = None,
     ) -> None:
         self.readiness_failures = readiness_failures
         self.camera_capture_failures = camera_capture_failures
@@ -103,9 +147,18 @@ class FakeMCP:
         self.transient_tool_failures = dict(transient_tool_failures or {})
         self.transport_tool_failures = dict(transport_tool_failures or {})
         self.step_payloads = list(step_payloads or [])
+        self.task_state_payloads = list(task_state_payloads or [])
         self.physics_dt = 1.0 / 60.0
         self.current_time = 0.0
         self.timeline_state = "stopped"
+        self.joint_positions = [0.0] * len(self.joint_names)
+        for index in range(1, 8):
+            self.joint_positions[self.joint_names.index(f"panda_joint{index}")] = (
+                index / 10
+            )
+        self.joint_positions[self.joint_names.index("finger_joint")] = (
+            GRIPPER_CLOSED_RADIANS / 2
+        )
         self.prims = (
             {
                 "/World/robot",
@@ -186,6 +239,15 @@ class FakeMCP:
                 "active_camera": arguments["prim_path"],
             }
         if name == "isaac.execute_script":
+            if "DROID_TASK_STATE=" in str(arguments["code"]):
+                if not self.task_state_payloads:
+                    raise AssertionError("task-state script had no queued payload")
+                payload = self.task_state_payloads.pop(0)
+                return {
+                    "status": "success",
+                    "stdout": "DROID_TASK_STATE=" + json.dumps(payload) + "\n",
+                    "stderr": "",
+                }
             return {"status": "success", "result": {"status": "success"}}
         if name == "isaac.step_simulation":
             if self.step_payloads:
@@ -208,6 +270,12 @@ class FakeMCP:
             self.timeline_state = "paused"
             return {"status": "success"}
         if name == "isaac.set_joint_positions":
+            for joint_index, position in zip(
+                arguments["joint_indices"],
+                arguments["joint_positions"],
+                strict=True,
+            ):
+                self.joint_positions[joint_index] = position
             return {"status": "success"}
         if name == "isaac.capture_camera_image":
             if self.camera_capture_failures:
@@ -226,13 +294,10 @@ class FakeMCP:
                 ),
             }
         if name == "isaac.get_joint_positions":
-            positions = [0.0] * len(self.joint_names)
-            for index in range(1, 8):
-                positions[self.joint_names.index(f"panda_joint{index}")] = index / 10
-            positions[self.joint_names.index("finger_joint")] = (
-                GRIPPER_CLOSED_RADIANS / 2
-            )
-            return {"status": "success", "joint_positions": positions}
+            return {
+                "status": "success",
+                "joint_positions": list(self.joint_positions),
+            }
         raise AssertionError(f"unexpected MCP tool: {name}")
 
 
@@ -549,6 +614,9 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 camera.prim_path for camera in second.cameras
             )
         )
+        spec = scene1_cube_in_bowl_success_spec()
+        self.assertEqual(spec.object_prim_path, "/World/rubiks_cube")
+        self.assertEqual(spec.receptacle_prim_path, "/World/_24_bowl")
 
     def test_writes_config_result_and_first_rgb_triplet(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -569,7 +637,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             config_payload = json.loads(
                 (results_dir / "config.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(config_payload["schema_version"], 5)
+            self.assertEqual(config_payload["schema_version"], 6)
             self.assertEqual(
                 config_payload["config"]["environment_uri"],
                 config.environment_uri,
@@ -633,6 +701,211 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertTrue(
                 (results_dir / "frames" / "sample-00001-exterior-1.png").is_file()
             )
+
+    def test_scene1_acceptance_stops_after_policy_lift_release_and_settle(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "task-success"
+            actions = np.zeros((1, 8, 8), dtype=np.float32)
+            actions[0, :5, 7] = 1.0
+            task_states = [
+                _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+                _task_state_payload(object_center=(0.36, -0.08, 0.14)),
+                _task_state_payload(object_center=(0.36, -0.08, 0.15)),
+                _task_state_payload(object_center=(0.375, 0.00, 0.15)),
+                _task_state_payload(object_center=(0.39, 0.08, 0.15)),
+                _task_state_payload(object_center=(0.405, 0.16, 0.15)),
+                _task_state_payload(object_center=(0.405, 0.174, 0.105)),
+                _task_state_payload(object_center=(0.405, 0.174, 0.105)),
+                _task_state_payload(object_center=(0.405, 0.174, 0.105)),
+            ]
+            mcp = FakeMCP(
+                readiness_failures=0,
+                warm=True,
+                task_state_payloads=task_states,
+            )
+            runner = HostedDroidRunner(
+                FakeSimulationClient(mcp),
+                FakeSampler(response={"action_chunk": actions}),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=10,
+                    open_loop_horizon=8,
+                    results_dir=results_dir,
+                    task_success=scene1_cube_in_bowl_success_spec(),
+                ),
+                sleep=lambda _: None,
+            )
+
+            result = runner.run()
+
+            self.assertTrue(result.task_success)
+            self.assertEqual(result.task_success_action_index, 7)
+            self.assertEqual(result.action_steps, 8)
+            self.assertEqual(result.task_success_checks, 8)
+            self.assertEqual(
+                result.task_success_reason,
+                "policy_lift_release_and_settled_placement_proven",
+            )
+            payload = json.loads((results_dir / "result.json").read_text())
+            self.assertEqual(
+                payload["evidence"]["task_states"],
+                {"path": "task-states.jsonl", "records": 9},
+            )
+            records = [
+                json.loads(line)
+                for line in (results_dir / "task-states.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(records[0]["phase"], "initial")
+            self.assertTrue(records[1]["evaluation"]["lift_condition_this_check"])
+            self.assertFalse(records[1]["evaluation"]["policy_driven_lift_observed"])
+            self.assertTrue(records[2]["evaluation"]["policy_driven_lift_observed"])
+            self.assertTrue(records[-1]["evaluation"]["success"])
+            self.assertEqual(
+                records[-1]["capture_method"],
+                "read_only_usd_bounds_and_dynamic_control_velocity",
+            )
+            object_paths = {
+                scene1_cube_in_bowl_success_spec().object_prim_path,
+                scene1_cube_in_bowl_success_spec().receptacle_prim_path,
+            }
+            mutating_object_calls = [
+                (name, arguments)
+                for name, arguments in mcp.calls
+                if name
+                in {
+                    "isaac.delete_object",
+                    "isaac.load_usd",
+                    "isaac.set_prim_transform",
+                }
+                and arguments.get("prim_path") in object_paths
+            ]
+            self.assertEqual(mutating_object_calls, [])
+            last_video_capture = max(
+                index
+                for index, (name, _) in enumerate(mcp.calls)
+                if name == "isaac.capture_camera_image"
+            )
+            last_task_state = max(
+                index
+                for index, (name, arguments) in enumerate(mcp.calls)
+                if name == "isaac.execute_script"
+                and "DROID_TASK_STATE=" in str(arguments["code"])
+            )
+            self.assertLess(last_video_capture, last_task_state)
+
+    def test_scene1_acceptance_rejects_direct_placement_without_lift(self) -> None:
+        actions = np.zeros((1, 4, 8), dtype=np.float32)
+        actions[0, 0, 7] = 1.0
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            task_state_payloads=[
+                _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+                *[
+                    _task_state_payload(object_center=(0.405, 0.174, 0.105))
+                    for _ in range(4)
+                ],
+            ],
+        )
+        result = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(response={"action_chunk": actions}),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=4,
+                open_loop_horizon=4,
+                task_success=scene1_cube_in_bowl_success_spec(),
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        self.assertFalse(result.task_success)
+        self.assertEqual(result.action_steps, 4)
+        self.assertIsNone(result.task_success_action_index)
+        self.assertEqual(
+            result.task_success_reason,
+            "max_action_steps_reached_without_valid_placement",
+        )
+
+    def test_scene1_acceptance_fails_closed_without_receptacle_velocity(self) -> None:
+        malformed_state = _task_state_payload(object_center=(0.36, -0.08, 0.10))
+        malformed_state.pop("receptacle_velocity")
+        sampler = FakeSampler()
+        runner = HostedDroidRunner(
+            FakeSimulationClient(
+                FakeMCP(
+                    readiness_failures=0,
+                    warm=True,
+                    task_state_payloads=[malformed_state],
+                )
+            ),
+            sampler,
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+                task_success=scene1_cube_in_bowl_success_spec(),
+            ),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaisesRegex(
+            HostedDroidError,
+            "missing receptacle velocity",
+        ):
+            runner.run()
+
+        self.assertEqual(sampler.observations, [])
+
+    def test_scene1_acceptance_rejects_moving_or_unreleased_cube(self) -> None:
+        for invalid_state, gripper_closed in (
+            (
+                _task_state_payload(
+                    object_center=(0.405, 0.174, 0.105),
+                    linear_velocity=(0.25, 0.0, 0.0),
+                ),
+                False,
+            ),
+            (
+                _task_state_payload(object_center=(0.405, 0.174, 0.105)),
+                True,
+            ),
+        ):
+            with self.subTest(gripper_closed=gripper_closed):
+                actions = np.zeros((1, 8, 8), dtype=np.float32)
+                actions[0, :5, 7] = 1.0
+                if gripper_closed:
+                    actions[0, :, 7] = 1.0
+                mcp = FakeMCP(
+                    readiness_failures=0,
+                    warm=True,
+                    task_state_payloads=[
+                        _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+                        _task_state_payload(object_center=(0.36, -0.08, 0.14)),
+                        _task_state_payload(object_center=(0.36, -0.08, 0.15)),
+                        _task_state_payload(object_center=(0.375, 0.00, 0.15)),
+                        _task_state_payload(object_center=(0.39, 0.08, 0.15)),
+                        _task_state_payload(object_center=(0.405, 0.16, 0.15)),
+                        invalid_state,
+                        invalid_state,
+                        invalid_state,
+                    ],
+                )
+                result = HostedDroidRunner(
+                    FakeSimulationClient(mcp),
+                    FakeSampler(response={"action_chunk": actions}),
+                    HostedDroidConfig(
+                        environment_uri="cybernetics://envs/env_droid",
+                        max_action_steps=8,
+                        open_loop_horizon=8,
+                        task_success=scene1_cube_in_bowl_success_spec(),
+                    ),
+                    sleep=lambda _: None,
+                ).run()
+
+                self.assertFalse(result.task_success)
+                self.assertEqual(result.action_steps, 8)
 
     def test_archives_predicted_video_and_sde_trajectory_tensors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

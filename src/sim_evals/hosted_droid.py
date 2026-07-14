@@ -93,6 +93,85 @@ class CameraSpec:
 
 
 @dataclass(frozen=True)
+class DroidTaskSuccessSpec:
+    """Geometric acceptance contract for a hosted DROID task."""
+
+    name: str
+    object_prim_path: str
+    receptacle_prim_path: str
+    minimum_lift_meters: float = 0.03
+    minimum_lift_checks: int = 2
+    horizontal_containment_margin_meters: float = 0.002
+    horizontal_containment_fraction: float = 0.65
+    minimum_insertion_meters: float = 0.005
+    vertical_tolerance_meters: float = 0.01
+    maximum_linear_speed_mps: float = 0.10
+    maximum_angular_speed_rps: float = 1.50
+    maximum_object_displacement_per_action_meters: float = 0.10
+    maximum_receptacle_size_change_meters: float = 0.01
+    gripper_closed_threshold: float = 0.80
+    gripper_released_threshold: float = 0.20
+    required_settled_checks: int = 3
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("name", self.name),
+            ("object_prim_path", self.object_prim_path),
+            ("receptacle_prim_path", self.receptacle_prim_path),
+        ):
+            if not value.strip():
+                raise ValueError(f"{name} must not be empty")
+        for name, value in (
+            ("minimum_lift_meters", self.minimum_lift_meters),
+            (
+                "horizontal_containment_margin_meters",
+                self.horizontal_containment_margin_meters,
+            ),
+            ("minimum_insertion_meters", self.minimum_insertion_meters),
+            ("vertical_tolerance_meters", self.vertical_tolerance_meters),
+            ("maximum_linear_speed_mps", self.maximum_linear_speed_mps),
+            ("maximum_angular_speed_rps", self.maximum_angular_speed_rps),
+            (
+                "maximum_object_displacement_per_action_meters",
+                self.maximum_object_displacement_per_action_meters,
+            ),
+            (
+                "maximum_receptacle_size_change_meters",
+                self.maximum_receptacle_size_change_meters,
+            ),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if not 0 < self.horizontal_containment_fraction <= 1:
+            raise ValueError("horizontal_containment_fraction must be in (0, 1]")
+        if (
+            not 0
+            <= self.gripper_released_threshold
+            < self.gripper_closed_threshold
+            <= 1
+        ):
+            raise ValueError(
+                "gripper thresholds must satisfy 0 <= released < closed <= 1"
+            )
+        for name, value in (
+            ("minimum_lift_checks", self.minimum_lift_checks),
+            ("required_settled_checks", self.required_settled_checks),
+        ):
+            if value < 1:
+                raise ValueError(f"{name} must be at least 1")
+
+
+def scene1_cube_in_bowl_success_spec() -> DroidTaskSuccessSpec:
+    """Return the immutable-scene-1 cube-in-bowl acceptance contract."""
+
+    return DroidTaskSuccessSpec(
+        name="scene1-cube-in-bowl",
+        object_prim_path="/World/rubiks_cube",
+        receptacle_prim_path="/World/_24_bowl",
+    )
+
+
+@dataclass(frozen=True)
 class HostedDroidConfig:
     environment_uri: str
     session_id: str | None = None
@@ -118,6 +197,7 @@ class HostedDroidConfig:
     record_video: bool = False
     video_fps: int = 15
     results_dir: Path | None = None
+    task_success: DroidTaskSuccessSpec | None = None
 
     def __post_init__(self) -> None:
         if not self.environment_uri.strip():
@@ -161,6 +241,11 @@ class HostedDroidRunResult:
     physics_dt: float
     physics_steps_per_action: int
     control_hz: float
+    task_success: bool | None = None
+    task_success_predicate: str | None = None
+    task_success_action_index: int | None = None
+    task_success_checks: int = 0
+    task_success_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,11 +258,266 @@ class HostedDroidRunResult:
             "physics_dt": self.physics_dt,
             "physics_steps_per_action": self.physics_steps_per_action,
             "control_hz": self.control_hz,
+            "task_success": self.task_success,
+            "task_success_predicate": self.task_success_predicate,
+            "task_success_action_index": self.task_success_action_index,
+            "task_success_checks": self.task_success_checks,
+            "task_success_reason": self.task_success_reason,
         }
 
 
-_EVIDENCE_SCHEMA_VERSION = 5
+@dataclass(frozen=True)
+class _AxisAlignedBounds:
+    minimum: tuple[float, float, float]
+    maximum: tuple[float, float, float]
+
+    @property
+    def center(self) -> tuple[float, float, float]:
+        return (
+            (self.minimum[0] + self.maximum[0]) / 2.0,
+            (self.minimum[1] + self.maximum[1]) / 2.0,
+            (self.minimum[2] + self.maximum[2]) / 2.0,
+        )
+
+    @property
+    def size(self) -> tuple[float, float, float]:
+        return (
+            self.maximum[0] - self.minimum[0],
+            self.maximum[1] - self.minimum[1],
+            self.maximum[2] - self.minimum[2],
+        )
+
+    def to_dict(self) -> dict[str, list[float]]:
+        return {
+            "minimum": list(self.minimum),
+            "maximum": list(self.maximum),
+            "center": list(self.center),
+            "size": list(self.size),
+        }
+
+
+@dataclass(frozen=True)
+class _DroidTaskState:
+    object_bounds: _AxisAlignedBounds
+    receptacle_bounds: _AxisAlignedBounds
+    object_linear_velocity: tuple[float, float, float]
+    object_angular_velocity: tuple[float, float, float]
+    receptacle_linear_velocity: tuple[float, float, float]
+    receptacle_angular_velocity: tuple[float, float, float]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "object_bounds": self.object_bounds.to_dict(),
+            "receptacle_bounds": self.receptacle_bounds.to_dict(),
+            "object_linear_velocity": list(self.object_linear_velocity),
+            "object_angular_velocity": list(self.object_angular_velocity),
+            "receptacle_linear_velocity": list(self.receptacle_linear_velocity),
+            "receptacle_angular_velocity": list(self.receptacle_angular_velocity),
+        }
+
+
+@dataclass(frozen=True)
+class _RolloutOutcome:
+    samples: int
+    action_steps: int
+    task_success: bool | None
+    task_success_predicate: str | None
+    task_success_action_index: int | None
+    task_success_checks: int
+    task_success_reason: str | None
+
+
+_EVIDENCE_SCHEMA_VERSION = 6
 _EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
+_TASK_STATE_STDOUT_PREFIX = "DROID_TASK_STATE="
+
+
+class _DroidTaskSuccessTracker:
+    """Own the temporal proof required for a policy-driven placement."""
+
+    def __init__(
+        self,
+        spec: DroidTaskSuccessSpec,
+        initial_state: _DroidTaskState,
+    ) -> None:
+        self.spec = spec
+        self.initial_state = initial_state
+        self.lift_observed = False
+        self.consecutive_lift_checks = 0
+        self.consecutive_settled_checks = 0
+        self.checks = 0
+        self.success_action_index: int | None = None
+        self.previous_object_center = initial_state.object_bounds.center
+        self.trajectory_valid = True
+
+    def initial_evaluation(self) -> dict[str, Any]:
+        return {
+            "predicate": self.spec.name,
+            "phase": "initial",
+            "policy_driven_lift_observed": False,
+            "trajectory_valid": True,
+            "consecutive_lift_checks": 0,
+            "required_lift_checks": self.spec.minimum_lift_checks,
+            "consecutive_settled_checks": 0,
+            "required_settled_checks": self.spec.required_settled_checks,
+            "success": False,
+        }
+
+    def evaluate(
+        self,
+        state: _DroidTaskState,
+        *,
+        action_index: int,
+        observed_gripper_position: float,
+    ) -> dict[str, Any]:
+        self.checks += 1
+        geometry = self._geometry(state)
+        object_displacement = math.dist(
+            state.object_bounds.center,
+            self.previous_object_center,
+        )
+        self.previous_object_center = state.object_bounds.center
+        displacement_valid = (
+            object_displacement
+            <= self.spec.maximum_object_displacement_per_action_meters
+        )
+        self.trajectory_valid = self.trajectory_valid and displacement_valid
+        lifted_meters = (
+            state.object_bounds.center[2] - self.initial_state.object_bounds.center[2]
+        )
+        gripper_closed = observed_gripper_position >= self.spec.gripper_closed_threshold
+        lift_condition = (
+            gripper_closed
+            and lifted_meters >= self.spec.minimum_lift_meters
+            and not geometry["geometrically_in_receptacle"]
+            and self.trajectory_valid
+        )
+        if lift_condition:
+            self.consecutive_lift_checks += 1
+        else:
+            self.consecutive_lift_checks = 0
+        self.lift_observed = (
+            self.lift_observed
+            or self.consecutive_lift_checks >= self.spec.minimum_lift_checks
+        )
+
+        object_linear_speed = math.sqrt(
+            sum(value * value for value in state.object_linear_velocity)
+        )
+        object_angular_speed = math.sqrt(
+            sum(value * value for value in state.object_angular_velocity)
+        )
+        receptacle_linear_speed = math.sqrt(
+            sum(value * value for value in state.receptacle_linear_velocity)
+        )
+        receptacle_angular_speed = math.sqrt(
+            sum(value * value for value in state.receptacle_angular_velocity)
+        )
+        settled = (
+            object_linear_speed <= self.spec.maximum_linear_speed_mps
+            and object_angular_speed <= self.spec.maximum_angular_speed_rps
+            and receptacle_linear_speed <= self.spec.maximum_linear_speed_mps
+            and receptacle_angular_speed <= self.spec.maximum_angular_speed_rps
+        )
+        released = observed_gripper_position <= self.spec.gripper_released_threshold
+        candidate = (
+            self.lift_observed
+            and self.trajectory_valid
+            and geometry["geometrically_in_receptacle"]
+            and released
+            and settled
+        )
+        if candidate:
+            self.consecutive_settled_checks += 1
+        else:
+            self.consecutive_settled_checks = 0
+        success = self.consecutive_settled_checks >= self.spec.required_settled_checks
+        if success and self.success_action_index is None:
+            self.success_action_index = action_index
+
+        return {
+            "predicate": self.spec.name,
+            "phase": "post_action",
+            "action_index": action_index,
+            "observed_gripper_position": observed_gripper_position,
+            "gripper_closed": gripper_closed,
+            "gripper_released": released,
+            "object_displacement_meters": object_displacement,
+            "object_displacement_valid": displacement_valid,
+            "trajectory_valid": self.trajectory_valid,
+            "object_lift_meters": lifted_meters,
+            "lift_condition_this_check": lift_condition,
+            "consecutive_lift_checks": self.consecutive_lift_checks,
+            "required_lift_checks": self.spec.minimum_lift_checks,
+            "policy_driven_lift_observed": self.lift_observed,
+            **geometry,
+            "object_linear_speed_mps": object_linear_speed,
+            "object_angular_speed_rps": object_angular_speed,
+            "receptacle_linear_speed_mps": receptacle_linear_speed,
+            "receptacle_angular_speed_rps": receptacle_angular_speed,
+            "settled": settled,
+            "candidate_success": candidate,
+            "consecutive_settled_checks": self.consecutive_settled_checks,
+            "required_settled_checks": self.spec.required_settled_checks,
+            "success": success,
+        }
+
+    def _geometry(self, state: _DroidTaskState) -> dict[str, Any]:
+        object_bounds = state.object_bounds
+        receptacle_bounds = state.receptacle_bounds
+        object_center = object_bounds.center
+        receptacle_center = receptacle_bounds.center
+        object_size = object_bounds.size
+        receptacle_size = receptacle_bounds.size
+        raw_allowed_x = (
+            receptacle_size[0] - object_size[0]
+        ) / 2.0 - self.spec.horizontal_containment_margin_meters
+        raw_allowed_y = (
+            receptacle_size[1] - object_size[1]
+        ) / 2.0 - self.spec.horizontal_containment_margin_meters
+        allowed_x = raw_allowed_x * self.spec.horizontal_containment_fraction
+        allowed_y = raw_allowed_y * self.spec.horizontal_containment_fraction
+        offset_x = abs(object_center[0] - receptacle_center[0])
+        offset_y = abs(object_center[1] - receptacle_center[1])
+        if allowed_x <= 0 or allowed_y <= 0:
+            normalized_radial_offset = None
+            horizontally_contained = False
+        else:
+            normalized_radial_offset = math.sqrt(
+                (offset_x / allowed_x) ** 2 + (offset_y / allowed_y) ** 2
+            )
+            horizontally_contained = normalized_radial_offset <= 1.0
+        vertically_inserted = (
+            object_bounds.minimum[2]
+            >= receptacle_bounds.minimum[2] - self.spec.vertical_tolerance_meters
+            and object_bounds.minimum[2]
+            <= receptacle_bounds.maximum[2] - self.spec.minimum_insertion_meters
+        )
+        receptacle_size_change = max(
+            abs(current - initial)
+            for current, initial in zip(
+                receptacle_size,
+                self.initial_state.receptacle_bounds.size,
+                strict=True,
+            )
+        )
+        receptacle_geometry_stable = (
+            receptacle_size_change <= self.spec.maximum_receptacle_size_change_meters
+        )
+        return {
+            "horizontal_offset_meters": [offset_x, offset_y],
+            "horizontal_clearance_meters": [allowed_x, allowed_y],
+            "normalized_radial_offset": normalized_radial_offset,
+            "horizontally_contained": horizontally_contained,
+            "vertically_inserted": vertically_inserted,
+            "receptacle_size_change_meters": receptacle_size_change,
+            "receptacle_geometry_stable": receptacle_geometry_stable,
+            "geometrically_in_receptacle": (
+                horizontally_contained
+                and vertically_inserted
+                and receptacle_geometry_stable
+            ),
+        }
 
 
 def _mediapy_module() -> Any | None:
@@ -463,12 +803,14 @@ class _EvidenceRecorder:
         self.frames_dir = results_dir / "frames"
         self.samples_dir = results_dir / "samples"
         self.actions_path = results_dir / "actions.jsonl"
+        self.task_states_path = results_dir / "task-states.jsonl"
         self.video_frames_dir = results_dir / "video-frames"
         self.video_path = results_dir / "rollout.mp4"
         self.video_manifest_path = self.video_frames_dir / "manifest.json"
         self.runtime_path = results_dir / "runtime.json"
         self._video_metadata: dict[str, Any] | None = None
         self._action_record_count = 0
+        self._task_state_record_count = 0
         self.started_at = _utc_now()
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.frames_dir.mkdir(parents=True, exist_ok=True)
@@ -506,6 +848,26 @@ class _EvidenceRecorder:
                 **metadata,
             },
         )
+
+    def write_task_state(
+        self,
+        *,
+        phase: str,
+        action_index: int | None,
+        state: _DroidTaskState,
+        evaluation: Mapping[str, Any],
+    ) -> None:
+        record = {
+            "schema_version": _EVIDENCE_SCHEMA_VERSION,
+            "record_type": "task_state",
+            "phase": phase,
+            "action_index": action_index,
+            "capture_method": "read_only_usd_bounds_and_dynamic_control_velocity",
+            "state": state.to_dict(),
+            "evaluation": dict(evaluation),
+        }
+        self._append_jsonl(self.task_states_path, record)
+        self._task_state_record_count += 1
 
     def finalize_video(self, fps: int) -> None:
         self._video_metadata = finalize_hosted_video_evidence(
@@ -575,7 +937,10 @@ class _EvidenceRecorder:
                 steps.append(step_metadata)
             path = self.samples_dir / f"sample-{sample_index:05d}-trajectory.npz"
             output = io.BytesIO()
-            np.savez_compressed(output, **arrays)
+            np.savez_compressed(
+                output,
+                **arrays,  # pyright: ignore[reportArgumentType]
+            )
             _atomic_write(path, output.getvalue())
             record["trajectory"] = {
                 "path": str(path.relative_to(self.results_dir)),
@@ -632,9 +997,14 @@ class _EvidenceRecorder:
         )
 
     def _append_action_record(self, record: Mapping[str, Any]) -> None:
+        self._append_jsonl(self.actions_path, record)
+        self._action_record_count += 1
+
+    @staticmethod
+    def _append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
         encoded = (json.dumps(record, sort_keys=True) + "\n").encode()
         descriptor = os.open(
-            self.actions_path,
+            path,
             os.O_APPEND | os.O_CREAT | os.O_WRONLY,
             0o600,
         )
@@ -648,7 +1018,6 @@ class _EvidenceRecorder:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        self._action_record_count += 1
 
     def write_result(self, result: HostedDroidRunResult) -> None:
         self._write_json(
@@ -692,6 +1061,7 @@ class _EvidenceRecorder:
             self.results_dir / "result.json",
             self.results_dir / "error.json",
             self.actions_path,
+            self.task_states_path,
             self.runtime_path,
         ):
             path.unlink(missing_ok=True)
@@ -728,9 +1098,16 @@ class _EvidenceRecorder:
                 "path": str(self.actions_path.relative_to(self.results_dir)),
                 "records": self._action_record_count,
             }
+        task_states = None
+        if self.task_states_path.is_file():
+            task_states = {
+                "path": str(self.task_states_path.relative_to(self.results_dir)),
+                "records": self._task_state_record_count,
+            }
         return {
             "frames": frames,
             "actions": actions,
+            "task_states": task_states,
             "sample_artifacts": sample_artifacts,
             "runtime": (
                 str(self.runtime_path.relative_to(self.results_dir))
@@ -864,6 +1241,11 @@ class HostedDroidRunner:
                                 "physics_steps_per_action": physics_steps_per_action,
                                 "target_control_hz": self.config.target_control_hz,
                                 "control_hz": control_hz,
+                                "task_success_predicate": (
+                                    self.config.task_success.name
+                                    if self.config.task_success is not None
+                                    else None
+                                ),
                             }
                         )
                     self._step_while_playing(
@@ -872,7 +1254,7 @@ class HostedDroidRunner:
                     )
                     self._sleep(_CAMERA_WARMUP_SECONDS)
                     self.sampling_api.reset_sampling_session()
-                    samples, action_steps = self._rollout(
+                    rollout = self._rollout(
                         mcp,
                         joint_indices,
                         physics_steps_per_action,
@@ -880,14 +1262,19 @@ class HostedDroidRunner:
                     )
                 result = HostedDroidRunResult(
                     session_id=session_id,
-                    samples=samples,
-                    action_steps=action_steps,
+                    samples=rollout.samples,
+                    action_steps=rollout.action_steps,
                     repaired_robot=repaired_robot,
                     created_cameras=tuple(created_cameras),
                     session_retained=not owns_session or self.config.keep_session,
                     physics_dt=physics_dt,
                     physics_steps_per_action=physics_steps_per_action,
                     control_hz=control_hz,
+                    task_success=rollout.task_success,
+                    task_success_predicate=rollout.task_success_predicate,
+                    task_success_action_index=rollout.task_success_action_index,
+                    task_success_checks=rollout.task_success_checks,
+                    task_success_reason=rollout.task_success_reason,
                 )
             except BaseException:
                 cleanup_errors.extend(
@@ -1166,9 +1553,24 @@ print({{"status": "success", "prim_path": {prim_path}}})
         joint_indices: tuple[list[int], int],
         physics_steps_per_action: int,
         evidence: _EvidenceRecorder | None = None,
-    ) -> tuple[int, int]:
+    ) -> _RolloutOutcome:
         samples = 0
         action_steps = 0
+        tracker: _DroidTaskSuccessTracker | None = None
+        if self.config.task_success is not None:
+            initial_state = self._capture_task_state(mcp, self.config.task_success)
+            tracker = _DroidTaskSuccessTracker(
+                self.config.task_success,
+                initial_state,
+            )
+            if evidence is not None:
+                evidence.write_task_state(
+                    phase="initial",
+                    action_index=None,
+                    state=initial_state,
+                    evaluation=tracker.initial_evaluation(),
+                )
+        should_stop = False
         while action_steps < self.config.max_action_steps:
             observation = self._observation(mcp, joint_indices, samples, evidence)
             response = self.sampling_api.sample_droid(
@@ -1231,8 +1633,135 @@ print({{"status": "success", "prim_path": {prim_path}}})
                             None,
                         )
                         evidence.write_video_frame(action_steps, video_rgb)
+                if tracker is not None:
+                    _, observed_gripper_position = self._joint_state(
+                        mcp,
+                        joint_indices,
+                    )
+                    task_state = self._capture_task_state(mcp, tracker.spec)
+                    task_evaluation = tracker.evaluate(
+                        task_state,
+                        action_index=action_steps,
+                        observed_gripper_position=observed_gripper_position,
+                    )
+                    if evidence is not None:
+                        evidence.write_task_state(
+                            phase="post_action",
+                            action_index=action_steps,
+                            state=task_state,
+                            evaluation=task_evaluation,
+                        )
+                    should_stop = bool(task_evaluation["success"])
                 action_steps += 1
-        return samples, action_steps
+                if should_stop:
+                    break
+            if should_stop:
+                break
+        if tracker is None:
+            return _RolloutOutcome(
+                samples=samples,
+                action_steps=action_steps,
+                task_success=None,
+                task_success_predicate=None,
+                task_success_action_index=None,
+                task_success_checks=0,
+                task_success_reason=None,
+            )
+        task_success = tracker.success_action_index is not None
+        return _RolloutOutcome(
+            samples=samples,
+            action_steps=action_steps,
+            task_success=task_success,
+            task_success_predicate=tracker.spec.name,
+            task_success_action_index=tracker.success_action_index,
+            task_success_checks=tracker.checks,
+            task_success_reason=(
+                "policy_lift_release_and_settled_placement_proven"
+                if task_success
+                else "max_action_steps_reached_without_valid_placement"
+            ),
+        )
+
+    def _capture_task_state(
+        self,
+        mcp: MCPClient,
+        spec: DroidTaskSuccessSpec,
+    ) -> _DroidTaskState:
+        object_path = json.dumps(spec.object_prim_path)
+        receptacle_path = json.dumps(spec.receptacle_prim_path)
+        prefix = json.dumps(_TASK_STATE_STDOUT_PREFIX)
+        code = f"""
+import json
+import omni.usd
+from omni.isaac.dynamic_control import _dynamic_control
+from pxr import Usd, UsdGeom
+
+stage = omni.usd.get_context().get_stage()
+dynamic_control = _dynamic_control.acquire_dynamic_control_interface()
+bbox_cache = UsdGeom.BBoxCache(
+    Usd.TimeCode.Default(),
+    [UsdGeom.Tokens.default_],
+    useExtentsHint=True,
+)
+
+def read_bounds(path):
+    prim = stage.GetPrimAtPath(path)
+    if not prim.IsValid():
+        raise RuntimeError(f"task prim not found: {{path}}")
+    bounds = bbox_cache.ComputeWorldBound(prim).ComputeAlignedBox()
+    minimum = bounds.GetMin()
+    maximum = bounds.GetMax()
+    return {{
+        "minimum": [float(minimum[i]) for i in range(3)],
+        "maximum": [float(maximum[i]) for i in range(3)],
+    }}
+
+def read_velocity(path):
+    handle = dynamic_control.get_rigid_body(path)
+    if handle == _dynamic_control.INVALID_HANDLE:
+        raise RuntimeError(f"rigid-body handle unavailable: {{path}}")
+    linear = dynamic_control.get_rigid_body_linear_velocity(handle)
+    angular = dynamic_control.get_rigid_body_angular_velocity(handle)
+    return {{
+        "linear": [float(linear[i]) for i in range(3)],
+        "angular": [float(angular[i]) for i in range(3)],
+    }}
+
+object_path = {object_path}
+receptacle_path = {receptacle_path}
+payload = {{
+    "object_path": object_path,
+    "receptacle_path": receptacle_path,
+    "object_bounds": read_bounds(object_path),
+    "receptacle_bounds": read_bounds(receptacle_path),
+    "object_velocity": read_velocity(object_path),
+    "receptacle_velocity": read_velocity(receptacle_path),
+}}
+print({prefix} + json.dumps(payload, sort_keys=True))
+"""
+        response = self._call(mcp, "isaac.execute_script", {"code": code})
+        stdout = response.get("stdout")
+        if not isinstance(stdout, str):
+            raise HostedDroidError(
+                "isaac.execute_script did not return task-state stdout"
+            )
+        encoded_state = next(
+            (
+                line.removeprefix(_TASK_STATE_STDOUT_PREFIX)
+                for line in reversed(stdout.splitlines())
+                if line.startswith(_TASK_STATE_STDOUT_PREFIX)
+            ),
+            None,
+        )
+        if encoded_state is None:
+            raise HostedDroidError(
+                "isaac.execute_script did not emit the task-state marker"
+            )
+        try:
+            payload = json.loads(encoded_state)
+        except json.JSONDecodeError as exc:
+            raise HostedDroidError("Isaac emitted invalid task-state JSON") from exc
+        return _parse_task_state(payload, spec)
 
     def _observation(
         self,
@@ -1251,32 +1780,43 @@ print({{"status": "success", "prim_path": {prim_path}}})
             )
             for camera_index, camera in enumerate(self.config.cameras)
         ]
+        arm_positions, gripper = self._joint_state(mcp, joint_indices)
+        return DroidObservation(
+            exterior_image_1_left=images[0],
+            exterior_image_2_left=images[1],
+            wrist_image_left=images[2],
+            joint_position=arm_positions,
+            gripper_position=np.asarray([gripper], dtype=np.float32),
+            instruction=self.config.instruction,
+        )
+
+    def _joint_state(
+        self,
+        mcp: MCPClient,
+        joint_indices: tuple[list[int], int],
+    ) -> tuple[np.ndarray, float]:
         positions_payload = self._call(
             mcp,
             "isaac.get_joint_positions",
             {"prim_path": self.config.robot_prim_path},
         )
         positions = np.asarray(
-            positions_payload.get("joint_positions"), dtype=np.float32
+            positions_payload.get("joint_positions"),
+            dtype=np.float32,
         )
         arm_indices, gripper_index = joint_indices
         if positions.ndim != 1 or positions.size <= max(*arm_indices, gripper_index):
             raise HostedDroidError(
                 "isaac.get_joint_positions returned an incomplete joint vector"
             )
-        gripper = np.clip(
-            positions[gripper_index] / GRIPPER_CLOSED_RADIANS,
-            0.0,
-            1.0,
+        gripper = float(
+            np.clip(
+                positions[gripper_index] / GRIPPER_CLOSED_RADIANS,
+                0.0,
+                1.0,
+            )
         )
-        return DroidObservation(
-            exterior_image_1_left=images[0],
-            exterior_image_2_left=images[1],
-            wrist_image_left=images[2],
-            joint_position=np.ascontiguousarray(positions[arm_indices]),
-            gripper_position=np.asarray([gripper], dtype=np.float32),
-            instruction=self.config.instruction,
-        )
+        return np.ascontiguousarray(positions[arm_indices]), gripper
 
     def _capture_rgb(
         self,
@@ -1530,6 +2070,73 @@ def _tool_payload(result: Any) -> dict[str, Any]:
     )
 
 
+def _parse_task_state(
+    payload: Any,
+    spec: DroidTaskSuccessSpec,
+) -> _DroidTaskState:
+    if not isinstance(payload, Mapping):
+        raise HostedDroidError("Isaac task state must be a mapping")
+    if payload.get("object_path") != spec.object_prim_path:
+        raise HostedDroidError("Isaac task state returned the wrong object prim")
+    if payload.get("receptacle_path") != spec.receptacle_prim_path:
+        raise HostedDroidError("Isaac task state returned the wrong receptacle prim")
+    velocity = payload.get("object_velocity")
+    if not isinstance(velocity, Mapping):
+        raise HostedDroidError("Isaac task state is missing object velocity")
+    receptacle_velocity = payload.get("receptacle_velocity")
+    if not isinstance(receptacle_velocity, Mapping):
+        raise HostedDroidError("Isaac task state is missing receptacle velocity")
+    return _DroidTaskState(
+        object_bounds=_parse_axis_aligned_bounds(
+            payload.get("object_bounds"),
+            "object_bounds",
+        ),
+        receptacle_bounds=_parse_axis_aligned_bounds(
+            payload.get("receptacle_bounds"),
+            "receptacle_bounds",
+        ),
+        object_linear_velocity=_finite_triplet(
+            velocity.get("linear"),
+            "object_velocity.linear",
+        ),
+        object_angular_velocity=_finite_triplet(
+            velocity.get("angular"),
+            "object_velocity.angular",
+        ),
+        receptacle_linear_velocity=_finite_triplet(
+            receptacle_velocity.get("linear"),
+            "receptacle_velocity.linear",
+        ),
+        receptacle_angular_velocity=_finite_triplet(
+            receptacle_velocity.get("angular"),
+            "receptacle_velocity.angular",
+        ),
+    )
+
+
+def _parse_axis_aligned_bounds(value: Any, name: str) -> _AxisAlignedBounds:
+    if not isinstance(value, Mapping):
+        raise HostedDroidError(f"Isaac task state is missing {name}")
+    minimum = _finite_triplet(value.get("minimum"), f"{name}.minimum")
+    maximum = _finite_triplet(value.get("maximum"), f"{name}.maximum")
+    if any(lower > upper for lower, upper in zip(minimum, maximum, strict=True)):
+        raise HostedDroidError(f"Isaac task state returned inverted {name}")
+    return _AxisAlignedBounds(minimum=minimum, maximum=maximum)
+
+
+def _finite_triplet(value: Any, name: str) -> tuple[float, float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise HostedDroidError(f"Isaac task state {name} must be a length-3 list")
+    if any(
+        isinstance(item, bool)
+        or not isinstance(item, (int, float))
+        or not math.isfinite(float(item))
+        for item in value
+    ):
+        raise HostedDroidError(f"Isaac task state {name} must contain finite numbers")
+    return cast(tuple[float, float, float], tuple(float(item) for item in value))
+
+
 def _raise_tool_error(name: str, payload: Mapping[str, Any]) -> None:
     status = str(payload.get("status", "")).lower()
     if payload.get("success") is False or status in {"error", "failed", "failure"}:
@@ -1688,6 +2295,50 @@ def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
         "record_video": config.record_video,
         "video_fps": config.video_fps,
         "results_dir": str(config.results_dir) if config.results_dir else None,
+        "task_success": (
+            {
+                "name": config.task_success.name,
+                "object_prim_path": config.task_success.object_prim_path,
+                "receptacle_prim_path": config.task_success.receptacle_prim_path,
+                "minimum_lift_meters": config.task_success.minimum_lift_meters,
+                "minimum_lift_checks": config.task_success.minimum_lift_checks,
+                "horizontal_containment_margin_meters": (
+                    config.task_success.horizontal_containment_margin_meters
+                ),
+                "horizontal_containment_fraction": (
+                    config.task_success.horizontal_containment_fraction
+                ),
+                "minimum_insertion_meters": (
+                    config.task_success.minimum_insertion_meters
+                ),
+                "vertical_tolerance_meters": (
+                    config.task_success.vertical_tolerance_meters
+                ),
+                "maximum_linear_speed_mps": (
+                    config.task_success.maximum_linear_speed_mps
+                ),
+                "maximum_angular_speed_rps": (
+                    config.task_success.maximum_angular_speed_rps
+                ),
+                "maximum_object_displacement_per_action_meters": (
+                    config.task_success.maximum_object_displacement_per_action_meters
+                ),
+                "maximum_receptacle_size_change_meters": (
+                    config.task_success.maximum_receptacle_size_change_meters
+                ),
+                "gripper_closed_threshold": (
+                    config.task_success.gripper_closed_threshold
+                ),
+                "gripper_released_threshold": (
+                    config.task_success.gripper_released_threshold
+                ),
+                "required_settled_checks": (
+                    config.task_success.required_settled_checks
+                ),
+            }
+            if config.task_success is not None
+            else None
+        ),
     }
 
 

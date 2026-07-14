@@ -18,6 +18,18 @@ class HostedEvalParserTests(unittest.TestCase):
         args = _parser().parse_args(["--keep-session"])
         self.assertTrue(args.keep_session)
 
+    def test_scene1_task_success_predicate_is_explicit(self) -> None:
+        default_args = _parser().parse_args([])
+        selected_args = _parser().parse_args(
+            ["--task-success-predicate", "scene1-cube-in-bowl"]
+        )
+
+        self.assertIsNone(default_args.task_success_predicate)
+        self.assertEqual(
+            selected_args.task_success_predicate,
+            "scene1-cube-in-bowl",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
