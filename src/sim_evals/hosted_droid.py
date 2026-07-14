@@ -1140,6 +1140,8 @@ _DROID_INITIAL_ARM_JOINT_POSITIONS = (
     0.0,
 )
 _DROID_DYNAMICS_PROFILE = "nvidia_droid_isaaclab"
+_DROID_PHYSICS_HZ = 120.0
+_DROID_GRIPPER_VELOCITY_LIMIT_RADIANS = 1.0
 _CAMERA_CAPTURE_ATTEMPTS = 10
 _CAMERA_CAPTURE_RETRY_STEPS = 2
 _CAMERA_CAPTURE_RETRY_SECONDS = 0.5
@@ -1441,6 +1443,10 @@ class HostedDroidRunner:
             },
             sort_keys=True,
         )
+        gripper_joint_name = json.dumps(GRIPPER_JOINT_NAME)
+        gripper_velocity_limit_degrees = math.degrees(
+            _DROID_GRIPPER_VELOCITY_LIMIT_RADIANS
+        )
         code = f"""
 import json
 import omni.usd
@@ -1454,6 +1460,7 @@ if not root.IsValid():
 
 joint_settings = json.loads({json.dumps(joint_settings)})
 configured_joints = []
+configured_gripper = False
 articulation_roots = 0
 rigid_bodies = 0
 for prim in Usd.PrimRange(root):
@@ -1473,6 +1480,13 @@ for prim in Usd.PrimRange(root):
             settings["velocity_limit_degrees"]
         )
         configured_joints.append(name)
+    if name == {gripper_joint_name}:
+        if not prim.IsA(UsdPhysics.RevoluteJoint):
+            raise RuntimeError(f"DROID gripper joint is not revolute: {{prim.GetPath()}}")
+        PhysxSchema.PhysxJointAPI.Apply(prim).GetMaxJointVelocityAttr().Set(
+            {gripper_velocity_limit_degrees}
+        )
+        configured_gripper = True
     if prim.HasAPI(UsdPhysics.RigidBodyAPI):
         rigid_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
         rigid_api.GetDisableGravityAttr().Set(True)
@@ -1488,6 +1502,8 @@ for prim in Usd.PrimRange(root):
 missing_joints = sorted(set(joint_settings) - set(configured_joints))
 if missing_joints:
     raise RuntimeError(f"DROID dynamics joints missing: {{missing_joints}}")
+if not configured_gripper:
+    raise RuntimeError("DROID gripper dynamics joint missing")
 if articulation_roots < 1 or rigid_bodies < 1:
     raise RuntimeError(
         "DROID dynamics profile found no articulation root or rigid bodies"
@@ -1496,6 +1512,9 @@ if articulation_roots < 1 or rigid_bodies < 1:
 physics_scenes = 0
 for prim in stage.Traverse():
     if prim.IsA(UsdPhysics.Scene):
+        UsdPhysics.Scene(prim).CreateTimeStepsPerSecondAttr().Set(
+            {_DROID_PHYSICS_HZ}
+        )
         PhysxSchema.PhysxSceneAPI.Apply(prim).GetEnableCCDAttr().Set(True)
         physics_scenes += 1
 if physics_scenes < 1:
@@ -1504,7 +1523,9 @@ if physics_scenes < 1:
 print(json.dumps({{
     "status": "success",
     "profile": "{_DROID_DYNAMICS_PROFILE}",
+    "physics_hz": {_DROID_PHYSICS_HZ},
     "configured_joints": sorted(configured_joints),
+    "configured_gripper": configured_gripper,
     "articulation_roots": articulation_roots,
     "rigid_bodies": rigid_bodies,
     "physics_scenes": physics_scenes,
