@@ -123,6 +123,14 @@ planes:
 - Worldlines owns policy execution. The runner calls the public Cybernetics
   `sample_droid` helper and never loads a policy into Isaac.
 
+Before sampling, the hosted runner applies the benchmark's `NVIDIA_DROID`
+physics profile to the raw robot USD: `400/80` arm drive gains, Panda effort and
+velocity limits, 64/0 articulation solver iterations, disabled rigid-body
+gravity, 5 m/s maximum depenetration velocity, and scene CCD. It also restores
+the benchmark arm pose with an open gripper. Policy actions use an atomic MCP
+step that ends paused and must advance exactly one 15 Hz control interval;
+timeline drift fails the run instead of silently holding targets too long.
+
 Use a Cybernetics SDK release that provides
 `cybernetics.sim.SimulationClient.mcp_session`. Authenticate with the normal
 SDK login or environment-based credential flow; this runner deliberately has
