@@ -42,6 +42,7 @@ _TRANSIENT_MCP_RETRIES = 12
 _HOSTED_MCP_CREDENTIAL_TTL_SECONDS = 86_400
 _DROID_EXTERNAL_CAMERA_ROOT_PREFIX = "/World/droid_eval_"
 _DROID_WRIST_CAMERA_PREFIX = "droid_eval_wrist_cam_"
+_ROBOT_METADATA_STDOUT_PREFIX = "DROID_ROBOT_METADATA="
 _PI0_DROID_POLICY_PROFILE: dict[str, Any] = {
     "base_model": "pi0-droid",
     "openpi_config": "pi0_droid_jointpos_polaris",
@@ -1390,24 +1391,11 @@ class HostedDroidRunner:
             self._sleep(self.config.readiness_poll_seconds)
 
     def _ensure_robot(self, mcp: MCPClient) -> bool:
-        info = self._try_call(
-            mcp,
-            "isaac.get_robot_info",
-            {
-                "prim_path": self.config.robot_prim_path,
-            },
-        )
-        if info is not None and _has_droid_joints(info):
+        metadata = self._robot_metadata(mcp)
+        if _has_droid_joints(metadata):
             return False
 
-        if (
-            self._try_call(
-                mcp,
-                "isaac.get_prim_info",
-                {"prim_path": self.config.robot_prim_path},
-            )
-            is not None
-        ):
+        if metadata["prim_exists"]:
             self._call(
                 mcp,
                 "isaac.delete_object",
@@ -1421,18 +1409,71 @@ class HostedDroidRunner:
                 "prim_path": self.config.robot_prim_path,
             },
         )
-        repaired = self._call(
-            mcp,
-            "isaac.get_robot_info",
-            {
-                "prim_path": self.config.robot_prim_path,
-            },
-        )
+        repaired = self._robot_metadata(mcp)
         if not _has_droid_joints(repaired):
             raise HostedDroidError(
                 f"loaded robot at {self.config.robot_prim_path} is not DROID-compatible"
             )
         return True
+
+    def _robot_metadata(self, mcp: MCPClient) -> dict[str, Any]:
+        robot_path = json.dumps(self.config.robot_prim_path)
+        prefix = json.dumps(_ROBOT_METADATA_STDOUT_PREFIX)
+        code = f"""
+import json
+import omni.usd
+from pxr import Usd, UsdPhysics
+
+stage = omni.usd.get_context().get_stage()
+robot_path = {robot_path}
+root = stage.GetPrimAtPath(robot_path)
+joint_names = []
+if root.IsValid():
+    for prim in Usd.PrimRange(root):
+        if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(
+            UsdPhysics.PrismaticJoint
+        ):
+            joint_names.append(prim.GetName())
+payload = {{
+    "prim_exists": bool(root.IsValid()),
+    "joint_names": joint_names,
+    "num_dof": len(joint_names),
+    "source": "usd_metadata",
+}}
+print({prefix} + json.dumps(payload, sort_keys=True))
+"""
+        response = self._call(mcp, "isaac.execute_script", {"code": code})
+        stdout = response.get("stdout")
+        if not isinstance(stdout, str):
+            raise HostedDroidError(
+                "isaac.execute_script did not return robot-metadata stdout"
+            )
+        encoded_metadata = next(
+            (
+                line.removeprefix(_ROBOT_METADATA_STDOUT_PREFIX)
+                for line in reversed(stdout.splitlines())
+                if line.startswith(_ROBOT_METADATA_STDOUT_PREFIX)
+            ),
+            None,
+        )
+        if encoded_metadata is None:
+            raise HostedDroidError(
+                "isaac.execute_script did not emit the robot-metadata marker"
+            )
+        try:
+            payload = json.loads(encoded_metadata)
+        except json.JSONDecodeError as exc:
+            raise HostedDroidError("Isaac emitted invalid robot-metadata JSON") from exc
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("prim_exists"), bool
+        ):
+            raise HostedDroidError("Isaac emitted invalid robot metadata")
+        joint_names = payload.get("joint_names")
+        if not isinstance(joint_names, list) or not all(
+            isinstance(name, str) for name in joint_names
+        ):
+            raise HostedDroidError("Isaac emitted invalid robot joint metadata")
+        return cast(dict[str, Any], payload)
 
     def _configure_robot_dynamics(self, mcp: MCPClient) -> None:
         robot_path = json.dumps(self.config.robot_prim_path)

@@ -123,16 +123,18 @@ planes:
 - Worldlines owns policy execution. The runner calls the public Cybernetics
   `sample_droid` helper and never loads a policy into Isaac.
 
-Before sampling, the hosted runner applies the benchmark's `NVIDIA_DROID`
-physics profile to the raw robot USD: `400/80` arm drive gains, Panda effort and
-velocity limits, a 1 rad/s gripper limit, 64/0 articulation solver iterations,
-disabled rigid-body gravity, 5 m/s maximum depenetration velocity, 120 Hz
-physics, and scene CCD. It also restores the benchmark arm pose with an open
-gripper. Fixed, play-every-frame timeline settings and a matching 120 Hz minimum
-simulation rate make each app update one physics substep. Policy actions use an
-atomic eight-substep MCP call that ends paused and must advance exactly one 15
-Hz control interval; timeline drift fails the run instead of silently holding
-targets too long.
+Before sampling, the hosted runner inventories the robot's joints through a
+USD-only script that cannot initialize an articulation or physics world. It then
+applies the benchmark's `NVIDIA_DROID` physics profile to the cold robot USD:
+`400/80` arm drive gains, Panda effort and velocity limits, a 1 rad/s gripper
+limit, 64/0 articulation solver iterations, disabled rigid-body gravity, 5 m/s
+maximum depenetration velocity, 120 Hz physics, and scene CCD. The first exact
+frame initializes physics only after that profile is complete. The runner also
+restores the benchmark arm pose with an open gripper. Fixed play-every-frame
+timeline settings and a matching 120 Hz minimum simulation rate make each app
+update one physics substep. Policy actions use an atomic eight-substep MCP call
+that ends paused and must advance exactly one 15 Hz control interval; timeline
+drift fails the run instead of silently holding targets too long.
 
 Task-acceptance runs require runtime articulation provenance for both DOF order
 and every joint observation; authored USD drive targets are not accepted as
