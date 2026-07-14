@@ -1512,10 +1512,9 @@ if articulation_roots < 1 or rigid_bodies < 1:
 physics_scenes = 0
 for prim in stage.Traverse():
     if prim.IsA(UsdPhysics.Scene):
-        UsdPhysics.Scene(prim).CreateTimeStepsPerSecondAttr().Set(
-            {_DROID_PHYSICS_HZ}
-        )
-        PhysxSchema.PhysxSceneAPI.Apply(prim).GetEnableCCDAttr().Set(True)
+        physx_scene_api = PhysxSchema.PhysxSceneAPI.Apply(prim)
+        physx_scene_api.GetTimeStepsPerSecondAttr().Set({_DROID_PHYSICS_HZ})
+        physx_scene_api.GetEnableCCDAttr().Set(True)
         physics_scenes += 1
 if physics_scenes < 1:
     raise RuntimeError("DROID dynamics profile found no physics scene")
