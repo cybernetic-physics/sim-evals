@@ -1143,10 +1143,14 @@ _DROID_DYNAMICS_PROFILE = "nvidia_droid_isaaclab"
 _DROID_PHYSICS_HZ = 120.0
 _DROID_GRIPPER_VELOCITY_LIMIT_RADIANS = 1.0
 _CAMERA_CAPTURE_ATTEMPTS = 10
-_CAMERA_CAPTURE_RETRY_STEPS = 2
 _CAMERA_CAPTURE_RETRY_SECONDS = 0.5
 _CAMERA_WARMUP_STEPS = 32
 _CAMERA_WARMUP_SECONDS = 1.0
+_INITIAL_SETTLE_MAX_CHECKS = 30
+_INITIAL_SETTLE_STABLE_CHECKS = 2
+_INITIAL_ARM_ERROR_TOLERANCE_RADIANS = 0.05
+_INITIAL_ARM_MOTION_TOLERANCE_RADIANS = 0.005
+_INITIAL_GRIPPER_TOLERANCE = 0.1
 _MIN_LUMINANCE_P99 = 12.0
 _MIN_LUMINANCE_STDDEV = 2.0
 _MIN_NON_DARK_FRACTION = 0.01
@@ -1254,6 +1258,13 @@ class HostedDroidRunner:
                     self._reset_robot_for_policy(mcp, joint_indices)
                     physics_dt, physics_steps_per_action = self._control_cadence(mcp)
                     control_hz = 1.0 / (physics_dt * physics_steps_per_action)
+                    initial_arm_positions, initial_gripper_position = (
+                        self._settle_robot_for_policy(
+                            mcp,
+                            joint_indices,
+                            physics_steps_per_action,
+                        )
+                    )
                     if evidence is not None:
                         evidence.write_runtime_metadata(
                             {
@@ -1263,10 +1274,15 @@ class HostedDroidRunner:
                                 "target_control_hz": self.config.target_control_hz,
                                 "control_hz": control_hz,
                                 "robot_dynamics_profile": _DROID_DYNAMICS_PROFILE,
-                                "initial_arm_joint_positions": list(
+                                "initial_arm_joint_targets": list(
                                     _DROID_INITIAL_ARM_JOINT_POSITIONS
                                 ),
-                                "initial_gripper_position": 0.0,
+                                "initial_arm_joint_positions": (
+                                    initial_arm_positions.tolist()
+                                ),
+                                "initial_gripper_target": 0.0,
+                                "initial_gripper_position": initial_gripper_position,
+                                "joint_measurement_source": "runtime_articulation",
                                 "task_success_predicate": (
                                     self.config.task_success.name
                                     if self.config.task_success is not None
@@ -1274,11 +1290,6 @@ class HostedDroidRunner:
                                 ),
                             }
                         )
-                    self._step_while_playing(
-                        mcp,
-                        num_steps=_CAMERA_WARMUP_STEPS,
-                    )
-                    self._sleep(_CAMERA_WARMUP_SECONDS)
                     self.sampling_api.reset_sampling_session()
                     rollout = self._rollout(
                         mcp,
@@ -1376,10 +1387,14 @@ class HostedDroidRunner:
             self._sleep(self.config.readiness_poll_seconds)
 
     def _ensure_robot(self, mcp: MCPClient) -> bool:
+        self._step_while_playing(mcp, num_steps=1)
         info = self._try_call(
             mcp,
             "isaac.get_robot_info",
-            {"prim_path": self.config.robot_prim_path},
+            {
+                "prim_path": self.config.robot_prim_path,
+                "require_runtime": True,
+            },
         )
         if info is not None and _has_droid_joints(info):
             return False
@@ -1414,7 +1429,10 @@ class HostedDroidRunner:
         repaired = self._call(
             mcp,
             "isaac.get_robot_info",
-            {"prim_path": self.config.robot_prim_path},
+            {
+                "prim_path": self.config.robot_prim_path,
+                "require_runtime": True,
+            },
         )
         if not _has_droid_joints(repaired):
             raise HostedDroidError(
@@ -1561,6 +1579,53 @@ print(json.dumps({{
             },
         )
 
+    def _settle_robot_for_policy(
+        self,
+        mcp: MCPClient,
+        joint_indices: tuple[list[int], int],
+        physics_steps_per_action: int,
+    ) -> tuple[np.ndarray, float]:
+        target = np.asarray(_DROID_INITIAL_ARM_JOINT_POSITIONS, dtype=np.float32)
+        self._step_while_playing(mcp, num_steps=_CAMERA_WARMUP_STEPS)
+        self._sleep(_CAMERA_WARMUP_SECONDS)
+
+        previous: np.ndarray | None = None
+        stable_checks = 0
+        last_error = math.inf
+        last_motion = math.inf
+        last_gripper = math.inf
+        for check in range(_INITIAL_SETTLE_MAX_CHECKS):
+            arm_positions, gripper_position = self._joint_state(mcp, joint_indices)
+            last_error = float(np.max(np.abs(arm_positions - target)))
+            last_motion = (
+                float(np.max(np.abs(arm_positions - previous)))
+                if previous is not None
+                else math.inf
+            )
+            last_gripper = gripper_position
+            if (
+                last_error <= _INITIAL_ARM_ERROR_TOLERANCE_RADIANS
+                and last_motion <= _INITIAL_ARM_MOTION_TOLERANCE_RADIANS
+                and gripper_position <= _INITIAL_GRIPPER_TOLERANCE
+            ):
+                stable_checks += 1
+            else:
+                stable_checks = 0
+            if stable_checks >= _INITIAL_SETTLE_STABLE_CHECKS:
+                return arm_positions, gripper_position
+            previous = arm_positions.copy()
+            if check + 1 < _INITIAL_SETTLE_MAX_CHECKS:
+                self._step_while_playing(
+                    mcp,
+                    num_steps=physics_steps_per_action,
+                )
+
+        raise HostedDroidError(
+            "DROID robot did not settle at the measured benchmark initial state: "
+            f"arm_error={last_error:.6f}, arm_motion={last_motion:.6f}, "
+            f"gripper={last_gripper:.6f}"
+        )
+
     def _ensure_cameras(self, mcp: MCPClient) -> list[str]:
         created: list[str] = []
         for camera in self.config.cameras:
@@ -1694,8 +1759,15 @@ print({{"status": "success", "prim_path": {prim_path}}})
         info = self._call(
             mcp,
             "isaac.get_robot_info",
-            {"prim_path": self.config.robot_prim_path},
+            {
+                "prim_path": self.config.robot_prim_path,
+                "require_runtime": True,
+            },
         )
+        if info.get("measurement_source") != "runtime_articulation":
+            raise HostedDroidError(
+                "isaac.get_robot_info did not prove runtime articulation ordering"
+            )
         names = info.get("joint_names")
         if not isinstance(names, list) or not all(
             isinstance(name, str) for name in names
@@ -2017,8 +2089,15 @@ print({prefix} + json.dumps(payload, sort_keys=True))
         positions_payload = self._call(
             mcp,
             "isaac.get_joint_positions",
-            {"prim_path": self.config.robot_prim_path},
+            {
+                "prim_path": self.config.robot_prim_path,
+                "require_runtime": True,
+            },
         )
+        if positions_payload.get("measurement_source") != "runtime_articulation":
+            raise HostedDroidError(
+                "isaac.get_joint_positions did not return runtime articulation state"
+            )
         positions = np.asarray(
             positions_payload.get("joint_positions"),
             dtype=np.float32,
@@ -2082,11 +2161,6 @@ print({prefix} + json.dumps(payload, sort_keys=True))
                 last_error = exc
                 if attempt == _CAMERA_CAPTURE_ATTEMPTS:
                     break
-                if not _is_transport_failure(exc):
-                    self._step_while_playing(
-                        mcp,
-                        num_steps=_CAMERA_CAPTURE_RETRY_STEPS,
-                    )
                 self._sleep(_CAMERA_CAPTURE_RETRY_SECONDS)
         raise HostedDroidError(
             f"camera {camera_prim_path} did not produce a valid rendered frame after "
