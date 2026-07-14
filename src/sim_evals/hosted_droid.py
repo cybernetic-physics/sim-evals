@@ -1130,6 +1130,16 @@ class _EvidenceRecorder:
 ARM_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
 GRIPPER_JOINT_NAME = "finger_joint"
 GRIPPER_CLOSED_RADIANS = math.pi / 4
+_DROID_INITIAL_ARM_JOINT_POSITIONS = (
+    0.0,
+    -math.pi / 5,
+    0.0,
+    -4 * math.pi / 5,
+    0.0,
+    3 * math.pi / 5,
+    0.0,
+)
+_DROID_DYNAMICS_PROFILE = "nvidia_droid_isaaclab"
 _CAMERA_CAPTURE_ATTEMPTS = 10
 _CAMERA_CAPTURE_RETRY_STEPS = 2
 _CAMERA_CAPTURE_RETRY_SECONDS = 0.5
@@ -1201,9 +1211,7 @@ class HostedDroidRunner:
             try:
                 if session_id is None:
                     launch_kwargs: dict[str, Any] = {
-                        "wait": True,
-                        "timeout_seconds": self.config.launch_timeout_seconds,
-                        "poll_interval_seconds": self.config.readiness_poll_seconds,
+                        "wait": False,
                     }
                     if self.config.runtime_provider is not None:
                         launch_kwargs["runtime_provider"] = self.config.runtime_provider
@@ -1213,6 +1221,11 @@ class HostedDroidRunner:
                     )
                     session_id = launch.session_id
                     owns_session = True
+                    self.simulation_client.wait_for_session(
+                        session_id,
+                        timeout_seconds=self.config.launch_timeout_seconds,
+                        poll_interval_seconds=self.config.readiness_poll_seconds,
+                    )
                 else:
                     self.simulation_client.wait_for_session(
                         session_id,
@@ -1231,10 +1244,12 @@ class HostedDroidRunner:
                 with mcp_session(session_id) as mcp:
                     self._wait_for_isaac(mcp)
                     repaired_robot = self._ensure_robot(mcp)
+                    self._configure_robot_dynamics(mcp)
                     self._retire_previous_cameras(mcp)
                     created_cameras = self._ensure_cameras(mcp)
                     self._set_viewer_camera(mcp, created_cameras[0])
                     joint_indices = self._joint_indices(mcp)
+                    self._reset_robot_for_policy(mcp, joint_indices)
                     physics_dt, physics_steps_per_action = self._control_cadence(mcp)
                     control_hz = 1.0 / (physics_dt * physics_steps_per_action)
                     if evidence is not None:
@@ -1245,6 +1260,11 @@ class HostedDroidRunner:
                                 "physics_steps_per_action": physics_steps_per_action,
                                 "target_control_hz": self.config.target_control_hz,
                                 "control_hz": control_hz,
+                                "robot_dynamics_profile": _DROID_DYNAMICS_PROFILE,
+                                "initial_arm_joint_positions": list(
+                                    _DROID_INITIAL_ARM_JOINT_POSITIONS
+                                ),
+                                "initial_gripper_position": 0.0,
                                 "task_success_predicate": (
                                     self.config.task_success.name
                                     if self.config.task_success is not None
@@ -1383,11 +1403,11 @@ class HostedDroidRunner:
                 "prim_path": self.config.robot_prim_path,
             },
         )
-        self._call(mcp, "isaac.play_simulation", {})
-        self._call(
+        self._step_while_playing(
             mcp,
-            "isaac.step_simulation",
-            {"num_steps": 1, "observe_joints": [self.config.robot_prim_path]},
+            num_steps=1,
+            observe_joints=[self.config.robot_prim_path],
+            observe_cap=1,
         )
         repaired = self._call(
             mcp,
@@ -1399,6 +1419,114 @@ class HostedDroidRunner:
                 f"loaded robot at {self.config.robot_prim_path} is not DROID-compatible"
             )
         return True
+
+    def _configure_robot_dynamics(self, mcp: MCPClient) -> None:
+        robot_path = json.dumps(self.config.robot_prim_path)
+        joint_settings = json.dumps(
+            {
+                **{
+                    f"panda_joint{index}": {
+                        "effort_limit": 87.0,
+                        "velocity_limit_degrees": math.degrees(2.175),
+                    }
+                    for index in range(1, 5)
+                },
+                **{
+                    f"panda_joint{index}": {
+                        "effort_limit": 12.0,
+                        "velocity_limit_degrees": math.degrees(2.61),
+                    }
+                    for index in range(5, 8)
+                },
+            },
+            sort_keys=True,
+        )
+        code = f"""
+import json
+import omni.usd
+from pxr import PhysxSchema, Usd, UsdPhysics
+
+stage = omni.usd.get_context().get_stage()
+robot_path = {robot_path}
+root = stage.GetPrimAtPath(robot_path)
+if not root.IsValid():
+    raise RuntimeError(f"DROID robot prim not found: {{robot_path}}")
+
+joint_settings = json.loads({json.dumps(joint_settings)})
+configured_joints = []
+articulation_roots = 0
+rigid_bodies = 0
+for prim in Usd.PrimRange(root):
+    name = prim.GetName()
+    if name in joint_settings:
+        if not prim.IsA(UsdPhysics.RevoluteJoint):
+            raise RuntimeError(f"DROID arm joint is not revolute: {{prim.GetPath()}}")
+        drive = UsdPhysics.DriveAPI.Get(prim, UsdPhysics.Tokens.angular)
+        if not drive or not drive.GetPrim().IsValid():
+            raise RuntimeError(f"DROID arm drive unavailable: {{prim.GetPath()}}")
+        settings = joint_settings[name]
+        drive.GetStiffnessAttr().Set(400.0)
+        drive.GetDampingAttr().Set(80.0)
+        drive.GetMaxForceAttr().Set(settings["effort_limit"])
+        joint_api = PhysxSchema.PhysxJointAPI.Apply(prim)
+        joint_api.GetMaxJointVelocityAttr().Set(
+            settings["velocity_limit_degrees"]
+        )
+        configured_joints.append(name)
+    if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        rigid_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+        rigid_api.GetDisableGravityAttr().Set(True)
+        rigid_api.GetMaxDepenetrationVelocityAttr().Set(5.0)
+        rigid_bodies += 1
+    if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+        articulation_api = PhysxSchema.PhysxArticulationAPI.Apply(prim)
+        articulation_api.GetEnabledSelfCollisionsAttr().Set(False)
+        articulation_api.GetSolverPositionIterationCountAttr().Set(64)
+        articulation_api.GetSolverVelocityIterationCountAttr().Set(0)
+        articulation_roots += 1
+
+missing_joints = sorted(set(joint_settings) - set(configured_joints))
+if missing_joints:
+    raise RuntimeError(f"DROID dynamics joints missing: {{missing_joints}}")
+if articulation_roots < 1 or rigid_bodies < 1:
+    raise RuntimeError(
+        "DROID dynamics profile found no articulation root or rigid bodies"
+    )
+
+physics_scenes = 0
+for prim in stage.Traverse():
+    if prim.IsA(UsdPhysics.Scene):
+        PhysxSchema.PhysxSceneAPI.Apply(prim).GetEnableCCDAttr().Set(True)
+        physics_scenes += 1
+if physics_scenes < 1:
+    raise RuntimeError("DROID dynamics profile found no physics scene")
+
+print(json.dumps({{
+    "status": "success",
+    "profile": "{_DROID_DYNAMICS_PROFILE}",
+    "configured_joints": sorted(configured_joints),
+    "articulation_roots": articulation_roots,
+    "rigid_bodies": rigid_bodies,
+    "physics_scenes": physics_scenes,
+}}, sort_keys=True))
+"""
+        self._call(mcp, "isaac.execute_script", {"code": code})
+
+    def _reset_robot_for_policy(
+        self,
+        mcp: MCPClient,
+        joint_indices: tuple[list[int], int],
+    ) -> None:
+        arm_indices, gripper_index = joint_indices
+        self._call(
+            mcp,
+            "isaac.set_joint_positions",
+            {
+                "prim_path": self.config.robot_prim_path,
+                "joint_positions": [*_DROID_INITIAL_ARM_JOINT_POSITIONS, 0.0],
+                "joint_indices": [*arm_indices, gripper_index],
+            },
+        )
 
     def _ensure_cameras(self, mcp: MCPClient) -> list[str]:
         created: list[str] = []
@@ -1983,9 +2111,11 @@ print({prefix} + json.dumps(payload, sort_keys=True))
         observe_joints: list[str] | None = None,
         observe_cap: int | None = None,
     ) -> dict[str, Any]:
-        self._call(mcp, "isaac.play_simulation", {})
         try:
-            arguments: dict[str, Any] = {"num_steps": num_steps}
+            arguments: dict[str, Any] = {
+                "num_steps": num_steps,
+                "pause_after": True,
+            }
             if observe_joints is not None:
                 arguments["observe_joints"] = observe_joints
             if observe_cap is not None:
@@ -1999,9 +2129,12 @@ print({prefix} + json.dumps(payload, sort_keys=True))
                     f"simulation step failed ({step_exc}); pause also failed: {pause_exc}"
                 ) from step_exc
             raise
-        else:
-            self._call(mcp, "isaac.pause_simulation", {})
-            return result
+        state = self._simulation_state(mcp)
+        if state["timeline_state"] != "paused":
+            raise HostedDroidError(
+                "isaac.step_simulation did not leave the timeline paused"
+            )
+        return result
 
     def _apply_action(
         self,
@@ -2053,6 +2186,14 @@ print({prefix} + json.dumps(payload, sort_keys=True))
                 "simulation time moved backward while applying action"
             )
         expected_seconds = physics_steps_per_action * before["physics_dt"]
+        drift_seconds = observed_seconds - expected_seconds
+        tolerance_seconds = max(1e-6, before["physics_dt"] * 0.25)
+        if abs(drift_seconds) > tolerance_seconds:
+            raise HostedDroidError(
+                "isaac.step_simulation advanced the policy action by the wrong "
+                f"duration: expected={expected_seconds:.9f}s, "
+                f"observed={observed_seconds:.9f}s"
+            )
         return (
             joint_positions,
             applied_joint_indices,
@@ -2062,7 +2203,7 @@ print({prefix} + json.dumps(payload, sort_keys=True))
                 "stepped": stepped,
                 "expected_simulation_seconds": expected_seconds,
                 "observed_simulation_seconds": observed_seconds,
-                "timeline_drift_seconds": observed_seconds - expected_seconds,
+                "timeline_drift_seconds": drift_seconds,
             },
         )
 

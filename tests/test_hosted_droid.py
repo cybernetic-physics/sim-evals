@@ -20,6 +20,7 @@ from PIL import Image
 
 from sim_evals.hosted_droid import (
     GRIPPER_CLOSED_RADIANS,
+    _DROID_INITIAL_ARM_JOINT_POSITIONS,
     HostedDroidConfig,
     HostedDroidError,
     HostedDroidRunner,
@@ -257,7 +258,10 @@ class FakeMCP:
                 result = {"status": "success", **self.step_payloads.pop(0)}
             else:
                 result = {"status": "success", "stepped": arguments["num_steps"]}
-            self.current_time += int(result.get("stepped", 0)) * self.physics_dt
+            advanced_steps = int(result.get("advanced_steps", result.get("stepped", 0)))
+            self.current_time += advanced_steps * self.physics_dt
+            if arguments.get("pause_after") is True:
+                self.timeline_state = "paused"
             return result
         if name == "isaac.get_simulation_state":
             return {
@@ -319,9 +323,11 @@ class FakeSimulationClient:
         mcp: FakeMCP,
         *,
         stop_error: Exception | None = None,
+        wait_error: BaseException | None = None,
     ) -> None:
         self.mcp = mcp
         self.stop_error = stop_error
+        self.wait_error = wait_error
         self.launch_calls: list[tuple[str, dict[str, Any]]] = []
         self.stopped: list[str] = []
         self.mcp_session_ids: list[str] = []
@@ -333,6 +339,10 @@ class FakeSimulationClient:
 
     def wait_for_session(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
         self.wait_calls.append((session_id, kwargs))
+        if self.wait_error is not None:
+            error = self.wait_error
+            self.wait_error = None
+            raise error
         return {"id": session_id, "status": "running"}
 
     def mcp_session(self, session_id: str) -> AbstractContextManager[MCPClient]:
@@ -426,8 +436,11 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertEqual(simulation.launch_calls[0][1]["runtime_provider"], "vast")
 
         observation = sampler.observations[0]
-        np.testing.assert_allclose(observation.joint_position, np.arange(1, 8) / 10)
-        np.testing.assert_allclose(observation.gripper_position, [0.5])
+        np.testing.assert_allclose(
+            observation.joint_position,
+            _DROID_INITIAL_ARM_JOINT_POSITIONS,
+        )
+        np.testing.assert_allclose(observation.gripper_position, [0.0])
         self.assertEqual(observation.exterior_image_1_left.shape, (360, 640, 3))
         self.assertEqual(int(observation.exterior_image_1_left[0, 0, 0]), 20)
         self.assertEqual(int(observation.exterior_image_1_left[0, -1, 0]), 40)
@@ -442,14 +455,32 @@ class HostedDroidRunnerTest(unittest.TestCase):
         expected_indices = [2, 5, 7, 1, 6, 8, 3, 4]
         self.assertEqual(set_calls[0]["joint_indices"], expected_indices)
         self.assertEqual(set_calls[1]["joint_indices"], expected_indices)
-        self.assertAlmostEqual(set_calls[0]["joint_positions"][-1], 0.0)
+        self.assertEqual(set_calls[2]["joint_indices"], expected_indices)
+        self.assertEqual(
+            set_calls[0]["joint_positions"],
+            [*_DROID_INITIAL_ARM_JOINT_POSITIONS, 0.0],
+        )
+        self.assertAlmostEqual(set_calls[1]["joint_positions"][-1], 0.0)
         self.assertAlmostEqual(
-            set_calls[1]["joint_positions"][-1], GRIPPER_CLOSED_RADIANS
+            set_calls[2]["joint_positions"][-1], GRIPPER_CLOSED_RADIANS
         )
         step_calls = [
             args for name, args in mcp.calls if name == "isaac.step_simulation"
         ]
         self.assertEqual(step_calls[-1]["num_steps"], 4)
+        self.assertTrue(all(call["pause_after"] for call in step_calls))
+        dynamics_script = next(
+            str(arguments["code"])
+            for name, arguments in mcp.calls
+            if name == "isaac.execute_script"
+            and "nvidia_droid_isaaclab" in str(arguments["code"])
+        )
+        self.assertIn("drive.GetStiffnessAttr().Set(400.0)", dynamics_script)
+        self.assertIn("drive.GetDampingAttr().Set(80.0)", dynamics_script)
+        self.assertIn("GetSolverVelocityIterationCountAttr().Set(0)", dynamics_script)
+        self.assertIn("GetMaxDepenetrationVelocityAttr().Set(5.0)", dynamics_script)
+        self.assertEqual(simulation.launch_calls[0][1]["wait"], False)
+        self.assertEqual(len(simulation.wait_calls), 1)
         self.assertAlmostEqual(result.physics_dt, 1.0 / 60.0)
         self.assertEqual(result.physics_steps_per_action, 4)
         self.assertAlmostEqual(result.control_hz, 15.0)
@@ -509,6 +540,29 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 )
             ],
         )
+
+    def test_interrupted_launch_wait_stops_the_owned_session(self) -> None:
+        simulation = FakeSimulationClient(
+            FakeMCP(readiness_failures=0, warm=True),
+            wait_error=KeyboardInterrupt(),
+        )
+        sampler = FakeSampler()
+        runner = HostedDroidRunner(
+            simulation,
+            sampler,
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+                keep_session=False,
+            ),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            runner.run()
+
+        self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
+        self.assertTrue(sampler.closed)
 
     def test_readiness_timeout_closes_sampler_and_keeps_session(self) -> None:
         mcp = FakeMCP(readiness_failures=10)
@@ -1321,7 +1375,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
         ]
         self.assertEqual(
             [call["joint_positions"][-1] for call in set_calls],
-            [0.0, 0.0, GRIPPER_CLOSED_RADIANS],
+            [0.0, 0.0, 0.0, GRIPPER_CLOSED_RADIANS],
         )
 
     def test_archives_full_sampled_chunk_before_open_loop_truncation(self) -> None:
@@ -1404,7 +1458,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
         retry_steps = [
             arguments
             for name, arguments in mcp.calls
-            if name == "isaac.step_simulation" and arguments == {"num_steps": 2}
+            if name == "isaac.step_simulation" and arguments["num_steps"] == 2
         ]
         self.assertEqual(len(capture_calls), 5)
         self.assertEqual(len(retry_steps), 2)
@@ -1429,7 +1483,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
         retry_steps = [
             arguments
             for name, arguments in mcp.calls
-            if name == "isaac.step_simulation" and arguments == {"num_steps": 2}
+            if name == "isaac.step_simulation" and arguments["num_steps"] == 2
         ]
         self.assertEqual(retry_steps, [])
 
@@ -1455,7 +1509,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             for name, arguments in mcp.calls
             if name == "isaac.set_joint_positions"
         ]
-        self.assertEqual(len(joint_targets), 2)
+        self.assertEqual(len(joint_targets), 3)
         self.assertEqual(joint_targets[0], joint_targets[1])
 
     def test_partial_action_step_fails_without_applied_action_evidence(self) -> None:
@@ -1494,6 +1548,28 @@ class HostedDroidRunnerTest(unittest.TestCase):
             )
             self.assertFalse((results_dir / "result.json").exists())
             self.assertTrue((results_dir / "error.json").is_file())
+
+    def test_action_step_fails_closed_on_timeline_drift(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            step_payloads=[
+                {"stepped": 32},
+                {"stepped": 4, "advanced_steps": 8},
+            ],
+        )
+        runner = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaisesRegex(HostedDroidError, "wrong duration"):
+            runner.run()
 
     def test_jsonl_writer_retries_short_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1685,6 +1761,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             arguments["code"]
             for name, arguments in mcp.calls
             if name == "isaac.execute_script"
+            and "AddOrientOp" in str(arguments["code"])
         ]
         self.assertEqual(len(enhanced), 3)
         self.assertEqual(enhanced[0]["orientation"], [-0.393, -0.195, 0.399, 0.805])
@@ -1698,7 +1775,11 @@ class HostedDroidRunnerTest(unittest.TestCase):
         fallback_calls = [
             (name, arguments)
             for name, arguments in mcp.calls
-            if name in {"isaac.create_camera", "isaac.execute_script"}
+            if name == "isaac.create_camera"
+            or (
+                name == "isaac.execute_script"
+                and "AddOrientOp" in str(arguments["code"])
+            )
         ]
         for camera_index in range(3):
             offset = camera_index * 3
@@ -1753,6 +1834,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             arguments["code"]
             for name, arguments in mcp.calls
             if name == "isaac.execute_script"
+            and "viewport.camera_path" in str(arguments["code"])
         ]
         self.assertEqual(len(scripts), 1)
         self.assertIn("viewport.camera_path", scripts[0])
