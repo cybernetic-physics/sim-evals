@@ -144,8 +144,10 @@ unrecorded physics steps between an applied action and its task-state evidence.
 Use a Cybernetics SDK release that provides
 `cybernetics.sim.SimulationClient.mcp_session`. Authenticate with the normal
 SDK login or environment-based credential flow; this runner deliberately has
-no credential arguments. The environment URI can be passed directly or through
-`CYBERNETICS_DROID_ENV_URI`:
+no credential arguments. Its MCP context explicitly requests the SDK maximum
+`86400`-second TTL for long rollouts, while keeping the credential session scoped;
+exiting the context revokes it. The environment URI can be passed directly or
+through `CYBERNETICS_DROID_ENV_URI`:
 
 ```bash
 export CYBERNETICS_DROID_ENV_URI=cybernetics://envs/ENV_ID/versions/VERSION_ID
@@ -273,7 +275,9 @@ deletes older evaluator-owned external roots and wrist cameras. The updated
 extension releases their render products, keeping retained sessions bounded.
 Sessions launched successfully by the evaluator remain running after the
 rollout. Use `--stop-session` to opt into cleanup. Attached sessions always
-remain caller-owned.
+remain caller-owned. Cleanup always attempts both sampling-client close and an
+opted-in simulator stop. A cleanup error after an otherwise successful rollout
+is recorded as failure evidence and never as `result.json` success.
 
 The runner reads `physics_dt` from `isaac.get_simulation_state` and derives the
 integer number of physics updates nearest to 15 Hz. It requests play immediately

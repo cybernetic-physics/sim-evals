@@ -39,6 +39,7 @@ _TRANSIENT_MCP_FAILURE_MARKERS = (
 _IDEMPOTENT_TRANSPORT_RETRY_TOOLS = frozenset({"isaac.set_joint_positions"})
 _TRANSIENT_TRANSPORT_FAILURE_MARKERS = ("HTTP 502",)
 _TRANSIENT_MCP_RETRIES = 12
+_HOSTED_MCP_CREDENTIAL_TTL_SECONDS = 86_400
 _DROID_EXTERNAL_CAMERA_ROOT_PREFIX = "/World/droid_eval_"
 _DROID_WRIST_CAMERA_PREFIX = "droid_eval_wrist_cam_"
 _PI0_DROID_POLICY_PROFILE: dict[str, Any] = {
@@ -75,7 +76,12 @@ class SimulationClientAPI(Protocol):
         poll_interval_seconds: float,
     ) -> Mapping[str, Any]: ...
 
-    def mcp_session(self, session_id: str) -> AbstractContextManager[MCPClient]: ...
+    def mcp_session(
+        self,
+        session_id: str,
+        *,
+        ttl_seconds: int,
+    ) -> AbstractContextManager[MCPClient]: ...
 
     def stop_session(self, session_id: str) -> None: ...
 
@@ -1242,12 +1248,15 @@ class HostedDroidRunner:
                 if not callable(mcp_session):
                     raise HostedDroidError(
                         "Cybernetics SimulationClient must expose "
-                        "mcp_session(session_id)"
+                        "mcp_session(session_id, *, ttl_seconds)"
                     )
                 mcp_session = cast(
-                    Callable[[str], AbstractContextManager[MCPClient]], mcp_session
+                    Callable[..., AbstractContextManager[MCPClient]], mcp_session
                 )
-                with mcp_session(session_id) as mcp:
+                with mcp_session(
+                    session_id,
+                    ttl_seconds=_HOSTED_MCP_CREDENTIAL_TTL_SECONDS,
+                ) as mcp:
                     self._wait_for_isaac(mcp)
                     repaired_robot = self._ensure_robot(mcp)
                     self._configure_robot_dynamics(mcp)
@@ -1313,19 +1322,12 @@ class HostedDroidRunner:
                     task_success_checks=rollout.task_success_checks,
                     task_success_reason=rollout.task_success_reason,
                 )
-            except BaseException:
-                cleanup_errors.extend(
-                    self._cleanup_after_failure(session_id, owns_session)
+            finally:
+                cleanup_errors.extend(self._cleanup(session_id, owns_session))
+            if cleanup_errors:
+                raise HostedDroidError(
+                    "hosted DROID cleanup failed: " + "; ".join(cleanup_errors)
                 )
-                raise
-            else:
-                self.sampling_api.close()
-                if (
-                    owns_session
-                    and session_id is not None
-                    and not self.config.keep_session
-                ):
-                    self.simulation_client.stop_session(session_id)
             if evidence is not None and self.config.record_video:
                 evidence.finalize_video(self.config.video_fps)
         except BaseException as exc:
@@ -1349,7 +1351,7 @@ class HostedDroidRunner:
             evidence.write_result(result)
         return result
 
-    def _cleanup_after_failure(
+    def _cleanup(
         self,
         session_id: str | None,
         owns_session: bool,
