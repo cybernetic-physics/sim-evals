@@ -156,6 +156,8 @@ class FakeMCP:
         self.closed_gripper_observation = closed_gripper_observation
         self.runtime_info_source = runtime_info_source
         self.runtime_joint_source = runtime_joint_source
+        self.dynamics_configured = False
+        self.post_dynamics_steps = 0
         self.physics_dt = 1.0 / 60.0
         self.current_time = 0.0
         self.timeline_state = "stopped"
@@ -199,6 +201,13 @@ class FakeMCP:
         if name == "isaac.get_robot_info":
             if not self.robot_loaded:
                 return {"status": "error", "message": "robot missing"}
+            if arguments.get("require_runtime") and (
+                not self.dynamics_configured or self.post_dynamics_steps < 1
+            ):
+                return {
+                    "status": "error",
+                    "message": "runtime articulation initialized before final dynamics",
+                }
             if arguments.get("require_runtime") and self.runtime_info_source is None:
                 return {
                     "status": "error",
@@ -265,6 +274,8 @@ class FakeMCP:
                     "stdout": "DROID_TASK_STATE=" + json.dumps(payload) + "\n",
                     "stderr": "",
                 }
+            if "nvidia_droid_isaaclab" in str(arguments["code"]):
+                self.dynamics_configured = True
             return {"status": "success", "result": {"status": "success"}}
         if name == "isaac.step_simulation":
             if self.step_payloads:
@@ -272,6 +283,8 @@ class FakeMCP:
             else:
                 result = {"status": "success", "stepped": arguments["num_steps"]}
             advanced_steps = int(result.get("advanced_steps", result.get("stepped", 0)))
+            if self.dynamics_configured:
+                self.post_dynamics_steps += advanced_steps
             self.current_time += advanced_steps * self.physics_dt
             if arguments.get("pause_after") is True:
                 self.timeline_state = "paused"
@@ -503,7 +516,23 @@ class HostedDroidRunnerTest(unittest.TestCase):
         joint_state_calls = [
             args for name, args in mcp.calls if name == "isaac.get_joint_positions"
         ]
-        self.assertTrue(all(call["require_runtime"] for call in robot_info_calls))
+        metadata_robot_info_calls = [
+            call for call in robot_info_calls if not call.get("require_runtime")
+        ]
+        runtime_robot_info_calls = [
+            call for call in robot_info_calls if call.get("require_runtime")
+        ]
+        self.assertEqual(len(metadata_robot_info_calls), 2)
+        self.assertEqual(
+            runtime_robot_info_calls,
+            [
+                {
+                    "prim_path": "/World/robot",
+                    "require_runtime": True,
+                    "refresh_runtime": True,
+                }
+            ],
+        )
         self.assertTrue(all(call["require_runtime"] for call in joint_state_calls))
         dynamics_script = next(
             str(arguments["code"])
@@ -525,6 +554,31 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertIn("timeline.set_time_codes_per_second(120.0)", dynamics_script)
         self.assertIn("configured_gripper = True", dynamics_script)
         self.assertIn("57.29577951308232", dynamics_script)
+        dynamics_index = next(
+            index
+            for index, (name, arguments) in enumerate(mcp.calls)
+            if name == "isaac.execute_script"
+            and "nvidia_droid_isaaclab" in str(arguments["code"])
+        )
+        first_step_index = next(
+            index
+            for index, (name, _) in enumerate(mcp.calls)
+            if name == "isaac.step_simulation"
+        )
+        runtime_info_index = next(
+            index
+            for index, (name, arguments) in enumerate(mcp.calls)
+            if name == "isaac.get_robot_info"
+            and arguments.get("require_runtime")
+        )
+        initial_pose_index = next(
+            index
+            for index, (name, _) in enumerate(mcp.calls)
+            if name == "isaac.set_joint_positions"
+        )
+        self.assertLess(dynamics_index, first_step_index)
+        self.assertLess(first_step_index, runtime_info_index)
+        self.assertLess(runtime_info_index, initial_pose_index)
         self.assertEqual(simulation.launch_calls[0][1]["wait"], False)
         self.assertEqual(len(simulation.wait_calls), 1)
         self.assertAlmostEqual(result.physics_dt, 1.0 / 60.0)
