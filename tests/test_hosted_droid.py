@@ -265,6 +265,18 @@ class FakeMCP:
                 "active_camera": arguments["prim_path"],
             }
         if name == "isaac.execute_script":
+            if "DROID_ROBOT_METADATA=" in str(arguments["code"]):
+                payload = {
+                    "prim_exists": self.robot_loaded,
+                    "joint_names": list(self.joint_names) if self.robot_loaded else [],
+                    "num_dof": len(self.joint_names) if self.robot_loaded else 0,
+                    "source": "usd_metadata",
+                }
+                return {
+                    "status": "success",
+                    "stdout": "DROID_ROBOT_METADATA=" + json.dumps(payload) + "\n",
+                    "stderr": "",
+                }
             if "DROID_TASK_STATE=" in str(arguments["code"]):
                 if not self.task_state_payloads:
                     raise AssertionError("task-state script had no queued payload")
@@ -522,7 +534,23 @@ class HostedDroidRunnerTest(unittest.TestCase):
         runtime_robot_info_calls = [
             call for call in robot_info_calls if call.get("require_runtime")
         ]
-        self.assertEqual(len(metadata_robot_info_calls), 2)
+        self.assertEqual(metadata_robot_info_calls, [])
+        metadata_scripts = [
+            arguments
+            for name, arguments in mcp.calls
+            if name == "isaac.execute_script"
+            and "DROID_ROBOT_METADATA=" in str(arguments["code"])
+        ]
+        self.assertEqual(len(metadata_scripts), 2)
+        self.assertTrue(
+            all("isaacsim.core" not in str(call["code"]) for call in metadata_scripts)
+        )
+        self.assertTrue(
+            all(
+                "SingleArticulation" not in str(call["code"])
+                for call in metadata_scripts
+            )
+        )
         self.assertEqual(
             runtime_robot_info_calls,
             [
@@ -568,14 +596,20 @@ class HostedDroidRunnerTest(unittest.TestCase):
         runtime_info_index = next(
             index
             for index, (name, arguments) in enumerate(mcp.calls)
-            if name == "isaac.get_robot_info"
-            and arguments.get("require_runtime")
+            if name == "isaac.get_robot_info" and arguments.get("require_runtime")
         )
         initial_pose_index = next(
             index
             for index, (name, _) in enumerate(mcp.calls)
             if name == "isaac.set_joint_positions"
         )
+        last_metadata_index = max(
+            index
+            for index, (name, arguments) in enumerate(mcp.calls)
+            if name == "isaac.execute_script"
+            and "DROID_ROBOT_METADATA=" in str(arguments["code"])
+        )
+        self.assertLess(last_metadata_index, dynamics_index)
         self.assertLess(dynamics_index, first_step_index)
         self.assertLess(first_step_index, runtime_info_index)
         self.assertLess(runtime_info_index, initial_pose_index)
