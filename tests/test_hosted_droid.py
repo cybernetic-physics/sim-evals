@@ -24,6 +24,8 @@ from sim_evals.hosted_droid import (
     HostedDroidError,
     HostedDroidRunner,
     MCPClient,
+    finalize_hosted_video_evidence,
+    recover_hosted_video_evidence,
 )
 from sim_evals.inference.droid_observation import DroidObservation
 from run_hosted_eval import _timestamped_results_dir
@@ -764,6 +766,119 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 (results_dir / video["source_frames_manifest"]).read_text()
             )
             self.assertEqual(len(manifest["frames"]), 3)
+
+    def test_ffmpeg_fallback_finalizes_persisted_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary)
+            frames_dir = results_dir / "video-frames"
+            frames_dir.mkdir()
+            for index in range(2):
+                (frames_dir / f"action-{index:05d}.png").write_bytes(
+                    base64.b64decode(_png_base64(20 + index))
+                )
+
+            def encode(path, frame_paths, **_kwargs):
+                self.assertEqual(len(frame_paths), 2)
+                path.write_bytes(b"ffmpeg-h264")
+
+            with (
+                patch("sim_evals.hosted_droid._require_video_backend"),
+                patch("sim_evals.hosted_droid._mediapy_module", return_value=None),
+                patch(
+                    "sim_evals.hosted_droid._write_video_with_ffmpeg",
+                    side_effect=encode,
+                ) as ffmpeg,
+            ):
+                metadata = finalize_hosted_video_evidence(
+                    results_dir,
+                    fps=15,
+                    source_camera="/World/camera",
+                )
+
+            self.assertIsNotNone(metadata)
+            assert metadata is not None
+            self.assertEqual(metadata["frames"], 2)
+            self.assertEqual(metadata["codec"], "h264")
+            self.assertEqual(metadata["source_camera"], "/World/camera")
+            self.assertEqual((results_dir / "rollout.mp4").read_bytes(), b"ffmpeg-h264")
+            self.assertEqual(ffmpeg.call_count, 1)
+
+    def test_recovers_video_without_relabeling_original_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary)
+            frames_dir = results_dir / "video-frames"
+            frames_dir.mkdir()
+            frames = []
+            for index in range(2):
+                raw = base64.b64decode(_png_base64(30 + index))
+                (frames_dir / f"action-{index:05d}.png").write_bytes(raw)
+                frames.append(np.asarray(Image.open(io.BytesIO(raw)).convert("RGB")))
+            (results_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 5,
+                        "config": {
+                            "video_fps": 15,
+                            "cameras": [{"prim_path": "/World/camera"}],
+                        },
+                    }
+                )
+            )
+            (results_dir / "actions.jsonl").write_text(
+                "\n".join(
+                    json.dumps({"record_type": record_type})
+                    for record_type in ("sample", "applied_action", "applied_action")
+                )
+                + "\n"
+            )
+            original_error = {"schema_version": 5, "status": "failed"}
+            (results_dir / "error.json").write_text(json.dumps(original_error))
+
+            def write_video(path, _frames, *, fps, codec):
+                self.assertEqual(fps, 15)
+                self.assertEqual(codec, "h264")
+                Path(path).write_bytes(b"recovered-video")
+
+            with patch.dict(
+                "sys.modules",
+                {
+                    "mediapy": SimpleNamespace(
+                        write_video=write_video,
+                        read_video=lambda _path: np.stack(frames),
+                    )
+                },
+            ):
+                recovery = recover_hosted_video_evidence(results_dir)
+
+            self.assertEqual(recovery["status"], "video_recovered")
+            self.assertEqual(recovery["original_status"], "failed")
+            self.assertEqual(
+                recovery["action_records"], {"sample": 1, "applied_action": 2}
+            )
+            self.assertEqual(
+                json.loads((results_dir / "error.json").read_text()), original_error
+            )
+            self.assertTrue((results_dir / "video-recovery.json").is_file())
+
+    def test_missing_video_backend_fails_before_session_work(self) -> None:
+        mcp = FakeMCP(readiness_failures=0, warm=True)
+        runner = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                record_video=True,
+                results_dir=Path("unused-results"),
+            ),
+        )
+
+        with (
+            patch("sim_evals.hosted_droid._mediapy_module", return_value=None),
+            patch("sim_evals.hosted_droid.shutil.which", return_value=None),
+            self.assertRaisesRegex(HostedDroidError, "before launching"),
+        ):
+            runner.run()
+        self.assertEqual(mcp.calls, [])
 
     def test_video_failure_does_not_mask_original_rollout_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

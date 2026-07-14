@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import io
 import json
 import math
 import os
+import shutil
+import subprocess
 import time
 import uuid
 from contextlib import AbstractContextManager
@@ -177,6 +180,282 @@ _EVIDENCE_SCHEMA_VERSION = 5
 _EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
 
 
+def _mediapy_module() -> Any | None:
+    try:
+        return importlib.import_module("mediapy")
+    except ModuleNotFoundError as exc:
+        if exc.name != "mediapy":
+            raise
+        return None
+
+
+def _require_video_backend() -> None:
+    if _mediapy_module() is not None:
+        return
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return
+    raise HostedDroidError(
+        "video recording requires mediapy or both ffmpeg and ffprobe; "
+        "install a video backend before launching the hosted rollout"
+    )
+
+
+def _run_video_command(
+    command: list[str], operation: str
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "no diagnostic output").strip()
+        raise HostedDroidError(f"{operation} failed: {detail}") from exc
+
+
+def _write_video_with_ffmpeg(
+    temporary_path: Path,
+    frame_paths: list[Path],
+    *,
+    fps: int,
+    width: int,
+    height: int,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg is None or ffprobe is None:
+        raise HostedDroidError("ffmpeg fallback requires both ffmpeg and ffprobe")
+
+    indexes = [int(path.stem.removeprefix("action-")) for path in frame_paths]
+    expected_indexes = list(range(indexes[0], indexes[0] + len(indexes)))
+    if indexes != expected_indexes:
+        raise HostedDroidError("video source frame indexes are not contiguous")
+
+    _run_video_command(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-framerate",
+            str(fps),
+            "-start_number",
+            str(indexes[0]),
+            "-i",
+            str(frame_paths[0].parent / "action-%05d.png"),
+            "-frames:v",
+            str(len(frame_paths)),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(temporary_path),
+        ],
+        "ffmpeg encode",
+    )
+    _run_video_command(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(temporary_path),
+            "-f",
+            "null",
+            "-",
+        ],
+        "ffmpeg decode validation",
+    )
+    probe = _run_video_command(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=codec_name,width,height,nb_read_frames",
+            "-of",
+            "json",
+            str(temporary_path),
+        ],
+        "ffprobe validation",
+    )
+    try:
+        stream = json.loads(probe.stdout)["streams"][0]
+        shape = (int(stream["height"]), int(stream["width"]))
+        frame_count = int(stream["nb_read_frames"])
+        codec = stream["codec_name"]
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HostedDroidError("ffprobe returned incomplete video metadata") from exc
+    if shape != (height, width) or frame_count != len(frame_paths) or codec != "h264":
+        raise HostedDroidError(
+            "encoded rollout video failed probe validation: "
+            f"shape={shape}, frames={frame_count}, codec={codec}"
+        )
+
+
+def finalize_hosted_video_evidence(
+    results_dir: Path,
+    *,
+    fps: int,
+    source_camera: str,
+) -> dict[str, Any] | None:
+    """Encode and validate already-persisted rollout frames without rerunning Isaac."""
+
+    video_frames_dir = results_dir / "video-frames"
+    frame_paths = sorted(video_frames_dir.glob("action-*.png"))
+    if not frame_paths:
+        return None
+    _require_video_backend()
+
+    frames: list[np.ndarray] = []
+    frame_manifest: list[dict[str, Any]] = []
+    for path in frame_paths:
+        raw = path.read_bytes()
+        frame = np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"))
+        frames.append(frame)
+        frame_manifest.append(
+            {
+                "path": str(path.relative_to(results_dir)),
+                "bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+    height, width = frames[0].shape[:2]
+    if any(frame.shape != (height, width, 3) for frame in frames):
+        raise HostedDroidError("video source frames do not share one RGB shape")
+
+    manifest_path = video_frames_dir / "manifest.json"
+    _atomic_write(
+        manifest_path,
+        (
+            json.dumps(
+                {
+                    "schema_version": _EVIDENCE_SCHEMA_VERSION,
+                    "source_camera": source_camera,
+                    "frames": frame_manifest,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
+    )
+
+    video_path = results_dir / "rollout.mp4"
+    temporary_path = video_path.with_suffix(".tmp.mp4")
+    temporary_path.unlink(missing_ok=True)
+    mediapy = _mediapy_module()
+    if mediapy is not None:
+        mediapy.write_video(temporary_path, frames, fps=fps, codec="h264")
+        decoded = np.asarray(mediapy.read_video(temporary_path))
+        if decoded.shape != (len(frames), height, width, 3):
+            raise HostedDroidError(
+                "encoded rollout video failed decode validation: "
+                f"expected {[len(frames), height, width, 3]}, got {list(decoded.shape)}"
+            )
+    else:
+        _write_video_with_ffmpeg(
+            temporary_path,
+            frame_paths,
+            fps=fps,
+            width=width,
+            height=height,
+        )
+    os.replace(temporary_path, video_path)
+    video_bytes = video_path.read_bytes()
+    return {
+        "path": str(video_path.relative_to(results_dir)),
+        "bytes": len(video_bytes),
+        "sha256": hashlib.sha256(video_bytes).hexdigest(),
+        "frames": len(frames),
+        "fps": fps,
+        "duration_seconds": len(frames) / fps,
+        "width": width,
+        "height": height,
+        "codec": "h264",
+        "source_camera": source_camera,
+        "source_frames_manifest": str(manifest_path.relative_to(results_dir)),
+    }
+
+
+def recover_hosted_video_evidence(results_dir: Path) -> dict[str, Any]:
+    """Finalize video for a completed rollout whose local post-processing failed."""
+
+    config_path = results_dir / "config.json"
+    actions_path = results_dir / "actions.jsonl"
+    try:
+        config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+        config = config_payload["config"]
+        source_camera = config["cameras"][0]["prim_path"]
+        fps = int(config["video_fps"])
+    except (
+        OSError,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise HostedDroidError(
+            "hosted evidence config is incomplete or invalid"
+        ) from exc
+    if fps < 1:
+        raise HostedDroidError("hosted evidence video_fps must be positive")
+
+    counts: dict[str, int] = {}
+    try:
+        for line in actions_path.read_text(encoding="utf-8").splitlines():
+            record_type = json.loads(line).get("record_type")
+            if not isinstance(record_type, str):
+                raise HostedDroidError("action evidence record is missing record_type")
+            counts[record_type] = counts.get(record_type, 0) + 1
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HostedDroidError(
+            "hosted action evidence is incomplete or invalid"
+        ) from exc
+
+    video = finalize_hosted_video_evidence(
+        results_dir,
+        fps=fps,
+        source_camera=source_camera,
+    )
+    if video is None:
+        raise HostedDroidError("hosted evidence does not contain rollout video frames")
+
+    original_status = None
+    error_path = results_dir / "error.json"
+    if error_path.is_file():
+        try:
+            original_status = json.loads(error_path.read_text(encoding="utf-8")).get(
+                "status"
+            )
+        except (OSError, json.JSONDecodeError):
+            original_status = "unreadable"
+    recovery = {
+        "schema_version": _EVIDENCE_SCHEMA_VERSION,
+        "status": "video_recovered",
+        "recovered_at": _utc_now(),
+        "original_status": original_status,
+        "action_records": counts,
+        "video": video,
+    }
+    _atomic_write(
+        results_dir / "video-recovery.json",
+        (json.dumps(recovery, indent=2, sort_keys=True) + "\n").encode(),
+    )
+    return recovery
+
+
 class _EvidenceRecorder:
     def __init__(self, results_dir: Path, config: HostedDroidConfig) -> None:
         self.results_dir = results_dir
@@ -229,61 +508,11 @@ class _EvidenceRecorder:
         )
 
     def finalize_video(self, fps: int) -> None:
-        paths = sorted(self.video_frames_dir.glob("action-*.png"))
-        if not paths:
-            return
-        import mediapy
-
-        frames: list[np.ndarray] = []
-        frame_manifest: list[dict[str, Any]] = []
-        for path in paths:
-            raw = path.read_bytes()
-            frame = np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"))
-            frames.append(frame)
-            frame_manifest.append(
-                {
-                    "path": str(path.relative_to(self.results_dir)),
-                    "bytes": len(raw),
-                    "sha256": hashlib.sha256(raw).hexdigest(),
-                }
-            )
-        height, width = frames[0].shape[:2]
-        if any(frame.shape != (height, width, 3) for frame in frames):
-            raise HostedDroidError("video source frames do not share one RGB shape")
-        self._write_json(
-            self.video_manifest_path,
-            {
-                "schema_version": _EVIDENCE_SCHEMA_VERSION,
-                "source_camera": self.config.cameras[0].prim_path,
-                "frames": frame_manifest,
-            },
+        self._video_metadata = finalize_hosted_video_evidence(
+            self.results_dir,
+            fps=fps,
+            source_camera=self.config.cameras[0].prim_path,
         )
-        temporary_path = self.video_path.with_suffix(".tmp.mp4")
-        temporary_path.unlink(missing_ok=True)
-        mediapy.write_video(temporary_path, frames, fps=fps, codec="h264")
-        decoded = np.asarray(mediapy.read_video(temporary_path))
-        if decoded.shape != (len(frames), height, width, 3):
-            raise HostedDroidError(
-                "encoded rollout video failed decode validation: "
-                f"expected {[len(frames), height, width, 3]}, got {list(decoded.shape)}"
-            )
-        os.replace(temporary_path, self.video_path)
-        video_bytes = self.video_path.read_bytes()
-        self._video_metadata = {
-            "path": str(self.video_path.relative_to(self.results_dir)),
-            "bytes": len(video_bytes),
-            "sha256": hashlib.sha256(video_bytes).hexdigest(),
-            "frames": len(frames),
-            "fps": fps,
-            "duration_seconds": len(frames) / fps,
-            "width": width,
-            "height": height,
-            "codec": "h264",
-            "source_camera": self.config.cameras[0].prim_path,
-            "source_frames_manifest": str(
-                self.video_manifest_path.relative_to(self.results_dir)
-            ),
-        }
 
     def write_sample(
         self,
@@ -577,6 +806,8 @@ class HostedDroidRunner:
         self._sleep = sleep
 
     def run(self) -> HostedDroidRunResult:
+        if self.config.record_video and self.config.results_dir is not None:
+            _require_video_backend()
         evidence = (
             _EvidenceRecorder(self.config.results_dir, self.config)
             if self.config.results_dir is not None
@@ -1220,7 +1451,9 @@ print({{"status": "success", "prim_path": {prim_path}}})
             )
         observed_seconds = after["current_time"] - before["current_time"]
         if observed_seconds < 0:
-            raise HostedDroidError("simulation time moved backward while applying action")
+            raise HostedDroidError(
+                "simulation time moved backward while applying action"
+            )
         expected_seconds = physics_steps_per_action * before["physics_dt"]
         return (
             joint_positions,

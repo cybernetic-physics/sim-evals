@@ -300,6 +300,21 @@ OpenPI source commit, config, checkpoint URI, action space, horizon, and action
 dimension. A missing or mismatched profile fails before any action is applied.
 The MP4 manifest records H.264 codec, FPS, dimensions, duration, byte length,
 SHA-256, source camera, frame count, and the lossless source-frame manifest.
+Video support is checked before any hosted session work begins. The runner uses
+`mediapy` when installed and otherwise falls back to local `ffmpeg` plus
+`ffprobe`, including a complete decode and frame-count validation.
+
+If an older runner completed the policy/simulator loop but failed while encoding
+the MP4, recover the already durable post-action PNGs without moving the robot
+again:
+
+```bash
+python recover_hosted_video.py runs/hosted-production/<RUN_DIRECTORY>
+```
+
+Recovery writes `rollout.mp4`, `video-frames/manifest.json`, and
+`video-recovery.json`. It deliberately preserves the original `error.json`
+instead of relabeling the interrupted run as an uninterrupted evaluator success.
 
 ## Minimal Example
 
