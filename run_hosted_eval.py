@@ -7,8 +7,14 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
-from sim_evals.hosted_droid import HostedDroidConfig, HostedDroidRunner
+from sim_evals.hosted_droid import (
+    HostedDroidConfig,
+    HostedDroidRunner,
+    SimulationClientAPI,
+    scene1_cube_in_bowl_success_spec,
+)
 from sim_evals.inference.cybernetics_dreamzero import CyberneticsSDKDroidSamplingAPI
 
 
@@ -45,6 +51,14 @@ def _parser() -> argparse.ArgumentParser:
         help="override automatic 15 Hz cadence derived from the hosted physics dt",
     )
     parser.add_argument("--target-control-hz", type=float, default=15.0)
+    parser.add_argument(
+        "--task-success-predicate",
+        choices=("scene1-cube-in-bowl",),
+        help=(
+            "opt in to policy-lift, geometric placement, release, and settled-state "
+            "acceptance for the immutable DROID scene"
+        ),
+    )
     parser.add_argument("--policy-mode", choices=("native", "sde"), default="native")
     parser.add_argument(
         "--include-predicted-video",
@@ -127,6 +141,11 @@ def main() -> None:
     if open_loop_horizon is None:
         open_loop_horizon = 10 if args.base_model == "pi0-droid" else 8
     results_dir = args.results_dir or _timestamped_results_dir()
+    task_success = (
+        scene1_cube_in_bowl_success_spec()
+        if args.task_success_predicate == "scene1-cube-in-bowl"
+        else None
+    )
 
     try:
         from cybernetics.sim import SimulationClient  # pyright: ignore[reportMissingImports]
@@ -156,6 +175,7 @@ def main() -> None:
         record_video=args.record_video,
         video_fps=args.video_fps,
         results_dir=results_dir,
+        task_success=task_success,
     )
     sampler = CyberneticsSDKDroidSamplingAPI(
         base_model=args.base_model,
@@ -164,7 +184,11 @@ def main() -> None:
         include_predicted_video=args.include_predicted_video,
     )
     with SimulationClient() as simulation_client:
-        result = HostedDroidRunner(simulation_client, sampler, config).run()
+        result = HostedDroidRunner(
+            cast(SimulationClientAPI, simulation_client),
+            sampler,
+            config,
+        ).run()
     output = result.to_dict()
     output["results_dir"] = str(results_dir)
     print(json.dumps(output, indent=2, sort_keys=True))
