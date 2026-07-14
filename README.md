@@ -104,7 +104,7 @@ eight-action open-loop cadence for DreamZero and ten for the PolaRiS PI0
 joint-position policy. Each episode gets a fresh sampling session and the
 previous session is cancelled so backend policy state is released.
 
-Hosted evidence schema v6 preserves both the full normalized model output in
+Hosted evidence schema v7 preserves both the full normalized model output in
 `sampled_action_chunk` and the configured open-loop execution slice in
 `action_chunk`. `sampled_action_chunk_shape` records the normalized `[N, 8]`
 shape before horizon or maximum-step truncation.
@@ -154,9 +154,11 @@ python run_hosted_eval.py \
 PI0 does not support `--policy-mode sde` or `--include-predicted-video`.
 The task predicate is opt-in. Without it, completion continues to mean only
 that the requested policy actions were transported and applied. The predicate
-uses read-only USD bounds and Dynamic Control rigid-body velocity queries; it
-never moves the cube
-or bowl. It requires two consecutive lifted states with an observed closed
+uses read-only USD bounds and the Isaac 6 physics tensor view for rigid-body
+velocity queries, with Dynamic Control retained only as a legacy fallback. It
+records the velocity source in every task-state record and fails closed when
+neither backend can return measured velocity; it never moves the cube or bowl.
+It requires two consecutive lifted states with an observed closed
 gripper, rejects object jumps above the per-action motion bound, uses a
 conservative fraction of the bowl's world bounds, and requires observed release
 plus stable cube and bowl velocity. Missing PhysX velocity fails closed. Direct
