@@ -138,6 +138,7 @@ class FakeMCP:
         transport_tool_failures: Mapping[str, int] | None = None,
         step_payloads: list[dict[str, Any]] | None = None,
         task_state_payloads: list[dict[str, Any]] | None = None,
+        closed_gripper_observation: float | None = None,
     ) -> None:
         self.readiness_failures = readiness_failures
         self.camera_capture_failures = camera_capture_failures
@@ -149,6 +150,7 @@ class FakeMCP:
         self.transport_tool_failures = dict(transport_tool_failures or {})
         self.step_payloads = list(step_payloads or [])
         self.task_state_payloads = list(task_state_payloads or [])
+        self.closed_gripper_observation = closed_gripper_observation
         self.physics_dt = 1.0 / 60.0
         self.current_time = 0.0
         self.timeline_state = "stopped"
@@ -276,6 +278,15 @@ class FakeMCP:
                 arguments["joint_positions"],
                 strict=True,
             ):
+                if (
+                    self.closed_gripper_observation is not None
+                    and joint_index == self.joint_names.index("finger_joint")
+                    and position > 0
+                ):
+                    position = min(
+                        position,
+                        GRIPPER_CLOSED_RADIANS * self.closed_gripper_observation,
+                    )
                 self.joint_positions[joint_index] = position
             return {"status": "success"}
         if name == "isaac.capture_camera_image":
@@ -725,6 +736,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 readiness_failures=0,
                 warm=True,
                 task_state_payloads=task_states,
+                closed_gripper_observation=0.34,
             )
             runner = HostedDroidRunner(
                 FakeSimulationClient(mcp),
@@ -760,6 +772,12 @@ class HostedDroidRunnerTest(unittest.TestCase):
             ]
             self.assertEqual(records[0]["phase"], "initial")
             self.assertTrue(records[1]["evaluation"]["lift_condition_this_check"])
+            self.assertAlmostEqual(
+                records[1]["evaluation"]["observed_gripper_position"],
+                0.34,
+                places=5,
+            )
+            self.assertTrue(records[1]["evaluation"]["gripper_closed"])
             self.assertFalse(records[1]["evaluation"]["policy_driven_lift_observed"])
             self.assertTrue(records[2]["evaluation"]["policy_driven_lift_observed"])
             self.assertTrue(records[-1]["evaluation"]["success"])

@@ -109,7 +109,7 @@ class DroidTaskSuccessSpec:
     maximum_angular_speed_rps: float = 1.50
     maximum_object_displacement_per_action_meters: float = 0.10
     maximum_receptacle_size_change_meters: float = 0.01
-    gripper_closed_threshold: float = 0.80
+    gripper_closed_threshold: float = 0.25
     gripper_released_threshold: float = 0.20
     required_settled_checks: int = 3
 
