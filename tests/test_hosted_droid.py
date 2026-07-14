@@ -200,7 +200,10 @@ class FakeMCP:
             if not self.robot_loaded:
                 return {"status": "error", "message": "robot missing"}
             if arguments.get("require_runtime") and self.runtime_info_source is None:
-                return {"status": "error", "message": "runtime articulation unavailable"}
+                return {
+                    "status": "error",
+                    "message": "runtime articulation unavailable",
+                }
             return {
                 "status": "success",
                 "joint_names": list(self.joint_names),
@@ -321,7 +324,10 @@ class FakeMCP:
             }
         if name == "isaac.get_joint_positions":
             if arguments.get("require_runtime") and self.runtime_joint_source is None:
-                return {"status": "error", "message": "runtime articulation unavailable"}
+                return {
+                    "status": "error",
+                    "message": "runtime articulation unavailable",
+                }
             return {
                 "status": "success",
                 "joint_positions": list(self.joint_positions),
@@ -343,7 +349,7 @@ class FakeSimulationClient:
         self.wait_error = wait_error
         self.launch_calls: list[tuple[str, dict[str, Any]]] = []
         self.stopped: list[str] = []
-        self.mcp_session_ids: list[str] = []
+        self.mcp_session_calls: list[tuple[str, int]] = []
         self.wait_calls: list[tuple[str, dict[str, Any]]] = []
 
     def launch(self, environment_uri: str, **kwargs: Any) -> Any:
@@ -358,10 +364,16 @@ class FakeSimulationClient:
             raise error
         return {"id": session_id, "status": "running"}
 
-    def mcp_session(self, session_id: str) -> AbstractContextManager[MCPClient]:
+    def mcp_session(
+        self,
+        session_id: str,
+        *,
+        ttl_seconds: int,
+    ) -> AbstractContextManager[MCPClient]:
+        self.mcp_session_calls.append((session_id, ttl_seconds))
+
         @contextmanager
         def session() -> Iterator[MCPClient]:
-            self.mcp_session_ids.append(session_id)
             yield self.mcp
 
         return cast(AbstractContextManager[MCPClient], session())
@@ -441,7 +453,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertTrue(result.repaired_robot)
         self.assertFalse(result.session_retained)
         self.assertEqual(len(result.created_cameras), 3)
-        self.assertEqual(simulation.mcp_session_ids, ["sess_hosted_droid"])
+        self.assertEqual(
+            simulation.mcp_session_calls,
+            [("sess_hosted_droid", 86_400)],
+        )
         self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
         self.assertEqual(sampler.reset_calls, 1)
         self.assertTrue(sampler.closed)
@@ -516,6 +531,29 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertEqual(result.physics_steps_per_action, 4)
         self.assertAlmostEqual(result.control_hz, 15.0)
 
+    def test_requests_maximum_mcp_ttl_for_1000_action_run(self) -> None:
+        simulation = FakeSimulationClient(FakeMCP(readiness_failures=10))
+        times = iter([0.0, 1.0])
+        runner = HostedDroidRunner(
+            simulation,
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1000,
+                readiness_timeout_seconds=0.5,
+            ),
+            monotonic=lambda: next(times),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaisesRegex(HostedDroidError, "Isaac MCP was not ready"):
+            runner.run()
+
+        self.assertEqual(
+            simulation.mcp_session_calls,
+            [("sess_hosted_droid", 86_400)],
+        )
+
     def test_keeps_valid_robot_and_uses_fresh_cameras_by_default(self) -> None:
         mcp = FakeMCP(readiness_failures=0, warm=True)
         simulation = FakeSimulationClient(mcp)
@@ -558,7 +596,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertTrue(result.session_retained)
         self.assertEqual(simulation.launch_calls, [])
         self.assertEqual(simulation.stopped, [])
-        self.assertEqual(simulation.mcp_session_ids, ["sess_slow_cold_start"])
+        self.assertEqual(
+            simulation.mcp_session_calls,
+            [("sess_slow_cold_start", 86_400)],
+        )
         self.assertEqual(
             simulation.wait_calls,
             [
@@ -691,6 +732,41 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertTrue(sampler.closed)
             self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
             payload = json.loads((results_dir / "error.json").read_text())
+            self.assertEqual(
+                payload["evidence_errors"],
+                ["sampling API close failed: RuntimeError: close failed"],
+            )
+
+    def test_successful_run_close_failure_still_stops_and_writes_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "successful-close-failure"
+            simulation = FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True))
+            sampler = FakeSampler(close_error=RuntimeError("close failed"))
+            runner = HostedDroidRunner(
+                simulation,
+                sampler,
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=1,
+                    keep_session=False,
+                    results_dir=results_dir,
+                ),
+                sleep=lambda _: None,
+            )
+
+            with self.assertRaisesRegex(
+                HostedDroidError,
+                "hosted DROID cleanup failed: sampling API close failed",
+            ):
+                runner.run()
+
+            self.assertEqual(len(sampler.observations), 1)
+            self.assertTrue(sampler.closed)
+            self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
+            self.assertFalse((results_dir / "result.json").exists())
+            payload = json.loads((results_dir / "error.json").read_text())
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["error"]["type"], "HostedDroidError")
             self.assertEqual(
                 payload["evidence_errors"],
                 ["sampling API close failed: RuntimeError: close failed"],
