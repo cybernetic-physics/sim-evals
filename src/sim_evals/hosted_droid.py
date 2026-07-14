@@ -1260,6 +1260,7 @@ class HostedDroidRunner:
                     self._wait_for_isaac(mcp)
                     repaired_robot = self._ensure_robot(mcp)
                     self._configure_robot_dynamics(mcp)
+                    self._step_while_playing(mcp, num_steps=1)
                     self._retire_previous_cameras(mcp)
                     created_cameras = self._ensure_cameras(mcp)
                     self._set_viewer_camera(mcp, created_cameras[0])
@@ -1389,13 +1390,11 @@ class HostedDroidRunner:
             self._sleep(self.config.readiness_poll_seconds)
 
     def _ensure_robot(self, mcp: MCPClient) -> bool:
-        self._step_while_playing(mcp, num_steps=1)
         info = self._try_call(
             mcp,
             "isaac.get_robot_info",
             {
                 "prim_path": self.config.robot_prim_path,
-                "require_runtime": True,
             },
         )
         if info is not None and _has_droid_joints(info):
@@ -1422,18 +1421,11 @@ class HostedDroidRunner:
                 "prim_path": self.config.robot_prim_path,
             },
         )
-        self._step_while_playing(
-            mcp,
-            num_steps=1,
-            observe_joints=[self.config.robot_prim_path],
-            observe_cap=1,
-        )
         repaired = self._call(
             mcp,
             "isaac.get_robot_info",
             {
                 "prim_path": self.config.robot_prim_path,
-                "require_runtime": True,
             },
         )
         if not _has_droid_joints(repaired):
@@ -1764,6 +1756,7 @@ print({{"status": "success", "prim_path": {prim_path}}})
             {
                 "prim_path": self.config.robot_prim_path,
                 "require_runtime": True,
+                "refresh_runtime": True,
             },
         )
         if info.get("measurement_source") != "runtime_articulation":
