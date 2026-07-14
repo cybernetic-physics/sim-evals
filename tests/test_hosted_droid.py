@@ -480,6 +480,13 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertIn("GetSolverVelocityIterationCountAttr().Set(0)", dynamics_script)
         self.assertIn("GetMaxDepenetrationVelocityAttr().Set(5.0)", dynamics_script)
         self.assertIn("GetTimeStepsPerSecondAttr().Set(120.0)", dynamics_script)
+        self.assertIn(
+            'settings.set("/persistent/simulation/minFrameRate", int(120.0))',
+            dynamics_script,
+        )
+        self.assertIn("timeline.set_play_every_frame(True)", dynamics_script)
+        self.assertIn("timeline.set_ticks_per_frame(1)", dynamics_script)
+        self.assertIn("timeline.set_time_codes_per_second(120.0)", dynamics_script)
         self.assertIn("configured_gripper = True", dynamics_script)
         self.assertIn("57.29577951308232", dynamics_script)
         self.assertEqual(simulation.launch_calls[0][1]["wait"], False)
