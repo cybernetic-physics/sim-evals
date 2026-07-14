@@ -98,6 +98,7 @@ def _task_state_payload(
     return {
         "object_path": spec.object_prim_path,
         "receptacle_path": spec.receptacle_prim_path,
+        "velocity_source": "physics_tensor",
         "object_bounds": bounds(object_center, object_half_size),
         "receptacle_bounds": bounds(receptacle_center, receptacle_half_size),
         "object_velocity": {
@@ -637,7 +638,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             config_payload = json.loads(
                 (results_dir / "config.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(config_payload["schema_version"], 6)
+            self.assertEqual(config_payload["schema_version"], 7)
             self.assertEqual(
                 config_payload["config"]["environment_uri"],
                 config.environment_uri,
@@ -764,7 +765,43 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertTrue(records[-1]["evaluation"]["success"])
             self.assertEqual(
                 records[-1]["capture_method"],
-                "read_only_usd_bounds_and_dynamic_control_velocity",
+                "read_only_usd_bounds_and_physics_tensor_velocity",
+            )
+            self.assertEqual(
+                records[-1]["state"]["velocity_source"],
+                "physics_tensor",
+            )
+            task_state_script = next(
+                str(arguments["code"])
+                for name, arguments in mcp.calls
+                if name == "isaac.execute_script"
+                and "DROID_TASK_STATE=" in str(arguments["code"])
+            )
+            self.assertIn(
+                "SimulationManager.get_physics_simulation_view()",
+                task_state_script,
+            )
+            self.assertIn(
+                "create_rigid_body_view(path)",
+                task_state_script,
+            )
+            self.assertIn(
+                "matched_paths != [path]",
+                task_state_script,
+            )
+            self.assertGreater(
+                task_state_script.index(
+                    "from isaacsim.core.simulation_manager import SimulationManager"
+                ),
+                task_state_script.index("def read_physics_tensor_velocities"),
+            )
+            self.assertIn(
+                "read_legacy_dynamic_control_velocities",
+                task_state_script,
+            )
+            self.assertIn(
+                "rigid-body velocity unavailable",
+                task_state_script,
             )
             object_paths = {
                 scene1_cube_in_bowl_success_spec().object_prim_path,
@@ -853,6 +890,35 @@ class HostedDroidRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(
             HostedDroidError,
             "missing receptacle velocity",
+        ):
+            runner.run()
+
+        self.assertEqual(sampler.observations, [])
+
+    def test_scene1_acceptance_fails_closed_without_velocity_source(self) -> None:
+        malformed_state = _task_state_payload(object_center=(0.36, -0.08, 0.10))
+        malformed_state.pop("velocity_source")
+        sampler = FakeSampler()
+        runner = HostedDroidRunner(
+            FakeSimulationClient(
+                FakeMCP(
+                    readiness_failures=0,
+                    warm=True,
+                    task_state_payloads=[malformed_state],
+                )
+            ),
+            sampler,
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+                task_success=scene1_cube_in_bowl_success_spec(),
+            ),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaisesRegex(
+            HostedDroidError,
+            "unsupported velocity source",
         ):
             runner.run()
 

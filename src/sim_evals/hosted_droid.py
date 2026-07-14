@@ -300,6 +300,7 @@ class _AxisAlignedBounds:
 class _DroidTaskState:
     object_bounds: _AxisAlignedBounds
     receptacle_bounds: _AxisAlignedBounds
+    velocity_source: str
     object_linear_velocity: tuple[float, float, float]
     object_angular_velocity: tuple[float, float, float]
     receptacle_linear_velocity: tuple[float, float, float]
@@ -309,6 +310,7 @@ class _DroidTaskState:
         return {
             "object_bounds": self.object_bounds.to_dict(),
             "receptacle_bounds": self.receptacle_bounds.to_dict(),
+            "velocity_source": self.velocity_source,
             "object_linear_velocity": list(self.object_linear_velocity),
             "object_angular_velocity": list(self.object_angular_velocity),
             "receptacle_linear_velocity": list(self.receptacle_linear_velocity),
@@ -327,7 +329,7 @@ class _RolloutOutcome:
     task_success_reason: str | None
 
 
-_EVIDENCE_SCHEMA_VERSION = 6
+_EVIDENCE_SCHEMA_VERSION = 7
 _EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
 _TASK_STATE_STDOUT_PREFIX = "DROID_TASK_STATE="
 
@@ -862,7 +864,9 @@ class _EvidenceRecorder:
             "record_type": "task_state",
             "phase": phase,
             "action_index": action_index,
-            "capture_method": "read_only_usd_bounds_and_dynamic_control_velocity",
+            "capture_method": (
+                f"read_only_usd_bounds_and_{state.velocity_source}_velocity"
+            ),
             "state": state.to_dict(),
             "evaluation": dict(evaluation),
         }
@@ -1693,11 +1697,10 @@ print({{"status": "success", "prim_path": {prim_path}}})
         code = f"""
 import json
 import omni.usd
-from omni.isaac.dynamic_control import _dynamic_control
-from pxr import Usd, UsdGeom
+import numpy as np
+from pxr import Usd, UsdGeom, UsdPhysics
 
 stage = omni.usd.get_context().get_stage()
-dynamic_control = _dynamic_control.acquire_dynamic_control_interface()
 bbox_cache = UsdGeom.BBoxCache(
     Usd.TimeCode.Default(),
     [UsdGeom.Tokens.default_],
@@ -1716,26 +1719,81 @@ def read_bounds(path):
         "maximum": [float(maximum[i]) for i in range(3)],
     }}
 
-def read_velocity(path):
-    handle = dynamic_control.get_rigid_body(path)
-    if handle == _dynamic_control.INVALID_HANDLE:
-        raise RuntimeError(f"rigid-body handle unavailable: {{path}}")
-    linear = dynamic_control.get_rigid_body_linear_velocity(handle)
-    angular = dynamic_control.get_rigid_body_angular_velocity(handle)
-    return {{
-        "linear": [float(linear[i]) for i in range(3)],
-        "angular": [float(angular[i]) for i in range(3)],
-    }}
+def as_numpy(value):
+    if hasattr(value, "detach"):
+        return value.detach().cpu().numpy()
+    if hasattr(value, "numpy"):
+        return value.numpy()
+    return np.asarray(value)
+
+def read_physics_tensor_velocities(paths):
+    from isaacsim.core.simulation_manager import SimulationManager
+
+    simulation_view = SimulationManager.get_physics_simulation_view()
+    if simulation_view is None:
+        raise RuntimeError("physics tensor simulation view is unavailable")
+    velocities = {{}}
+    for path in paths:
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid() or not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            raise RuntimeError(f"rigid-body API unavailable: {{path}}")
+        body_view = simulation_view.create_rigid_body_view(path)
+        if body_view is None or not body_view.check():
+            raise RuntimeError(f"physics tensor rigid-body view invalid: {{path}}")
+        matched_paths = list(body_view.prim_paths)
+        if body_view.count != 1 or matched_paths != [path]:
+            raise RuntimeError(
+                "physics tensor rigid-body view did not match the exact prim; "
+                f"requested={{path}}; matched={{matched_paths}}"
+            )
+        values = as_numpy(body_view.get_velocities()).reshape(body_view.count, 6)[0]
+        velocities[path] = {{
+            "linear": [float(values[i]) for i in range(3)],
+            "angular": [float(values[i]) for i in range(3, 6)],
+        }}
+    return velocities
+
+def read_legacy_dynamic_control_velocities(paths):
+    from omni.isaac.dynamic_control import _dynamic_control
+
+    dynamic_control = _dynamic_control.acquire_dynamic_control_interface()
+    velocities = {{}}
+    for path in paths:
+        handle = dynamic_control.get_rigid_body(path)
+        if handle == _dynamic_control.INVALID_HANDLE:
+            raise RuntimeError(f"legacy rigid-body handle unavailable: {{path}}")
+        linear = dynamic_control.get_rigid_body_linear_velocity(handle)
+        angular = dynamic_control.get_rigid_body_angular_velocity(handle)
+        velocities[path] = {{
+            "linear": [float(linear[i]) for i in range(3)],
+            "angular": [float(angular[i]) for i in range(3)],
+        }}
+    return velocities
+
+def read_velocities(paths):
+    try:
+        return read_physics_tensor_velocities(paths), "physics_tensor"
+    except Exception as tensor_error:
+        try:
+            return read_legacy_dynamic_control_velocities(paths), "legacy_dynamic_control"
+        except Exception as legacy_error:
+            raise RuntimeError(
+                "rigid-body velocity unavailable; "
+                f"physics_tensor={{tensor_error}}; "
+                f"legacy_dynamic_control={{legacy_error}}"
+            ) from legacy_error
 
 object_path = {object_path}
 receptacle_path = {receptacle_path}
+velocities, velocity_source = read_velocities([object_path, receptacle_path])
 payload = {{
     "object_path": object_path,
     "receptacle_path": receptacle_path,
+    "velocity_source": velocity_source,
     "object_bounds": read_bounds(object_path),
     "receptacle_bounds": read_bounds(receptacle_path),
-    "object_velocity": read_velocity(object_path),
-    "receptacle_velocity": read_velocity(receptacle_path),
+    "object_velocity": velocities[object_path],
+    "receptacle_velocity": velocities[receptacle_path],
 }}
 print({prefix} + json.dumps(payload, sort_keys=True))
 """
@@ -2086,6 +2144,11 @@ def _parse_task_state(
     receptacle_velocity = payload.get("receptacle_velocity")
     if not isinstance(receptacle_velocity, Mapping):
         raise HostedDroidError("Isaac task state is missing receptacle velocity")
+    velocity_source = payload.get("velocity_source")
+    if velocity_source not in {"physics_tensor", "legacy_dynamic_control"}:
+        raise HostedDroidError(
+            "Isaac task state returned an unsupported velocity source"
+        )
     return _DroidTaskState(
         object_bounds=_parse_axis_aligned_bounds(
             payload.get("object_bounds"),
@@ -2095,6 +2158,7 @@ def _parse_task_state(
             payload.get("receptacle_bounds"),
             "receptacle_bounds",
         ),
+        velocity_source=velocity_source,
         object_linear_velocity=_finite_triplet(
             velocity.get("linear"),
             "object_velocity.linear",
