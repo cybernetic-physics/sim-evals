@@ -158,8 +158,11 @@ uses read-only USD bounds and the Isaac 6 physics tensor view for rigid-body
 velocity queries, with Dynamic Control retained only as a legacy fallback. It
 records the velocity source in every task-state record and fails closed when
 neither backend can return measured velocity; it never moves the cube or bowl.
-It requires two consecutive lifted states with an observed closed
-gripper, rejects object jumps above the per-action motion bound, uses a
+It requires two consecutive lifted states with measured finger closure above
+`0.25`, while release remains at or below `0.20`. The hysteresis recognizes a
+real obstructed grasp: the scene-1 cube holds the normalized finger joint near
+`0.34`, whereas an empty fully closed gripper reaches `1.0`. The predicate
+rejects object jumps above the per-action motion bound, uses a
 conservative fraction of the bowl's world bounds, and requires observed release
 plus stable cube and bowl velocity. Missing PhysX velocity fails closed. Direct
 placement, a moving receptacle, or a still-closed gripper cannot pass. The final
