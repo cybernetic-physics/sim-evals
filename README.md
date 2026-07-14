@@ -128,9 +128,11 @@ physics profile to the raw robot USD: `400/80` arm drive gains, Panda effort and
 velocity limits, a 1 rad/s gripper limit, 64/0 articulation solver iterations,
 disabled rigid-body gravity, 5 m/s maximum depenetration velocity, 120 Hz
 physics, and scene CCD. It also restores the benchmark arm pose with an open
-gripper. Policy actions use an atomic eight-substep MCP call that ends paused
-and must advance exactly one 15 Hz control interval; timeline drift fails the
-run instead of silently holding targets too long.
+gripper. Fixed, play-every-frame timeline settings and a matching 120 Hz minimum
+simulation rate make each app update one physics substep. Policy actions use an
+atomic eight-substep MCP call that ends paused and must advance exactly one 15
+Hz control interval; timeline drift fails the run instead of silently holding
+targets too long.
 
 Use a Cybernetics SDK release that provides
 `cybernetics.sim.SimulationClient.mcp_session`. Authenticate with the normal
