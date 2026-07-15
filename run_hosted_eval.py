@@ -14,11 +14,14 @@ import numpy as np
 
 from sim_evals.hosted_droid import (
     HostedDroidConfig,
+    HostedDroidError,
     HostedDroidRunner,
     SimulationClientAPI,
+    _config_dict,
     _droid_joint_positions_for_policy_action,
     _validate_policy_response,
     scene1_cube_in_bowl_success_spec,
+    verify_hosted_evidence_manifest,
 )
 from sim_evals.inference.cybernetics_dreamzero import (
     CyberneticsSDKDroidSamplingAPI,
@@ -36,11 +39,21 @@ class _RecordedPi0Replay:
         *,
         samples: tuple[dict[str, object], ...],
         source_sha256: str,
+        actions_sha256: str,
+        source_files_sha256: dict[str, str],
+        source_config: dict[str, object],
+        source_initial_arm_joint_positions: tuple[float, ...],
+        source_initial_gripper_position: float,
         open_loop_horizon: int,
         applied_action_steps: int,
     ) -> None:
         self._samples = samples
         self.source_sha256 = source_sha256
+        self.actions_sha256 = actions_sha256
+        self.source_files_sha256 = source_files_sha256
+        self.source_config = source_config
+        self.source_initial_arm_joint_positions = source_initial_arm_joint_positions
+        self.source_initial_gripper_position = source_initial_gripper_position
         self.open_loop_horizon = open_loop_horizon
         self.applied_action_steps = applied_action_steps
         self._index = 0
@@ -51,6 +64,30 @@ class _RecordedPi0Replay:
         source_dir = evidence_dir.expanduser().resolve()
         config_path = source_dir / "config.json"
         actions_path = source_dir / "actions.jsonl"
+        runtime_path = source_dir / "runtime.json"
+        result_path = source_dir / "result.json"
+        task_states_path = source_dir / "task-states.jsonl"
+        try:
+            manifest = verify_hosted_evidence_manifest(source_dir)
+        except HostedDroidError as exc:
+            raise ValueError(
+                f"recorded replay rejected its evidence manifest: {exc}"
+            ) from exc
+        source_sha256 = cast(str, manifest["aggregate_sha256"])
+        manifest_files = cast(dict[str, dict[str, object]], manifest["files"])
+        required_files = {
+            "config.json",
+            "runtime.json",
+            "actions.jsonl",
+            "task-states.jsonl",
+            "result.json",
+        }
+        if not required_files.issubset(manifest_files):
+            raise ValueError("recorded replay manifest is missing required evidence")
+        source_files_sha256 = {
+            path: cast(str, metadata["sha256"])
+            for path, metadata in manifest_files.items()
+        }
         config_payload = _json_object(config_path)
         source_config = config_payload.get("config")
         if (
@@ -61,6 +98,8 @@ class _RecordedPi0Replay:
             raise ValueError("recorded replay requires schema-v9 config evidence")
         if source_config.get("base_model") != "pi0-droid":
             raise ValueError("recorded replay requires pi0-droid evidence")
+        if source_config.get("action_source") != "worldlines_policy":
+            raise ValueError("recorded replay source must be model-driven evidence")
         open_loop_horizon = source_config.get("open_loop_horizon")
         if (
             isinstance(open_loop_horizon, bool)
@@ -69,13 +108,44 @@ class _RecordedPi0Replay:
         ):
             raise ValueError("recorded replay has an invalid open-loop horizon")
 
+        runtime_payload = _json_object(runtime_path)
+        result_payload = _json_object(result_path)
+        if runtime_payload.get("schema_version") != 9:
+            raise ValueError("recorded replay requires schema-v9 runtime evidence")
+        initial_arm = _float_array(
+            runtime_payload.get("initial_arm_joint_positions"),
+            "recorded initial arm state",
+            dtype=np.float64,
+        )
+        initial_gripper = runtime_payload.get("initial_gripper_position")
+        if (
+            initial_arm.shape != (7,)
+            or isinstance(initial_gripper, bool)
+            or not isinstance(initial_gripper, (int, float))
+            or not np.isfinite(float(initial_gripper))
+        ):
+            raise ValueError("recorded replay has invalid initial robot state")
+        if (
+            result_payload.get("schema_version") != 9
+            or result_payload.get("status") != "succeeded"
+            or not isinstance(result_payload.get("result"), dict)
+        ):
+            raise ValueError(
+                "recorded replay requires completed schema-v9 result evidence"
+            )
+
         raw = actions_path.read_bytes()
-        source_sha256 = hashlib.sha256(raw).hexdigest()
+        actions_sha256 = hashlib.sha256(raw).hexdigest()
+        if source_files_sha256["actions.jsonl"] != actions_sha256:
+            raise ValueError(
+                "recorded replay actions changed after manifest verification"
+            )
         records = _jsonl_objects(raw, actions_path)
         samples: list[dict[str, object]] = []
         sampled_chunks: list[np.ndarray] = []
         targets: list[dict[str, object]] = []
         applied: list[dict[str, object]] = []
+        previous_after_time: float | None = None
         for record in records:
             record_type = record.get("record_type")
             if record_type == "sample":
@@ -92,7 +162,11 @@ class _RecordedPi0Replay:
                     raise ValueError(
                         "recorded samples must begin at an action-chunk boundary"
                     )
-                response = _replay_sample_response(record, source_sha256)
+                response = _replay_sample_response(
+                    record,
+                    source_sha256,
+                    actions_sha256,
+                )
                 sampled_chunk = _action_chunk(response)
                 _validate_policy_response("pi0-droid", response, sampled_chunk)
                 executed_chunk = _float_array(
@@ -127,12 +201,23 @@ class _RecordedPi0Replay:
                     raise ValueError(
                         "recorded applied action must follow exactly one target"
                     )
-                _validate_replay_action_record(
+                timing = _validate_replay_action_record(
                     record,
                     expected_action_index=len(applied),
                     sampled_chunks=sampled_chunks,
                     open_loop_horizon=open_loop_horizon,
                 )
+                if timing is None:
+                    raise AssertionError("applied action timing was not validated")
+                before_time, after_time, physics_dt = timing
+                if previous_after_time is not None and not np.isclose(
+                    before_time,
+                    previous_after_time,
+                    rtol=0.0,
+                    atol=max(1e-9, physics_dt * 0.25),
+                ):
+                    raise ValueError("recorded applied-action timing is not continuous")
+                previous_after_time = after_time
                 if len(applied) >= len(targets) or not _same_replay_action(
                     record, targets[len(applied)]
                 ):
@@ -154,9 +239,33 @@ class _RecordedPi0Replay:
             raise ValueError(
                 "recorded replay samples must exactly cover its applied-action prefix"
             )
+        result = cast(dict[str, object], result_payload["result"])
+        if result.get("action_steps") != len(applied):
+            raise ValueError("recorded result action count does not match its evidence")
+        task_records = _jsonl_objects(task_states_path.read_bytes(), task_states_path)
+        task_action_indices = [
+            record.get("action_index")
+            for record in task_records
+            if record.get("record_type") == "task_state"
+        ]
+        if task_action_indices != [None, *range(len(applied))]:
+            raise ValueError("recorded task-state evidence does not cover every action")
+        source_task = source_config.get("task_success")
+        source_task_name = (
+            source_task.get("name") if isinstance(source_task, dict) else None
+        )
+        if result.get("task_success_predicate") != source_task_name:
+            raise ValueError(
+                "recorded result predicate does not match its configuration"
+            )
         return cls(
             samples=tuple(samples),
             source_sha256=source_sha256,
+            actions_sha256=actions_sha256,
+            source_files_sha256=source_files_sha256,
+            source_config=source_config,
+            source_initial_arm_joint_positions=tuple(initial_arm.tolist()),
+            source_initial_gripper_position=float(initial_gripper),
             open_loop_horizon=open_loop_horizon,
             applied_action_steps=len(applied),
         )
@@ -218,7 +327,9 @@ def _jsonl_objects(raw: bytes, path: Path) -> list[dict[str, object]]:
 
 
 def _replay_sample_response(
-    record: dict[str, object], source_sha256: str
+    record: dict[str, object],
+    source_sha256: str,
+    actions_sha256: str,
 ) -> dict[str, object]:
     metadata = record.get("policy_metadata")
     if not isinstance(metadata, dict):
@@ -229,6 +340,7 @@ def _replay_sample_response(
             **metadata,
             "evaluation_action_source": "recorded_replay",
             "replay_source_sha256": source_sha256,
+            "replay_actions_sha256": actions_sha256,
         },
     }
 
@@ -239,7 +351,7 @@ def _validate_replay_action_record(
     expected_action_index: int,
     sampled_chunks: list[np.ndarray],
     open_loop_horizon: int,
-) -> None:
+) -> tuple[float, float, float] | None:
     action_index = record.get("action_index")
     if type(action_index) is not int or action_index != expected_action_index:
         raise ValueError("recorded actions must have contiguous zero-based indices")
@@ -293,7 +405,8 @@ def _validate_replay_action_record(
     ):
         raise ValueError("recorded joint indices must be eight distinct integers")
     if record.get("record_type") == "applied_action":
-        _validate_simulation_timing(record.get("simulation_timing"))
+        return _validate_simulation_timing(record.get("simulation_timing"))
+    return None
 
 
 def _float_array(
@@ -323,7 +436,7 @@ def _finite_number(value: object, name: str, *, positive: bool = False) -> float
     return float(value)
 
 
-def _validate_simulation_timing(value: object) -> None:
+def _validate_simulation_timing(value: object) -> tuple[float, float, float]:
     if not isinstance(value, dict):
         raise ValueError("recorded applied action requires simulation timing")
     stepped = value.get("stepped")
@@ -372,6 +485,9 @@ def _validate_simulation_timing(value: object) -> None:
         raise ValueError("recorded simulation timing observed duration is inconsistent")
     if not np.isclose(drift, observed - expected, rtol=0.0, atol=tolerance):
         raise ValueError("recorded simulation timing drift is inconsistent")
+    if abs(drift) > max(1e-6, before_dt * 0.25):
+        raise ValueError("recorded simulation timing exceeds the drift bound")
+    return before_time, after_time, before_dt
 
 
 def _same_replay_action(applied: dict[str, object], target: dict[str, object]) -> bool:
@@ -386,6 +502,55 @@ def _same_replay_action(applied: dict[str, object], target: dict[str, object]) -
             "joint_indices",
         )
     )
+
+
+def _validate_replay_configuration(
+    config: HostedDroidConfig,
+    replay: _RecordedPi0Replay,
+) -> None:
+    current = _config_dict(config)
+    source = replay.source_config
+    fixed_fields = (
+        "environment_uri",
+        "base_model",
+        "instruction",
+        "robot_prim_path",
+        "robot_usd_path",
+        "image_width",
+        "image_height",
+        "open_loop_horizon",
+        "target_control_hz",
+        "policy_mode",
+        "include_predicted_video",
+        "task_success",
+    )
+    mismatched = [
+        field for field in fixed_fields if current[field] != source.get(field)
+    ]
+    source_cameras = source.get("cameras")
+    current_cameras = current["cameras"]
+    if not isinstance(source_cameras, list) or len(source_cameras) != len(
+        current_cameras
+    ):
+        mismatched.append("cameras")
+    else:
+        normalized_source = [
+            {key: value for key, value in camera.items() if key != "prim_path"}
+            if isinstance(camera, dict)
+            else camera
+            for camera in source_cameras
+        ]
+        normalized_current = [
+            {key: value for key, value in camera.items() if key != "prim_path"}
+            for camera in current_cameras
+        ]
+        if normalized_source != normalized_current:
+            mismatched.append("cameras")
+    if mismatched:
+        raise SystemExit(
+            "recorded replay configuration differs from its source: "
+            + ", ".join(sorted(set(mismatched)))
+        )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -602,6 +767,8 @@ def main() -> None:
         results_dir=results_dir,
         task_success=task_success,
     )
+    if replay_sampler is not None:
+        _validate_replay_configuration(config, replay_sampler)
     sampler = replay_sampler or CyberneticsSDKDroidSamplingAPI(
         base_model=args.base_model,
         session_timeout=args.request_timeout_seconds,

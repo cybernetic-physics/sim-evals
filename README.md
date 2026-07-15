@@ -141,6 +141,9 @@ timeline settings and a matching 240 Hz minimum simulation rate make each app
 update one physics substep. Policy actions use an atomic sixteen-substep MCP
 call that ends paused and must advance exactly one 15 Hz control interval;
 timeline drift fails the run instead of silently holding targets too long.
+The repository's local IsaacLab DROID environment remains a 120 Hz reference;
+240 Hz is the hosted contact-hardening profile, not a claim that rate alone
+causes better contact behavior.
 
 The runtime preflight fails closed unless the gripper drive remains at the
 benchmark's `100/0.0002/16.5` stiffness, damping, and angular-effort values and
@@ -236,9 +239,19 @@ python run_hosted_eval.py \
   --results-dir "$PWD/runs/hosted-production/pi0-droid-replay"
 ```
 
-Replay preflight verifies the source file digest, schema, PI0 profile, full
-sample chunks, sequential sample/chunk mapping, derived runtime joint targets,
-applied-action timing, and the exact applied prefix before launching. Replay
+Replay preflight verifies a manifest-last inventory of every source artifact,
+the schema and producer provenance, PI0 profile, environment, task and camera
+contracts, full sample chunks, sequential sample/chunk mapping, derived runtime
+joint targets, complete task-state coverage, and continuous bounded-drift action
+timing before launching. The fresh runtime must settle within `0.005 rad` per
+arm joint and `0.01` gripper units of the source initial state. Physics rate and
+solver iterations may differ deliberately for a controlled comparison.
+
+This is a manifest-bound action-prefix replay under bounded initial-state
+variation, not deterministic episode reproduction. Simulator scheduling,
+contact solver internals, and other hidden state are not captured, so a replay
+can show that one profile behaved better for the same verified action prefix;
+it cannot prove that a single changed parameter caused the difference. Replay
 never constructs a Worldlines client, cannot attach to an existing scene, and
 requires evaluator-owned session cleanup. An ambiguous
 `isaac.step_simulation` transport failure is never retried because doing so
@@ -362,8 +375,9 @@ bounded retry window, so an API container replacement does not discard a live
 episode. Other command failures are not replayed, so ambiguous or
 application-level errors still fail closed. An HTTP 502 is replayed only for
 absolute `isaac.set_joint_positions` targets, where sending the identical
-target again is idempotent; non-idempotent simulation steps still fail closed
-on transport ambiguity.
+target again is idempotent. Read-only camera capture and simulation-state calls
+also receive bounded transport retries while physics remains paused;
+non-idempotent simulation steps still fail closed on transport ambiguity.
 An action is appended to evidence only after `step_simulation` reports the full
 requested frame count without `timed_out`; partial steps remain failure evidence,
 not acknowledged actions. Before creating a fresh camera generation, the runner
@@ -403,17 +417,22 @@ blank, clipped-sliver, and render-race frames retry and then fail closed before
 the policy is called. The runner then atomically writes one terminal
 record: `result.json` after success or `error.json` after failure. Errors include
 the exception type and message, plus the hosted session ID when launch reached
-that point. The evidence layout is:
+that point. Legacy `status: "succeeded"` means the evaluator completed its
+requested action loop. `execution_status` states transport/execution completion,
+while `task_status` independently records `passed`, `failed`, or
+`not_evaluated`; a completed rollout that misses the bowl is not a task pass.
+The evidence layout is:
 
 ```text
 <results-dir>/
 |-- config.json
 |-- actions.jsonl                       # samples, accepted targets, applied actions
 |-- task-states.jsonl                   # opt-in geometry/contact acceptance verdicts
-|-- result.json                         # success only
-|-- error.json                          # failure only
+|-- result.json                         # completed execution; task status is separate
+|-- error.json                          # execution failure only
 |-- rollout.mp4                         # post-action exterior-camera rollout
 |-- runtime.json                        # measured physics dt and control cadence
+|-- evidence-manifest.json              # written last; hashes every other file
 |-- frames/
     |-- sample-00000-exterior-1.png
     |-- sample-00000-exterior-2.png
@@ -444,6 +463,19 @@ SHA-256, source camera, frame count, and the lossless source-frame manifest.
 Video support is checked before any hosted session work begins. The runner uses
 `mediapy` when installed and otherwise falls back to local `ffmpeg` plus
 `ffprobe`, including a complete decode and frame-count validation.
+
+`evidence-manifest.json` is written only after the terminal record and contains
+the byte length and SHA-256 of every other file, an aggregate inventory digest,
+and evaluator/SDK provenance. Verification rejects changed, missing, symlinked,
+or unlisted files. To assign an evidence identity to a completed directory from
+an older runner, finalize it in place after all recovery work is complete:
+
+```bash
+python finalize_hosted_evidence.py runs/hosted-production/<RUN_DIRECTORY>
+```
+
+Running the finalizer again after any mutation creates a new evidence identity;
+retain the prior manifest externally when comparing revisions.
 
 If an older runner completed the policy/simulator loop but failed while encoding
 the MP4, recover the already durable post-action PNGs without moving the robot
