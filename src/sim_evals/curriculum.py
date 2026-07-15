@@ -8,7 +8,6 @@ output version URI after every state transition.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import hmac
 import json
@@ -21,6 +20,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, Sequence, cast
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised by patching on POSIX CI
+    _fcntl = None
 
 
 CURRICULUM_SCHEMA_VERSION = "droid-scene-curriculum/v1"
@@ -1143,15 +1147,19 @@ def _safe_http_error_detail(response: Any) -> str | None:
 def _manifest_lock(manifest_path: Path) -> Iterator[None]:
     """Serialize all durable execution-state decisions across local processes."""
 
+    if _fcntl is None:
+        raise CurriculumError(
+            "curriculum manifest locking requires POSIX fcntl support"
+        )
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = manifest_path.with_name(f".{manifest_path.name}.lock")
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _fcntl.flock(descriptor, _fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            _fcntl.flock(descriptor, _fcntl.LOCK_UN)
     finally:
         os.close(descriptor)
 

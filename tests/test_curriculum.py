@@ -11,8 +11,10 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import run_curriculum
+import sim_evals.curriculum as curriculum_module
 from sim_evals.curriculum import (
     MAX_TOTAL_VARIANTS,
     CyberneticsWorkflowRunClient,
@@ -427,6 +429,18 @@ class CurriculumLaunchTests(unittest.TestCase):
         self.assertEqual(len(persisted.output_environment_uris), 2)
         with self.assertRaises(queue.Empty):
             created_variants.get(timeout=0.05)
+
+    def test_manifest_lock_fails_clearly_without_posix_fcntl(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(curriculum_module, "_fcntl", None),
+            self.assertRaisesRegex(
+                CurriculumError,
+                "requires POSIX fcntl support",
+            ),
+        ):
+            with curriculum_module._manifest_lock(Path(temporary) / "manifest.json"):
+                self.fail("unsupported manifest lock unexpectedly succeeded")
 
     def test_resumes_recorded_run_before_creating_next(self) -> None:
         running = self.manifest.with_execution(

@@ -370,8 +370,10 @@ reward is informative.
 The hosted method is intentionally named
 `dsrl_pixels_proprio_no_vlm_token_v1`: the public sampler does not expose PI0's
 final 2,048-dimensional VLM token. It also uses a bounded replay ring and omits
-the reference color jitter while retaining random edge-padded shifts. These
-deviations are persisted in controller and evidence metadata.
+the reference color jitter while retaining random edge-padded shifts. The
+bounded MPS canary defaults to batch size 16 and seed 42 rather than the
+reference real-robot launcher's batch size 256 and seed 0. These deviations are
+persisted in controller and evidence metadata.
 
 Checkpoint roles are deliberately different:
 

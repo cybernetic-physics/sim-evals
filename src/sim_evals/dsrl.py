@@ -298,6 +298,8 @@ class TorchDsrlController:
                 "final PI0 VLM token omitted because hosted sampling does not expose it",
                 "replay is a bounded hosted ring instead of the reference dynamically growing buffer",
                 "reference color jitter is omitted; random edge-padded shifts remain enabled",
+                "bounded MPS canary uses batch size 16 instead of the reference launcher batch size 256",
+                "hosted default seed is 42 instead of the reference launcher seed 0",
             ],
             "device": str(self.device),
             "trainable_parameters": trainable_parameters,
@@ -824,8 +826,10 @@ def _build_actor(torch: Any, nn: Any, config: DsrlConfig):
                 + math.log(2 * math.pi)
             )
             log_probability = normal_log_probability.sum(dim=-1, keepdim=True)
-            correction = torch.log(
-                config.action_magnitude * (1 - squashed.pow(2)) + 1e-6
+            correction = _scaled_tanh_log_abs_det_jacobian(
+                torch,
+                pre_tanh,
+                action_magnitude=config.action_magnitude,
             ).sum(dim=-1, keepdim=True)
             return action, log_probability - correction
 
@@ -892,7 +896,7 @@ def _build_encoder(torch: Any, nn: Any, config: DsrlConfig):
             self.bottleneck = nn.Sequential(
                 nn.Flatten(),
                 nn.Linear(flattened, config.encoder_latent_dim),
-                nn.LayerNorm(config.encoder_latent_dim),
+                nn.LayerNorm(config.encoder_latent_dim, eps=1e-6),
                 nn.Tanh(),
             )
 
@@ -916,13 +920,27 @@ def _mlp(
     for hidden in hidden_dims:
         layers.append(nn.Linear(previous, hidden))
         if layer_norm:
-            layers.append(nn.LayerNorm(hidden))
+            layers.append(nn.LayerNorm(hidden, eps=1e-6))
         layers.append(nn.ReLU())
         previous = hidden
     layers.append(nn.Linear(previous, output_dim))
     if activate_final:
         layers.append(nn.ReLU())
     return nn.Sequential(*layers)
+
+
+def _scaled_tanh_log_abs_det_jacobian(
+    torch: Any,
+    pre_tanh: Any,
+    *,
+    action_magnitude: float,
+):
+    """Match Distrax's stable Tanh Jacobian, including the action scale."""
+
+    log_tanh_derivative = 2 * (
+        math.log(2) - pre_tanh - torch.nn.functional.softplus(-2 * pre_tanh)
+    )
+    return math.log(action_magnitude) + log_tanh_derivative
 
 
 def _initialize_encoder(nn: Any, encoder: Any) -> None:

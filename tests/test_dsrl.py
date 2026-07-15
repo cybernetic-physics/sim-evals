@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
@@ -13,6 +14,7 @@ from sim_evals.dsrl import (
     DsrlObservation,
     DsrlReplayBuffer,
     TorchDsrlController,
+    _scaled_tanh_log_abs_det_jacobian,
 )
 from sim_evals.inference.droid_observation import DroidObservation
 
@@ -123,6 +125,50 @@ def test_config_and_replay_reject_invalid_controller_state() -> None:
             mask=1.0,
             next_observation=observation,
         )
+
+
+def test_reference_deviations_record_bounded_launcher_defaults() -> None:
+    pytest.importorskip("torch")
+    controller = TorchDsrlController(_small_config())
+
+    deviations = controller.metadata()["reference_deviations"]
+
+    assert any("batch size 16" in deviation for deviation in deviations)
+    assert any("batch size 256" in deviation for deviation in deviations)
+    assert any("seed is 42" in deviation for deviation in deviations)
+    assert any("seed 0" in deviation for deviation in deviations)
+
+
+def test_dsrl_uses_reference_layer_norm_epsilon() -> None:
+    torch = pytest.importorskip("torch")
+    controller = TorchDsrlController(_small_config())
+
+    layer_norms = [
+        module
+        for network in (controller.actor, controller.critic)
+        for module in network.modules()
+        if isinstance(module, torch.nn.LayerNorm)
+    ]
+
+    assert layer_norms
+    assert all(layer_norm.eps == 1e-6 for layer_norm in layer_norms)
+
+
+def test_scaled_tanh_jacobian_matches_stable_reference_at_saturation() -> None:
+    torch = pytest.importorskip("torch")
+    pre_tanh = torch.tensor([[-100.0, -2.0, 0.0, 2.0, 100.0]])
+
+    actual = _scaled_tanh_log_abs_det_jacobian(
+        torch,
+        pre_tanh,
+        action_magnitude=2.5,
+    )
+    expected = math.log(2.5) + 2 * (
+        math.log(2) - pre_tanh - torch.nn.functional.softplus(-2 * pre_tanh)
+    )
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_torch_controller_updates_checkpoints_and_resumes(tmp_path) -> None:
