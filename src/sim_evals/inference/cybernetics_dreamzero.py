@@ -15,7 +15,11 @@ class DroidObservationSamplingAPI(Protocol):
     """Narrow API expected from a typed/raw Cybernetics DROID sampler."""
 
     def sample_droid(
-        self, observation: DroidObservation, *, timeout: float | None = None
+        self,
+        observation: DroidObservation,
+        *,
+        dsrl_action: np.ndarray | None = None,
+        timeout: float | None = None,
     ) -> Any: ...
 
     def reset_sampling_session(self) -> None: ...
@@ -45,6 +49,7 @@ class CyberneticsSDKDroidSamplingAPI:
 
         self._service_client_type = ServiceClient
         self._sdk_observation_type = SDKDroidObservation
+        self._sdk_dsrl_action_type: Any | None = None
         self._service_client: Any | None = None
         self._base_model = base_model
         self._model_path = model_path
@@ -68,7 +73,11 @@ class CyberneticsSDKDroidSamplingAPI:
         )
 
     def sample_droid(
-        self, observation: DroidObservation, *, timeout: float | None = None
+        self,
+        observation: DroidObservation,
+        *,
+        dsrl_action: np.ndarray | None = None,
+        timeout: float | None = None,
     ) -> Any:
         if self._sampling_client is None:
             self.reset_sampling_session()
@@ -85,13 +94,38 @@ class CyberneticsSDKDroidSamplingAPI:
             gripper_position=observation.gripper_position,
             instruction=observation.instruction,
         )
-        result = sample(
-            sdk_observation,
-            policy_mode=self._policy_mode,
-            include_predicted_video=self._include_predicted_video,
-        )
+        sample_kwargs: dict[str, Any] = {
+            "policy_mode": self._policy_mode,
+            "include_predicted_video": self._include_predicted_video,
+        }
+        sdk_dsrl_action = None
+        if dsrl_action is not None:
+            if self._sdk_dsrl_action_type is None:
+                try:
+                    from cybernetics import Pi0DroidDsrlAction
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "The installed Cybernetics SDK does not support PI0 DSRL"
+                    ) from exc
+                self._sdk_dsrl_action_type = Pi0DroidDsrlAction
+            sdk_dsrl_action = self._sdk_dsrl_action_type.from_numpy(
+                np.ascontiguousarray(dsrl_action)
+            )
+            sample_kwargs["dsrl_action"] = sdk_dsrl_action
+        result = sample(sdk_observation, **sample_kwargs)
         if hasattr(result, "result"):
-            return result.result(timeout=timeout)
+            result = result.result(timeout=timeout)
+        if sdk_dsrl_action is not None:
+            policy_metadata = (
+                result.get("policy_metadata")
+                if isinstance(result, Mapping)
+                else getattr(result, "policy_metadata", None)
+            )
+            if not isinstance(policy_metadata, Mapping):
+                raise RuntimeError(
+                    "PI0 DSRL response did not include policy_metadata acknowledgement"
+                )
+            sdk_dsrl_action.require_applied_policy_metadata(policy_metadata)
         return result
 
     def _close_active_session(self) -> None:

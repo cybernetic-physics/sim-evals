@@ -38,8 +38,14 @@ class FakeSamplingAPI:
         self.closed = False
 
     def sample_droid(
-        self, observation: DroidObservation, *, timeout: float | None = None
+        self,
+        observation: DroidObservation,
+        *,
+        dsrl_action: np.ndarray | None = None,
+        timeout: float | None = None,
     ) -> Any:
+        if dsrl_action is not None:
+            raise AssertionError("non-RL client should not provide a DSRL action")
         self.requests.append(observation)
         self.timeouts.append(timeout)
         response = self.responses[len(self.requests) - 1]
@@ -117,6 +123,76 @@ class CyberneticsDreamZeroClientTest(unittest.TestCase):
         )
         self.assertEqual(cancelled, ["session-1"])
         self.assertEqual(closed, [True])
+
+    def test_pi0_dsrl_bridge_requires_matching_noise_acknowledgement(self) -> None:
+        observed_actions: list[np.ndarray] = []
+        checked_metadata: list[object] = []
+
+        class SDKObservation:
+            @classmethod
+            def from_numpy(cls, **kwargs):
+                return kwargs
+
+        class SDKDsrlAction:
+            @classmethod
+            def from_numpy(cls, values):
+                observed_actions.append(np.asarray(values).copy())
+                return cls()
+
+            def require_applied_policy_metadata(self, metadata):
+                checked_metadata.append(metadata)
+                if metadata.get("ack") != "matching":
+                    raise ValueError("noise acknowledgement mismatch")
+
+        class Future:
+            def __init__(self, value):
+                self.value = value
+
+            def result(self, timeout=None):
+                return self.value
+
+        class Sampler:
+            def sample_droid(self, _observation, **kwargs):
+                self.options = kwargs
+                return Future(
+                    {
+                        "action_chunk": np.zeros((10, 8), dtype=np.float32),
+                        "policy_metadata": {"ack": "matching"},
+                    }
+                )
+
+        sampler = Sampler()
+
+        class ServiceClient:
+            session_id = "session-1"
+            holder = SimpleNamespace(close=lambda: None)
+
+            def create_sampling_client(self, **_kwargs):
+                return sampler
+
+            def create_rest_client(self):
+                return SimpleNamespace(
+                    cancel_session=lambda _session_id: Future({"ok": True})
+                )
+
+        fake_sdk = SimpleNamespace(
+            DroidObservation=SDKObservation,
+            Pi0DroidDsrlAction=SDKDsrlAction,
+            ServiceClient=ServiceClient,
+        )
+        observation = DroidObservation.from_sim_observation(
+            _observation(), "put the cube in the bowl"
+        )
+        action = np.arange(32, dtype=np.float32)
+        with patch.dict("sys.modules", {"cybernetics": fake_sdk}):
+            api = CyberneticsSDKDroidSamplingAPI(base_model="pi0-droid")
+            response = api.sample_droid(observation, dsrl_action=action, timeout=19)
+            api.close()
+
+        np.testing.assert_array_equal(observed_actions[0], action)
+        self.assertIs(sampler.options["dsrl_action"].__class__, SDKDsrlAction)
+        self.assertEqual(checked_metadata, [{"ack": "matching"}])
+        self.assertEqual(response["action_chunk"].shape, (10, 8))
 
     def test_collects_raw_droid_observation_and_consumes_action_chunk(self) -> None:
         action_chunk = np.arange(16, dtype=np.float32).reshape(1, 2, 8)

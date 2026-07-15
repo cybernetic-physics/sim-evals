@@ -117,6 +117,39 @@ class SimulationClientAPI(Protocol):
     def stop_session(self, session_id: str) -> None: ...
 
 
+class DroidDsrlController(Protocol):
+    @property
+    def gamma(self) -> float: ...
+
+    def metadata(self) -> Mapping[str, Any]: ...
+
+    def select_action(
+        self,
+        observation: DroidObservation,
+        *,
+        deterministic: bool = False,
+    ) -> np.ndarray: ...
+
+    def record_transition(
+        self,
+        transition: "DroidDsrlChunkTransition",
+    ) -> Mapping[str, Any]: ...
+
+
+@dataclass(frozen=True)
+class DroidDsrlChunkTransition:
+    observation: DroidObservation
+    next_observation: DroidObservation
+    dsrl_action: np.ndarray
+    reward: float
+    discount: float
+    mask: float
+    terminated: bool
+    truncated: bool
+    executed_primitive_actions: int
+    policy_metadata: Mapping[str, Any]
+
+
 @dataclass(frozen=True)
 class CameraSpec:
     role: str
@@ -440,6 +473,10 @@ class HostedDroidRunResult:
     task_success_action_index: int | None = None
     task_success_checks: int = 0
     task_success_reason: str | None = None
+    dsrl_transitions: int = 0
+    dsrl_updates: int = 0
+    dsrl_updates_total: int = 0
+    dsrl_updates_delta: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -457,6 +494,10 @@ class HostedDroidRunResult:
             "task_success_action_index": self.task_success_action_index,
             "task_success_checks": self.task_success_checks,
             "task_success_reason": self.task_success_reason,
+            "dsrl_transitions": self.dsrl_transitions,
+            "dsrl_updates": self.dsrl_updates,
+            "dsrl_updates_total": self.dsrl_updates_total,
+            "dsrl_updates_delta": self.dsrl_updates_delta,
         }
 
 
@@ -525,6 +566,9 @@ class _RolloutOutcome:
     task_success_action_index: int | None
     task_success_checks: int
     task_success_reason: str | None
+    dsrl_transitions: int
+    dsrl_updates_total: int
+    dsrl_updates_delta: int
 
 
 _EVIDENCE_SCHEMA_VERSION = 9
@@ -1660,6 +1704,7 @@ class _EvidenceRecorder:
         self.samples_dir = results_dir / "samples"
         self.actions_path = results_dir / "actions.jsonl"
         self.task_states_path = results_dir / "task-states.jsonl"
+        self.dsrl_transitions_path = results_dir / "dsrl-transitions.jsonl"
         self.video_frames_dir = results_dir / "video-frames"
         self.video_path = results_dir / "rollout.mp4"
         self.video_manifest_path = self.video_frames_dir / "manifest.json"
@@ -1668,6 +1713,7 @@ class _EvidenceRecorder:
         self._video_metadata: dict[str, Any] | None = None
         self._action_record_count = 0
         self._task_state_record_count = 0
+        self._dsrl_transition_record_count = 0
         self.started_at = _utc_now()
         self._artifact_producer = _runtime_provenance()
         self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -1728,6 +1774,36 @@ class _EvidenceRecorder:
         }
         self._append_jsonl(self.task_states_path, record)
         self._task_state_record_count += 1
+
+    def write_dsrl_transition(
+        self,
+        *,
+        sample_index: int,
+        transition: DroidDsrlChunkTransition,
+        controller_metrics: Mapping[str, Any],
+    ) -> None:
+        repeated_noise = np.repeat(
+            np.asarray(transition.dsrl_action, dtype=np.float32)[np.newaxis, :],
+            repeats=10,
+            axis=0,
+        )
+        record = {
+            "schema_version": _EVIDENCE_SCHEMA_VERSION,
+            "record_type": "dsrl_transition",
+            "sample_index": sample_index,
+            "dsrl_action": transition.dsrl_action.astype(float).tolist(),
+            "pi0_initial_flow_noise": repeated_noise.astype(float).tolist(),
+            "reward": transition.reward,
+            "discount": transition.discount,
+            "mask": transition.mask,
+            "terminated": transition.terminated,
+            "truncated": transition.truncated,
+            "executed_primitive_actions": transition.executed_primitive_actions,
+            "policy_metadata": dict(transition.policy_metadata),
+            "controller_metrics": dict(controller_metrics),
+        }
+        self._append_jsonl(self.dsrl_transitions_path, record)
+        self._dsrl_transition_record_count += 1
 
     def finalize_video(self, fps: int) -> None:
         self._video_metadata = finalize_hosted_video_evidence(
@@ -1943,6 +2019,7 @@ class _EvidenceRecorder:
             self.results_dir / "error.json",
             self.actions_path,
             self.task_states_path,
+            self.dsrl_transitions_path,
             self.runtime_path,
             self.evidence_manifest_path,
         ):
@@ -1986,11 +2063,18 @@ class _EvidenceRecorder:
                 "path": str(self.task_states_path.relative_to(self.results_dir)),
                 "records": self._task_state_record_count,
             }
+        dsrl_transitions = None
+        if self.dsrl_transitions_path.is_file():
+            dsrl_transitions = {
+                "path": str(self.dsrl_transitions_path.relative_to(self.results_dir)),
+                "records": self._dsrl_transition_record_count,
+            }
         return {
             "artifact_manifest": _EVIDENCE_MANIFEST_NAME,
             "frames": frames,
             "actions": actions,
             "task_states": task_states,
+            "dsrl_transitions": dsrl_transitions,
             "sample_artifacts": sample_artifacts,
             "runtime": (
                 str(self.runtime_path.relative_to(self.results_dir))
@@ -2214,14 +2298,27 @@ class HostedDroidRunner:
         sampling_api: DroidObservationSamplingAPI,
         config: HostedDroidConfig,
         *,
+        dsrl_controller: DroidDsrlController | None = None,
+        deterministic_dsrl: bool = False,
+        train_dsrl_controller: bool = True,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.simulation_client = simulation_client
         self.sampling_api = sampling_api
         self.config = config
+        self.dsrl_controller = dsrl_controller
+        self.deterministic_dsrl = deterministic_dsrl
+        self.train_dsrl_controller = train_dsrl_controller
         self._monotonic = monotonic
         self._sleep = sleep
+        if dsrl_controller is not None:
+            if config.base_model != "pi0-droid":
+                raise ValueError("DSRL steering requires base_model='pi0-droid'")
+            if config.open_loop_horizon != 10:
+                raise ValueError("DSRL steering requires open_loop_horizon=10")
+            if config.task_success is None:
+                raise ValueError("DSRL steering requires an explicit task predicate")
 
     def run(self) -> HostedDroidRunResult:
         self._validate_action_source()
@@ -2361,6 +2458,11 @@ class HostedDroidRunner:
                                     if self.config.task_success is not None
                                     else None
                                 ),
+                                "dsrl_controller": (
+                                    dict(self.dsrl_controller.metadata())
+                                    if self.dsrl_controller is not None
+                                    else None
+                                ),
                             }
                         )
                     self.sampling_api.reset_sampling_session()
@@ -2385,6 +2487,10 @@ class HostedDroidRunner:
                     task_success_action_index=rollout.task_success_action_index,
                     task_success_checks=rollout.task_success_checks,
                     task_success_reason=rollout.task_success_reason,
+                    dsrl_transitions=rollout.dsrl_transitions,
+                    dsrl_updates=rollout.dsrl_updates_total,
+                    dsrl_updates_total=rollout.dsrl_updates_total,
+                    dsrl_updates_delta=rollout.dsrl_updates_delta,
                 )
             finally:
                 cleanup_errors.extend(self._cleanup(session_id, owns_session))
@@ -3844,6 +3950,10 @@ print({{"status": "success", "prim_path": {prim_path}}})
     ) -> _RolloutOutcome:
         samples = 0
         action_steps = 0
+        dsrl_transitions = 0
+        dsrl_updates_start = _controller_update_count(self.dsrl_controller)
+        dsrl_updates_total = dsrl_updates_start
+        pending_observation: DroidObservation | None = None
         tracker: _DroidTaskSuccessTracker | None = None
         terminal_failure_reason: str | None = None
         if self.config.task_success is not None:
@@ -3869,13 +3979,51 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 )
         should_stop = False
         while action_steps < self.config.max_action_steps:
-            observation = self._observation(mcp, joint_indices, samples, evidence)
-            response = self.sampling_api.sample_droid(
-                observation,
-                timeout=self.config.request_timeout_seconds,
-            )
+            observation = pending_observation
+            if observation is None:
+                observation = self._observation(mcp, joint_indices, samples, evidence)
+            pending_observation = None
+            dsrl_action: np.ndarray | None = None
+            sample_kwargs: dict[str, Any] = {
+                "timeout": self.config.request_timeout_seconds
+            }
+            if self.dsrl_controller is not None:
+                candidate = self.dsrl_controller.select_action(
+                    observation,
+                    deterministic=self.deterministic_dsrl,
+                )
+                dsrl_action = np.asarray(candidate)
+                if dsrl_action.dtype != np.dtype(np.float32):
+                    raise HostedDroidError("DSRL action dtype must be float32")
+                if dsrl_action.shape != (32,):
+                    raise HostedDroidError(
+                        f"DSRL action must have shape [32], got {list(dsrl_action.shape)}"
+                    )
+                if not np.isfinite(dsrl_action).all():
+                    raise HostedDroidError(
+                        "DSRL action must contain only finite values"
+                    )
+                dsrl_action = np.ascontiguousarray(dsrl_action)
+                sample_kwargs["dsrl_action"] = dsrl_action
+            response = self.sampling_api.sample_droid(observation, **sample_kwargs)
             sampled_chunk = _action_chunk(response)
-            _validate_policy_response(self.config.base_model, response, sampled_chunk)
+            expected_base_policy_metadata: Mapping[str, Any] | None = None
+            if self.dsrl_controller is not None:
+                controller_metadata = self.dsrl_controller.metadata()
+                raw_lineage = controller_metadata.get("base_policy_metadata")
+                if raw_lineage is not None:
+                    if not isinstance(raw_lineage, Mapping):
+                        raise HostedDroidError(
+                            "DSRL controller base-policy metadata must be a mapping"
+                        )
+                    expected_base_policy_metadata = raw_lineage
+            _validate_policy_response(
+                self.config.base_model,
+                response,
+                sampled_chunk,
+                dsrl_action=dsrl_action,
+                expected_base_policy_metadata=expected_base_policy_metadata,
+            )
             chunk = sampled_chunk[: self.config.open_loop_horizon]
             sample_index = samples
             if evidence is not None:
@@ -3886,6 +4034,7 @@ print({{"status": "success", "prim_path": {prim_path}}})
                     chunk,
                 )
             samples += 1
+            executed_in_chunk = 0
             for chunk_index, action in enumerate(chunk):
                 if action_steps >= self.config.max_action_steps:
                     break
@@ -3958,8 +4107,66 @@ print({{"status": "success", "prim_path": {prim_path}}})
                         terminal_failure_reason is not None
                     )
                 action_steps += 1
+                executed_in_chunk += 1
                 if should_stop:
                     break
+            truncated = not should_stop and action_steps >= self.config.max_action_steps
+            if self.dsrl_controller is not None:
+                assert dsrl_action is not None
+                if executed_in_chunk < 1:
+                    raise HostedDroidError(
+                        "DSRL transition executed no primitive robot actions"
+                    )
+                next_observation = self._observation(
+                    mcp,
+                    joint_indices,
+                    samples,
+                    evidence,
+                )
+                metadata = _response_field(response, "policy_metadata")
+                if not isinstance(metadata, Mapping):
+                    raise HostedDroidError(
+                        "DSRL PI0 response did not include policy metadata"
+                    )
+                gamma = float(self.dsrl_controller.gamma)
+                if not math.isfinite(gamma) or not 0 < gamma <= 1:
+                    raise HostedDroidError("DSRL controller gamma must be in (0, 1]")
+                transition = DroidDsrlChunkTransition(
+                    observation=observation,
+                    next_observation=next_observation,
+                    dsrl_action=dsrl_action,
+                    reward=0.0 if should_stop else -1.0,
+                    discount=gamma**executed_in_chunk,
+                    mask=0.0 if should_stop else 1.0,
+                    terminated=should_stop,
+                    truncated=truncated,
+                    executed_primitive_actions=executed_in_chunk,
+                    policy_metadata=dict(metadata),
+                )
+                if self.train_dsrl_controller:
+                    controller_metrics = dict(
+                        self.dsrl_controller.record_transition(transition)
+                    )
+                    updates = controller_metrics.get("updates", dsrl_updates_total)
+                    if not isinstance(updates, int) or updates < dsrl_updates_total:
+                        raise HostedDroidError(
+                            "DSRL controller returned an invalid update counter"
+                        )
+                    dsrl_updates_total = updates
+                else:
+                    controller_metrics = {
+                        "mode": "evaluation",
+                        "updates": dsrl_updates_total,
+                    }
+                dsrl_transitions += 1
+                if evidence is not None:
+                    evidence.write_dsrl_transition(
+                        sample_index=sample_index,
+                        transition=transition,
+                        controller_metrics=controller_metrics,
+                    )
+                if not should_stop and not truncated:
+                    pending_observation = next_observation
             if should_stop:
                 break
         if tracker is None:
@@ -3971,6 +4178,9 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 task_success_action_index=None,
                 task_success_checks=0,
                 task_success_reason=None,
+                dsrl_transitions=dsrl_transitions,
+                dsrl_updates_total=dsrl_updates_total,
+                dsrl_updates_delta=dsrl_updates_total - dsrl_updates_start,
             )
         task_success = tracker.success_action_index is not None
         return _RolloutOutcome(
@@ -3986,6 +4196,9 @@ print({{"status": "success", "prim_path": {prim_path}}})
                 else terminal_failure_reason
                 or "max_action_steps_reached_without_valid_placement"
             ),
+            dsrl_transitions=dsrl_transitions,
+            dsrl_updates_total=dsrl_updates_total,
+            dsrl_updates_delta=dsrl_updates_total - dsrl_updates_start,
         )
 
     def _capture_task_state(
@@ -4672,6 +4885,9 @@ def _validate_policy_response(
     base_model: str,
     response: Any,
     action_chunk: np.ndarray,
+    *,
+    dsrl_action: np.ndarray | None = None,
+    expected_base_policy_metadata: Mapping[str, Any] | None = None,
 ) -> None:
     if base_model != "pi0-droid":
         return
@@ -4690,10 +4906,54 @@ def _validate_policy_response(
             "pi0-droid response did not prove the pinned joint-position policy "
             f"profile; mismatched keys: {mismatched_profile_keys}"
         )
+    if expected_base_policy_metadata is not None and any(
+        metadata.get(key) != value
+        for key, value in expected_base_policy_metadata.items()
+    ):
+        raise HostedDroidError(
+            "pi0-droid response does not match the DSRL controller base-policy lineage"
+        )
     if action_chunk.shape != (10, 8):
         raise HostedDroidError(
             f"pi0-droid must return action_chunk [10,8], got {list(action_chunk.shape)}"
         )
+    if dsrl_action is None:
+        return
+    canonical_action = np.asarray(dsrl_action)
+    if canonical_action.dtype != np.dtype(np.float32) or canonical_action.shape != (
+        32,
+    ):
+        raise HostedDroidError("PI0-DROID DSRL action must be float32 [32]")
+    noise = np.repeat(canonical_action[np.newaxis, :], repeats=10, axis=0)
+    expected_acknowledgement = {
+        "contract_version": 1,
+        "applied": True,
+        "dtype": "float32",
+        "shape": [10, 32],
+        "sha256": hashlib.sha256(
+            np.ascontiguousarray(noise, dtype="<f4").tobytes(order="C")
+        ).hexdigest(),
+    }
+    acknowledgement = metadata.get("pi0_initial_flow_noise")
+    if not isinstance(acknowledgement, Mapping):
+        raise HostedDroidError(
+            "pi0-droid response did not acknowledge DSRL initial flow noise"
+        )
+    observed = {key: acknowledgement.get(key) for key in expected_acknowledgement}
+    if observed != expected_acknowledgement:
+        raise HostedDroidError(
+            "pi0-droid response acknowledged different DSRL initial flow noise"
+        )
+
+
+def _controller_update_count(controller: DroidDsrlController | None) -> int:
+    if controller is None:
+        return 0
+    metadata = controller.metadata()
+    updates = metadata.get("updates", 0)
+    if not isinstance(updates, int) or updates < 0:
+        raise HostedDroidError("DSRL controller metadata has an invalid update counter")
+    return updates
 
 
 def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:

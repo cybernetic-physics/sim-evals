@@ -110,6 +110,9 @@ Hosted evidence schema v9 preserves both the full normalized model output in
 shape before horizon or maximum-step truncation. Opt-in task acceptance also
 stores a bounded PhysX contact trace for every action update, including signed
 separation, normal and friction impulses, and contact points.
+DSRL runs additionally record
+the verified steering noise, sparse chunk transition, and controller counters
+in `dsrl-transitions.jsonl`.
 
 The `flatdict` build override in `pyproject.toml` pins its isolated build to a
 setuptools release that still provides the undeclared `pkg_resources` module
@@ -333,6 +336,93 @@ through the Cybernetics SDK after preserving the evidence. Sessions launched by
 the evaluator are also retained by default so the live scene remains available
 for inspection after the rollout. Pass `--stop-session` only when teardown is
 intentional. The older explicit `--keep-session` spelling remains accepted.
+
+### PI0-DROID DSRL training
+
+Install the optional PyTorch controller dependency, then start with one bounded
+canary against an exact immutable environment version:
+
+```bash
+uv sync --extra dsrl
+python run_hosted_dsrl.py \
+  --environment-uri "$CYBERNETICS_DROID_ENV_URI" \
+  --episodes 1 \
+  --max-action-steps 200 \
+  --results-dir "$PWD/runs/hosted-dsrl/canary"
+```
+
+This is a trajectory-wise port of the public DSRL PI0 real-robot loop. The
+hosted PI0-DROID policy stays frozen. A local pixel-SAC controller emits one
+32-dimensional initial-flow-noise action, repeated across PI0's 10-step flow
+horizon. The first complete trajectory uses Gaussian exploration. Every chunk
+transition is held until the fresh simulation and sampling session have been
+torn down, then the complete trajectory is inserted into replay before any
+optimization. Training performs 5,000 updates after the first trajectory and
+`trajectory_chunks * 30` updates thereafter by default.
+
+The sparse chunk reward is `-1` until the strict settled cube-in-bowl predicate
+passes and `0` on success. A one-episode/200-primitive-action canary and video
+recording off are the safe defaults. More than one sparse-reward training
+episode requires an explicit `--allow-zero-success-training` acknowledgement or
+an easier curriculum; do not treat that acknowledgement as evidence that the
+reward is informative.
+
+The hosted method is intentionally named
+`dsrl_pixels_proprio_no_vlm_token_v1`: the public sampler does not expose PI0's
+final 2,048-dimensional VLM token. It also uses a bounded replay ring and omits
+the reference color jitter while retaining random edge-padded shifts. These
+deviations are persisted in controller and evidence metadata.
+
+Checkpoint roles are deliberately different:
+
+- `controller/latest` is a replay-free weights/optimizer artifact for inspection
+  or evaluation. It is not an exact training-resume point, and `--resume`
+  rejects it.
+- `controller/checkpoint-NNNNNN` contains replay and is written at the configured
+  interval and at the final training episode. Resume training only from one of
+  these replay-bearing directories.
+
+Each episode creates a fresh PI0 sampling session and a fresh owned simulation
+session. The runner also verifies the pinned PI0 checkpoint lineage and the
+SHA-256 acknowledgement of the exact `[10, 32]` noise tensor before applying
+robot actions.
+
+### Deterministic scene curriculum
+
+Plan train, validation, and held-out variants without launching any workflow:
+
+```bash
+python run_curriculum.py \
+  --base-environment-uri "$CYBERNETICS_DROID_ENV_URI" \
+  --train-variants 8 \
+  --validation-variants 4 \
+  --held-out-variants 4 \
+  --manifest "$PWD/runs/droid-curriculum/manifest.json" \
+  --dry-run
+```
+
+The plan requires an exact `cybernetics://envs/env_.../versions/ver_...` source,
+uses unique deterministic seeds, and writes a SHA-256-pinned manifest. It varies
+reachable initial geometry, cameras, lighting, colors, and non-occluding
+distractors while requiring dynamics, robot state, task paths, and acceptance
+semantics to remain unchanged.
+
+Launching is an explicit side effect. Reuse the reviewed manifest and create at
+most one workflow in the invocation:
+
+```bash
+python run_curriculum.py \
+  --base-environment-uri "$CYBERNETICS_DROID_ENV_URI" \
+  --manifest "$PWD/runs/droid-curriculum/manifest.json" \
+  --launch \
+  --max-launches 1
+```
+
+Launches are sequential. The manifest records each workflow id immediately,
+resumes an existing run instead of duplicating it, verifies the immutable source
+binding before launch or resume and again on the terminal result, and stores only
+exact ready output-version URIs. No workflow is created by the default dry-run
+mode.
 
 Omit `--results-dir` to create a collision-resistant UTC directory such as
 `runs/hosted-droid/20260712T140506.123456Z`. The final console JSON reports the
