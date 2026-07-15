@@ -39,8 +39,18 @@ _TRANSIENT_MCP_FAILURE_MARKERS = (
     "Name or service not known",
     "All connection attempts failed",
 )
-_IDEMPOTENT_TRANSPORT_RETRY_TOOLS = frozenset({"isaac.set_joint_positions"})
-_TRANSIENT_TRANSPORT_FAILURE_MARKERS = ("HTTP 502",)
+_IDEMPOTENT_TRANSPORT_RETRY_TOOLS = frozenset(
+    {
+        "isaac.capture_camera_image",
+        "isaac.set_joint_positions",
+    }
+)
+_TRANSIENT_TRANSPORT_FAILURE_MARKERS = (
+    "HTTP 502",
+    "MCP_TRANSPORT_CONNECT",
+    "MCP_TRANSPORT_TIMEOUT",
+    "MCP_TRANSPORT_ERROR",
+)
 _TRANSIENT_MCP_RETRIES = 12
 _HOSTED_MCP_CREDENTIAL_TTL_SECONDS = 86_400
 _DROID_EXTERNAL_CAMERA_ROOT_PREFIX = "/World/droid_eval_"

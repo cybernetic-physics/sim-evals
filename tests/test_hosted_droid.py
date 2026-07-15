@@ -2321,6 +2321,63 @@ class HostedDroidRunnerTest(unittest.TestCase):
         ]
         self.assertEqual(retry_steps, [])
 
+    def test_camera_capture_survives_classified_client_connect_window(self) -> None:
+        restart_errors = [
+            "MCP tool 'isaac.capture_camera_image' transport request failed "
+            "[MCP_TRANSPORT_CONNECT]"
+        ] * 11
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            tool_failure_messages={"isaac.capture_camera_image": restart_errors},
+        )
+        sleeps: list[float] = []
+
+        result = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=sleeps.append,
+        ).run()
+
+        self.assertEqual(result.action_steps, 1)
+        self.assertEqual(sleeps.count(5.0), 11)
+        retry_steps = [
+            arguments
+            for name, arguments in mcp.calls
+            if name == "isaac.step_simulation" and arguments["num_steps"] == 2
+        ]
+        self.assertEqual(retry_steps, [])
+
+    def test_does_not_retry_non_idempotent_step_after_classified_transport_error(
+        self,
+    ) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            tool_failure_messages={
+                "isaac.step_simulation": [
+                    "MCP tool 'isaac.step_simulation' transport request failed "
+                    "[MCP_TRANSPORT_TIMEOUT]"
+                ]
+            },
+        )
+        runner = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(environment_uri="cybernetics://envs/env_droid"),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaisesRegex(HostedDroidError, "MCP_TRANSPORT_TIMEOUT"):
+            runner._call(mcp, "isaac.step_simulation", {"num_steps": 1})
+
+        step_calls = [name for name, _ in mcp.calls if name == "isaac.step_simulation"]
+        self.assertEqual(len(step_calls), 1)
+
     def test_retries_idempotent_joint_target_after_transport_502(self) -> None:
         mcp = FakeMCP(
             readiness_failures=0,
