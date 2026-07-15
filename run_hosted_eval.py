@@ -129,6 +129,10 @@ def _timestamped_results_dir(now: datetime | None = None) -> Path:
     return Path("runs") / "hosted-droid" / name
 
 
+def _resolve_open_loop_horizon(requested: int | None) -> int:
+    return 8 if requested is None else requested
+
+
 def main() -> None:
     args = _parser().parse_args()
     if not args.environment_uri:
@@ -137,9 +141,7 @@ def main() -> None:
         raise SystemExit("pi0-droid supports only --policy-mode native")
     if args.base_model == "pi0-droid" and args.include_predicted_video:
         raise SystemExit("pi0-droid does not produce predicted video")
-    open_loop_horizon = args.open_loop_horizon
-    if open_loop_horizon is None:
-        open_loop_horizon = 10 if args.base_model == "pi0-droid" else 8
+    open_loop_horizon = _resolve_open_loop_horizon(args.open_loop_horizon)
     results_dir = args.results_dir or _timestamped_results_dir()
     task_success = (
         scene1_cube_in_bowl_success_spec()
