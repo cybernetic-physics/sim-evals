@@ -3956,6 +3956,7 @@ print({{"status": "success", "prim_path": {prim_path}}})
         pending_observation: DroidObservation | None = None
         tracker: _DroidTaskSuccessTracker | None = None
         terminal_failure_reason: str | None = None
+        task_succeeded = False
         if self.config.task_success is not None:
             initial_state = self._capture_task_state(mcp, self.config.task_success)
             replay_task_comparison = self._validate_replay_initial_task_state(
@@ -4103,14 +4104,18 @@ print({{"status": "success", "prim_path": {prim_path}}})
                             evaluation=task_evaluation,
                         )
                     terminal_failure_reason = tracker.terminal_failure_reason()
-                    should_stop = bool(task_evaluation["success"]) or (
+                    task_succeeded = bool(task_evaluation["success"])
+                    should_stop = task_succeeded or (
                         terminal_failure_reason is not None
                     )
                 action_steps += 1
                 executed_in_chunk += 1
                 if should_stop:
                     break
-            truncated = not should_stop and action_steps >= self.config.max_action_steps
+            truncated = not task_succeeded and (
+                terminal_failure_reason is not None
+                or action_steps >= self.config.max_action_steps
+            )
             if self.dsrl_controller is not None:
                 assert dsrl_action is not None
                 if executed_in_chunk < 1:
@@ -4135,10 +4140,10 @@ print({{"status": "success", "prim_path": {prim_path}}})
                     observation=observation,
                     next_observation=next_observation,
                     dsrl_action=dsrl_action,
-                    reward=0.0 if should_stop else -1.0,
+                    reward=0.0 if task_succeeded else -1.0,
                     discount=gamma**executed_in_chunk,
-                    mask=0.0 if should_stop else 1.0,
-                    terminated=should_stop,
+                    mask=0.0 if task_succeeded else 1.0,
+                    terminated=task_succeeded,
                     truncated=truncated,
                     executed_primitive_actions=executed_in_chunk,
                     policy_metadata=dict(metadata),
