@@ -411,7 +411,13 @@ class FakeMCP:
                         "role": camera["role"],
                         "transform_space": camera["transform_space"],
                         "valid": valid,
-                        "issues": [] if valid else ["position"],
+                        "issues": [] if valid else ["optics"],
+                        "maximum_optics_error": 47.9 if not valid else 0.0,
+                        "optics_error_by_field": (
+                            {"focal_length": 47.9} if not valid else {}
+                        ),
+                        "actual_optics": ({"focal_length": 50.0} if not valid else {}),
+                        "expected_optics": ({"focal_length": 2.1} if not valid else {}),
                     }
                     for camera in expected
                 ]
@@ -3107,7 +3113,9 @@ class HostedDroidRunnerTest(unittest.TestCase):
             camera_calibration_valid=False,
         )
 
-        with self.assertRaisesRegex(HostedDroidError, "camera calibration drifted"):
+        with self.assertRaisesRegex(
+            HostedDroidError, "camera calibration drifted"
+        ) as raised:
             HostedDroidRunner(
                 FakeSimulationClient(mcp),
                 sampler,
@@ -3119,6 +3127,11 @@ class HostedDroidRunnerTest(unittest.TestCase):
             ).run()
 
         self.assertEqual(sampler.observations, [])
+        self.assertIn('"actual_optics": {"focal_length": 50.0}', str(raised.exception))
+        self.assertIn('"expected_optics": {"focal_length": 2.1}', str(raised.exception))
+        self.assertIn(
+            '"optics_error_by_field": {"focal_length": 47.9}', str(raised.exception)
+        )
         calibration_script = next(
             str(arguments["code"])
             for name, arguments in mcp.calls

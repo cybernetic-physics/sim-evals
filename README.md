@@ -370,7 +370,9 @@ gripper-local space. Projection, pose, unit scale, focal length, focus distance,
 apertures and offsets, f-stop, the canonical `(0.01, 1e6)` clipping range, and
 the absence of custom clipping planes must all match and remain finite. Missing
 or drifted calibration fails before inference rather than feeding a visually
-plausible wrong view to the policy.
+plausible wrong view to the policy. Calibration failures include expected and
+observed optics plus per-field error magnitudes in `error.json`, so a rejected
+episode identifies the exact intrinsic that changed.
 Explicit pre-dispatch `BRIDGE_OFFLINE` and `ISAAC_UNREACHABLE` responses are
 retried with the configured readiness poll interval. Control-plane DNS and
 connection failures reported before MCP bridge dispatch receive the same
