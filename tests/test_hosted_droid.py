@@ -640,6 +640,8 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertIn("DROID cube mass mismatch", dynamics_script)
         self.assertIn("finger_binding_paths", dynamics_script)
         self.assertIn("material_profile_from_binding", dynamics_script)
+        self.assertIn("UsdShade.MaterialBindingAPI", dynamics_script)
+        self.assertIn("ComputeBoundMaterial", dynamics_script)
         self.assertIn("read_offset_metadata", dynamics_script)
         self.assertIn('"schema:+inf"', dynamics_script)
         self.assertNotIn("resolved_physics_materials", dynamics_script)

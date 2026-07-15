@@ -1520,7 +1520,7 @@ import omni.kit.app
 import omni.timeline
 import omni.usd
 from isaacsim.core.simulation_manager import SimulationManager
-from pxr import PhysxSchema, Usd, UsdPhysics
+from pxr import PhysxSchema, Usd, UsdPhysics, UsdShade
 
 stage = omni.usd.get_context().get_stage()
 timeline = omni.timeline.get_timeline_interface()
@@ -1673,34 +1673,32 @@ def read_offset_metadata(prim, attribute_name):
     return value
 
 def material_profile_from_binding(binding_prim):
-    for relationship_name in ("material:binding:physics", "material:binding"):
-        relationship = binding_prim.GetRelationship(relationship_name)
-        if not relationship or not relationship.IsValid():
+    binding_api = UsdShade.MaterialBindingAPI(binding_prim)
+    for purpose in ("physics", UsdShade.Tokens.allPurpose):
+        bound_material, _ = binding_api.ComputeBoundMaterial(purpose)
+        material = bound_material.GetPrim() if bound_material else None
+        if material is None or not material.IsValid():
             continue
-        for target in relationship.GetTargets():
-            material = stage.GetPrimAtPath(target.GetPrimPath())
-            if not material.IsValid():
-                continue
-            static_friction = read_float(material, "physics:staticFriction")
-            dynamic_friction = read_float(material, "physics:dynamicFriction")
-            if static_friction is None or dynamic_friction is None:
-                continue
-            combine_attribute = material.GetAttribute(
-                "physxMaterial:frictionCombineMode"
-            )
-            combine_mode = (
-                str(combine_attribute.Get())
-                if combine_attribute
-                and combine_attribute.IsValid()
-                and combine_attribute.Get() is not None
-                else None
-            )
-            return {{
-                "path": str(material.GetPath()),
-                "static_friction": static_friction,
-                "dynamic_friction": dynamic_friction,
-                "friction_combine_mode": combine_mode,
-            }}
+        static_friction = read_float(material, "physics:staticFriction")
+        dynamic_friction = read_float(material, "physics:dynamicFriction")
+        if static_friction is None or dynamic_friction is None:
+            continue
+        combine_attribute = material.GetAttribute(
+            "physxMaterial:frictionCombineMode"
+        )
+        combine_mode = (
+            str(combine_attribute.Get())
+            if combine_attribute
+            and combine_attribute.IsValid()
+            and combine_attribute.Get() is not None
+            else None
+        )
+        return {{
+            "path": str(material.GetPath()),
+            "static_friction": static_friction,
+            "dynamic_friction": dynamic_friction,
+            "friction_combine_mode": combine_mode,
+        }}
     return None
 
 def collision_profile(profile_root):
