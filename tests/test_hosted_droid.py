@@ -636,6 +636,13 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertIn('"physics:staticFriction"', dynamics_script)
         self.assertIn('"physxMaterial:frictionCombineMode"', dynamics_script)
         self.assertIn('("physics:mass", "physics:density")', dynamics_script)
+        self.assertIn("CreateMassAttr(0.04)", dynamics_script)
+        self.assertIn("DROID cube mass mismatch", dynamics_script)
+        self.assertIn("finger_binding_paths", dynamics_script)
+        self.assertIn("material_profile_from_binding", dynamics_script)
+        self.assertIn("read_offset_metadata", dynamics_script)
+        self.assertIn('"schema:+inf"', dynamics_script)
+        self.assertNotIn("resolved_physics_materials", dynamics_script)
         self.assertIn("DROID_DYNAMICS_PROFILE=", dynamics_script)
         self.assertIn("57.29577951308232", dynamics_script)
         dynamics_index = next(

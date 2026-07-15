@@ -1155,6 +1155,7 @@ _DROID_GRIPPER_DAMPING = 0.0002
 _DROID_GRIPPER_MAX_FORCE = 16.5
 _DROID_FINGER_PAD_MIN_FRICTION = 2.0
 _DROID_CUBE_MIN_FRICTION = 10.0
+_DROID_CUBE_MASS_KG = 0.04
 _CAMERA_CAPTURE_ATTEMPTS = 10
 _CAMERA_CAPTURE_RETRY_SECONDS = 0.5
 _CAMERA_WARMUP_STEPS = 32
@@ -1601,6 +1602,12 @@ for prim in stage.Traverse():
 if physics_scenes < 1:
     raise RuntimeError("DROID dynamics profile found no physics scene")
 
+cube_root = stage.GetPrimAtPath(cube_path)
+if not cube_root.IsValid():
+    raise RuntimeError("DROID cube prim unavailable: %s" % cube_path)
+# The scene payload omits mass, so pin the benchmark value before rebuilding PhysX.
+UsdPhysics.MassAPI.Apply(cube_root).CreateMassAttr({_DROID_CUBE_MASS_KG})
+
 app = omni.kit.app.get_app()
 old_physics_view = SimulationManager.get_physics_sim_view()
 if timeline.is_stopped():
@@ -1650,75 +1657,76 @@ def read_float(prim, attribute_name, *, required=False):
         )
     return value
 
-def resolved_physics_materials(collision_prim):
-    current = collision_prim
-    while current and current.IsValid() and not current.IsPseudoRoot():
-        materials = {{}}
-        for relationship in current.GetRelationships():
-            if not str(relationship.GetName()).startswith("material:binding"):
+def read_offset_metadata(prim, attribute_name):
+    attribute = prim.GetAttribute(attribute_name)
+    value = attribute.Get() if attribute and attribute.IsValid() else None
+    if value is None:
+        return None
+    value = float(value)
+    if math.isnan(value):
+        raise RuntimeError(
+            "DROID runtime offset is NaN: %s.%s"
+            % (prim.GetPath(), attribute_name)
+        )
+    if math.isinf(value):
+        return "schema:+inf" if value > 0 else "schema:-inf"
+    return value
+
+def material_profile_from_binding(binding_prim):
+    for relationship_name in ("material:binding:physics", "material:binding"):
+        relationship = binding_prim.GetRelationship(relationship_name)
+        if not relationship or not relationship.IsValid():
+            continue
+        for target in relationship.GetTargets():
+            material = stage.GetPrimAtPath(target.GetPrimPath())
+            if not material.IsValid():
                 continue
-            for target in relationship.GetTargets():
-                material = stage.GetPrimAtPath(target.GetPrimPath())
-                if not material.IsValid():
-                    continue
-                static_friction = read_float(
-                    material,
-                    "physics:staticFriction",
-                )
-                dynamic_friction = read_float(
-                    material,
-                    "physics:dynamicFriction",
-                )
-                if static_friction is None or dynamic_friction is None:
-                    continue
-                combine_attribute = material.GetAttribute(
-                    "physxMaterial:frictionCombineMode"
-                )
-                combine_mode = (
-                    str(combine_attribute.Get())
-                    if combine_attribute
-                    and combine_attribute.IsValid()
-                    and combine_attribute.Get() is not None
-                    else None
-                )
-                materials[str(material.GetPath())] = {{
-                    "path": str(material.GetPath()),
-                    "static_friction": static_friction,
-                    "dynamic_friction": dynamic_friction,
-                    "friction_combine_mode": combine_mode,
-                }}
-        if materials:
-            return list(materials.values())
-        current = current.GetParent()
-    return []
+            static_friction = read_float(material, "physics:staticFriction")
+            dynamic_friction = read_float(material, "physics:dynamicFriction")
+            if static_friction is None or dynamic_friction is None:
+                continue
+            combine_attribute = material.GetAttribute(
+                "physxMaterial:frictionCombineMode"
+            )
+            combine_mode = (
+                str(combine_attribute.Get())
+                if combine_attribute
+                and combine_attribute.IsValid()
+                and combine_attribute.Get() is not None
+                else None
+            )
+            return {{
+                "path": str(material.GetPath()),
+                "static_friction": static_friction,
+                "dynamic_friction": dynamic_friction,
+                "friction_combine_mode": combine_mode,
+            }}
+    return None
 
 def collision_profile(profile_root):
     collision_count = 0
-    bound_collision_count = 0
     contact_offsets = set()
     rest_offsets = set()
-    materials = {{}}
     for prim in Usd.PrimRange(profile_root):
         if not prim.HasAPI(UsdPhysics.CollisionAPI):
             continue
         collision_count += 1
-        contact_offset = read_float(prim, "physxCollision:contactOffset")
-        rest_offset = read_float(prim, "physxCollision:restOffset")
+        contact_offset = read_offset_metadata(
+            prim,
+            "physxCollision:contactOffset",
+        )
+        rest_offset = read_offset_metadata(
+            prim,
+            "physxCollision:restOffset",
+        )
         if contact_offset is not None:
             contact_offsets.add(contact_offset)
         if rest_offset is not None:
             rest_offsets.add(rest_offset)
-        resolved = resolved_physics_materials(prim)
-        if resolved:
-            bound_collision_count += 1
-        for material in resolved:
-            materials[material["path"]] = material
     return {{
         "collision_count": collision_count,
-        "bound_collision_count": bound_collision_count,
-        "contact_offsets": sorted(contact_offsets),
-        "rest_offsets": sorted(rest_offsets),
-        "materials": [materials[path] for path in sorted(materials)],
+        "contact_offsets": sorted(contact_offsets, key=str),
+        "rest_offsets": sorted(rest_offsets, key=str),
     }}
 
 def mass_profile(profile_root):
@@ -1767,9 +1775,6 @@ for name, expected in expected_gripper.items():
             % (name, expected, actual)
         )
 
-cube_root = stage.GetPrimAtPath(cube_path)
-if not cube_root.IsValid():
-    raise RuntimeError("DROID cube prim unavailable: %s" % cube_path)
 robot_collisions = collision_profile(root)
 cube_collisions = collision_profile(cube_root)
 cube_mass = mass_profile(cube_root)
@@ -1779,6 +1784,69 @@ if cube_collisions["collision_count"] < 1:
     raise RuntimeError("DROID cube collision profile is empty")
 if not cube_mass:
     raise RuntimeError("DROID cube has no positive authored mass or density")
+authored_cube_mass = read_float(cube_root, "physics:mass", required=True)
+if not math.isclose(
+    authored_cube_mass,
+    {_DROID_CUBE_MASS_KG},
+    rel_tol=1e-6,
+    abs_tol=1e-6,
+):
+    raise RuntimeError(
+        "DROID cube mass mismatch: expected=%s actual=%s"
+        % ({_DROID_CUBE_MASS_KG}, authored_cube_mass)
+    )
+
+finger_binding_paths = [
+    robot_path + "/Gripper/Robotiq_2F_85/left_inner_finger",
+    robot_path + "/Gripper/Robotiq_2F_85/right_inner_finger",
+]
+finger_bindings = []
+robot_materials = {{}}
+bound_robot_collisions = 0
+for binding_path in finger_binding_paths:
+    binding_prim = stage.GetPrimAtPath(binding_path)
+    if not binding_prim.IsValid():
+        raise RuntimeError(
+            "DROID finger physics binding prim unavailable: %s" % binding_path
+        )
+    material = material_profile_from_binding(binding_prim)
+    if material is None:
+        raise RuntimeError(
+            "DROID finger physics material unavailable: %s" % binding_path
+        )
+    binding_collision_count = sum(
+        1
+        for prim in Usd.PrimRange(binding_prim)
+        if prim.HasAPI(UsdPhysics.CollisionAPI)
+    )
+    if binding_collision_count < 1:
+        raise RuntimeError(
+            "DROID finger physics binding has no collision geometry: %s"
+            % binding_path
+        )
+    bound_robot_collisions += binding_collision_count
+    robot_materials[material["path"]] = material
+    finger_bindings.append({{
+        "binding_path": binding_path,
+        "collision_count": binding_collision_count,
+        "material_path": material["path"],
+    }})
+robot_collisions["bound_collision_count"] = bound_robot_collisions
+robot_collisions["material_bindings"] = finger_bindings
+robot_collisions["materials"] = [
+    robot_materials[path] for path in sorted(robot_materials)
+]
+
+cube_material = material_profile_from_binding(cube_root)
+if cube_material is None:
+    raise RuntimeError("DROID cube physics material unavailable")
+cube_collisions["bound_collision_count"] = cube_collisions["collision_count"]
+cube_collisions["material_bindings"] = [{{
+    "binding_path": cube_path,
+    "collision_count": cube_collisions["collision_count"],
+    "material_path": cube_material["path"],
+}}]
+cube_collisions["materials"] = [cube_material]
 
 robot_materials = robot_collisions["materials"]
 if not any(
