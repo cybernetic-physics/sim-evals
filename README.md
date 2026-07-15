@@ -104,10 +104,12 @@ eight-action open-loop cadence for both DreamZero and the PolaRiS PI0
 joint-position policy. Each episode gets a fresh sampling session and the
 previous session is cancelled so backend policy state is released.
 
-Hosted evidence schema v8 preserves both the full normalized model output in
+Hosted evidence schema v9 preserves both the full normalized model output in
 `sampled_action_chunk` and the configured open-loop execution slice in
 `action_chunk`. `sampled_action_chunk_shape` records the normalized `[N, 8]`
-shape before horizon or maximum-step truncation.
+shape before horizon or maximum-step truncation. Opt-in task acceptance also
+stores a bounded PhysX contact trace for every action update, including signed
+separation, normal and friction impulses, and contact points.
 
 The `flatdict` build override in `pyproject.toml` pins its isolated build to a
 setuptools release that still provides the undeclared `pkg_resources` module
@@ -125,10 +127,12 @@ planes:
 
 Before sampling, the hosted runner inventories the robot's joints through a
 USD-only script that cannot initialize an articulation or physics world. It then
-stops the timeline, applies the benchmark's `NVIDIA_DROID` physics profile:
+stops the timeline, applies the `cybernetics_droid_contact_v1` physics profile:
 `400/80` arm drive gains, Panda effort and velocity limits, a 1 rad/s gripper
-limit, 64/0 articulation solver iterations, disabled rigid-body gravity, 5 m/s
-maximum depenetration velocity, 120 Hz physics, and scene CCD. The physics
+limit, 64/1 articulation solver iterations, disabled articulation-link gravity,
+3 m/s maximum depenetration velocity, 120 Hz physics, TGS, scene and cube CCD,
+late articulation-contact solving, and explicit `2 mm/0 mm` contact/rest
+offsets on task colliders. The physics
 context is explicitly reinitialized after that profile is complete, so later
 tensor views cannot retain stale link metadata. The first exact frame then
 commits the new context before the runtime-only joint read. The runner also
@@ -138,13 +142,15 @@ update one physics substep. Policy actions use an atomic eight-substep MCP call
 that ends paused and must advance exactly one 15 Hz control interval; timeline
 drift fails the run instead of silently holding targets too long.
 
-The runtime preflight fails closed unless the effective gripper drive remains
-at the benchmark's `100/0.0002/16.5` stiffness, damping, and maximum-force
-values, the resolved finger-pad and cube physics materials retain their
-benchmark friction, and the cube has the benchmark's pinned `0.04 kg` mass. The
-source cube payload does not author a positive mass, so the runner authors this
-value before the single physics rebuild and then verifies the composed runtime
-value. It archives those values plus collision/contact metadata in
+The runtime preflight fails closed unless the gripper drive remains at the
+benchmark's `100/0.0002/16.5` stiffness, damping, and angular-effort values and
+the cube has the pinned `0.04 kg` mass. It replaces the historical effective
+friction coefficient of `10` with dedicated finger (`1.5/1.2`), cube
+(`0.8/0.6`), bowl (`0.6/0.5`), and table (`0.5/0.4`) static/dynamic materials,
+all using `average` combination. The source cube payload does not author a
+positive mass, so the runner authors the value before the single physics
+rebuild and verifies the composed runtime. It archives exact collider paths,
+approximation tokens, offsets, material bindings, and drive values in
 `runtime.json`.
 
 Task-acceptance runs require runtime articulation provenance for both DOF order
@@ -154,6 +160,12 @@ policy observation, the commanded
 benchmark pose must remain within the configured arm/gripper tolerances for two
 consecutive control intervals. Camera retries occur while paused and never add
 unrecorded physics steps between an applied action and its task-state evidence.
+Task acceptance requires complete per-substep contact manifolds for both
+finger/cube pairs and the cube/receptacle pair. It rejects penetration above
+`1 mm`, a per-contact normal impulse above `0.5 N*s`, non-opposing bilateral
+finger normals, sparse contact during a claimed lift, and more than `1 cm` of
+gripper-relative object slip while the close command remains active. Placement
+is causal only after a post-lift open command and measured bowl contact.
 
 Use a Cybernetics SDK release that provides
 `cybernetics.sim.SimulationClient.mcp_session`. Authenticate with the normal
@@ -198,8 +210,20 @@ real obstructed grasp: the scene-1 cube holds the normalized finger joint near
 `0.34`, whereas an empty fully closed gripper reaches `1.0`. The predicate
 rejects object jumps above the per-action motion bound, uses a
 conservative fraction of the bowl's world bounds, and requires observed release
-plus stable cube and bowl velocity. Missing PhysX velocity fails closed. Direct
-placement, a moving receptacle, or a still-closed gripper cannot pass. The final
+after a post-lift open command.
+
+Task acceptance additionally requests three exact contact pairs in the same
+atomic step as each policy action: left finger/cube, right finger/cube, and
+cube/receptacle. A lift requires bilateral finger support at the end of the
+action. Placement requires receptacle support, and a support loss greater than
+1 cm while the close command remains active permanently invalidates the run.
+The provisional scene-1 penetration ceiling is 2 mm; exceeding it, filling a
+contact buffer, dropping a pair, emitting non-finite data, or omitting any
+update fails closed. This is an evaluator guardrail, not a calibrated
+real-hardware tolerance. Replace it only after paired collision-geometry and
+system-identification measurements. Placement also requires stable cube and
+bowl velocity. Missing PhysX velocity fails closed. Direct placement, a moving
+receptacle, or a still-closed gripper cannot pass. The final
 predicate read occurs after video capture so camera-recovery physics steps
 cannot invalidate an already-recorded verdict.
 
@@ -323,7 +347,7 @@ that point. The evidence layout is:
 <results-dir>/
 |-- config.json
 |-- actions.jsonl                       # samples, accepted targets, applied actions
-|-- task-states.jsonl                   # opt-in geometry and temporal acceptance proof
+|-- task-states.jsonl                   # opt-in geometry/contact acceptance verdicts
 |-- result.json                         # success only
 |-- error.json                          # failure only
 |-- rollout.mp4                         # post-action exterior-camera rollout

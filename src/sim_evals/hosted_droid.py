@@ -101,11 +101,16 @@ class CameraSpec:
 
 @dataclass(frozen=True)
 class DroidTaskSuccessSpec:
-    """Geometric acceptance contract for a hosted DROID task."""
+    """Causal geometry and hard-body acceptance contract for a DROID task."""
 
     name: str
     object_prim_path: str
     receptacle_prim_path: str
+    left_finger_prim_path: str = "/World/robot/Gripper/Robotiq_2F_85/left_inner_finger"
+    right_finger_prim_path: str = (
+        "/World/robot/Gripper/Robotiq_2F_85/right_inner_finger"
+    )
+    gripper_reference_prim_path: str = "/World/robot/Gripper/Robotiq_2F_85/base_link"
     minimum_lift_meters: float = 0.03
     minimum_lift_checks: int = 2
     horizontal_containment_margin_meters: float = 0.002
@@ -118,6 +123,12 @@ class DroidTaskSuccessSpec:
     maximum_receptacle_size_change_meters: float = 0.01
     gripper_closed_threshold: float = 0.25
     gripper_released_threshold: float = 0.20
+    maximum_contact_penetration_meters: float = 0.001
+    maximum_contact_normal_impulse_ns: float = 0.5
+    maximum_closed_support_loss_meters: float = 0.010
+    minimum_bilateral_contact_fraction: float = 0.875
+    maximum_bilateral_contact_gap_updates: int = 1
+    maximum_bilateral_normal_dot: float = -0.8
     required_settled_checks: int = 3
 
     def __post_init__(self) -> None:
@@ -125,6 +136,9 @@ class DroidTaskSuccessSpec:
             ("name", self.name),
             ("object_prim_path", self.object_prim_path),
             ("receptacle_prim_path", self.receptacle_prim_path),
+            ("left_finger_prim_path", self.left_finger_prim_path),
+            ("right_finger_prim_path", self.right_finger_prim_path),
+            ("gripper_reference_prim_path", self.gripper_reference_prim_path),
         ):
             if not value.strip():
                 raise ValueError(f"{name} must not be empty")
@@ -146,11 +160,27 @@ class DroidTaskSuccessSpec:
                 "maximum_receptacle_size_change_meters",
                 self.maximum_receptacle_size_change_meters,
             ),
+            (
+                "maximum_contact_penetration_meters",
+                self.maximum_contact_penetration_meters,
+            ),
+            (
+                "maximum_contact_normal_impulse_ns",
+                self.maximum_contact_normal_impulse_ns,
+            ),
+            (
+                "maximum_closed_support_loss_meters",
+                self.maximum_closed_support_loss_meters,
+            ),
         ):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
         if not 0 < self.horizontal_containment_fraction <= 1:
             raise ValueError("horizontal_containment_fraction must be in (0, 1]")
+        if not 0 < self.minimum_bilateral_contact_fraction <= 1:
+            raise ValueError("minimum_bilateral_contact_fraction must be in (0, 1]")
+        if not -1 <= self.maximum_bilateral_normal_dot <= 1:
+            raise ValueError("maximum_bilateral_normal_dot must be in [-1, 1]")
         if (
             not 0
             <= self.gripper_released_threshold
@@ -162,10 +192,15 @@ class DroidTaskSuccessSpec:
             )
         for name, value in (
             ("minimum_lift_checks", self.minimum_lift_checks),
+            (
+                "maximum_bilateral_contact_gap_updates",
+                self.maximum_bilateral_contact_gap_updates,
+            ),
             ("required_settled_checks", self.required_settled_checks),
         ):
-            if value < 1:
-                raise ValueError(f"{name} must be at least 1")
+            minimum = 0 if name == "maximum_bilateral_contact_gap_updates" else 1
+            if value < minimum:
+                raise ValueError(f"{name} must be at least {minimum}")
 
 
 def scene1_cube_in_bowl_success_spec() -> DroidTaskSuccessSpec:
@@ -176,6 +211,35 @@ def scene1_cube_in_bowl_success_spec() -> DroidTaskSuccessSpec:
         object_prim_path="/World/rubiks_cube",
         receptacle_prim_path="/World/_24_bowl",
     )
+
+
+def _contact_integrity_request(spec: DroidTaskSuccessSpec) -> dict[str, Any]:
+    """Return the exact rigid-body pairs needed to prove task integrity."""
+
+    return {
+        "max_contacts_per_pair": 64,
+        "limits": {
+            "maximum_penetration_m": spec.maximum_contact_penetration_meters,
+            "maximum_normal_impulse_ns": (spec.maximum_contact_normal_impulse_ns),
+        },
+        "pairs": [
+            {
+                "label": _LEFT_FINGER_CONTACT,
+                "sensor_path": spec.left_finger_prim_path,
+                "filter_path": spec.object_prim_path,
+            },
+            {
+                "label": _RIGHT_FINGER_CONTACT,
+                "sensor_path": spec.right_finger_prim_path,
+                "filter_path": spec.object_prim_path,
+            },
+            {
+                "label": _RECEPTACLE_CONTACT,
+                "sensor_path": spec.object_prim_path,
+                "filter_path": spec.receptacle_prim_path,
+            },
+        ],
+    }
 
 
 @dataclass(frozen=True)
@@ -312,6 +376,8 @@ class _DroidTaskState:
     object_angular_velocity: tuple[float, float, float]
     receptacle_linear_velocity: tuple[float, float, float]
     receptacle_angular_velocity: tuple[float, float, float]
+    object_runtime_position: tuple[float, float, float]
+    gripper_reference_position: tuple[float, float, float]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -322,6 +388,8 @@ class _DroidTaskState:
             "object_angular_velocity": list(self.object_angular_velocity),
             "receptacle_linear_velocity": list(self.receptacle_linear_velocity),
             "receptacle_angular_velocity": list(self.receptacle_angular_velocity),
+            "object_runtime_position": list(self.object_runtime_position),
+            "gripper_reference_position": list(self.gripper_reference_position),
         }
 
 
@@ -336,9 +404,12 @@ class _RolloutOutcome:
     task_success_reason: str | None
 
 
-_EVIDENCE_SCHEMA_VERSION = 8
+_EVIDENCE_SCHEMA_VERSION = 9
 _EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
 _TASK_STATE_STDOUT_PREFIX = "DROID_TASK_STATE="
+_LEFT_FINGER_CONTACT = "left-finger-cube"
+_RIGHT_FINGER_CONTACT = "right-finger-cube"
+_RECEPTACLE_CONTACT = "cube-receptacle"
 
 
 class _DroidTaskSuccessTracker:
@@ -358,6 +429,11 @@ class _DroidTaskSuccessTracker:
         self.success_action_index: int | None = None
         self.previous_object_center = initial_state.object_bounds.center
         self.trajectory_valid = True
+        self.hard_body_integrity_valid = True
+        self.hard_body_integrity_reason: str | None = None
+        self.release_command_after_lift_seen = False
+        self.closed_support_observed = False
+        self.minimum_closed_gripper_object_distance: float | None = None
 
     def initial_evaluation(self) -> dict[str, Any]:
         return {
@@ -365,6 +441,10 @@ class _DroidTaskSuccessTracker:
             "phase": "initial",
             "policy_driven_lift_observed": False,
             "trajectory_valid": True,
+            "hard_body_integrity": "pending",
+            "hard_body_integrity_reason": None,
+            "release_command_after_lift_seen": False,
+            "closed_support_observed": False,
             "consecutive_lift_checks": 0,
             "required_lift_checks": self.spec.minimum_lift_checks,
             "consecutive_settled_checks": 0,
@@ -378,14 +458,22 @@ class _DroidTaskSuccessTracker:
         *,
         action_index: int,
         observed_gripper_position: float,
+        commanded_gripper_closed: bool,
+        contact_integrity: Mapping[str, Any],
     ) -> dict[str, Any]:
         self.checks += 1
+        contacts = self._contact_evidence(contact_integrity)
         geometry = self._geometry(state)
+        previous_object_center = self.previous_object_center
         object_displacement = math.dist(
             state.object_bounds.center,
-            self.previous_object_center,
+            previous_object_center,
         )
         self.previous_object_center = state.object_bounds.center
+        gripper_object_distance = math.dist(
+            state.object_runtime_position,
+            state.gripper_reference_position,
+        )
         displacement_valid = (
             object_displacement
             <= self.spec.maximum_object_displacement_per_action_meters
@@ -395,10 +483,39 @@ class _DroidTaskSuccessTracker:
             state.object_bounds.center[2] - self.initial_state.object_bounds.center[2]
         )
         gripper_closed = observed_gripper_position >= self.spec.gripper_closed_threshold
+        if (
+            commanded_gripper_closed
+            and gripper_closed
+            and contacts["bilateral_finger_contact_at_end"]
+        ):
+            self.closed_support_observed = True
+            if self.minimum_closed_gripper_object_distance is None:
+                self.minimum_closed_gripper_object_distance = gripper_object_distance
+            else:
+                self.minimum_closed_gripper_object_distance = min(
+                    self.minimum_closed_gripper_object_distance,
+                    gripper_object_distance,
+                )
+        closed_support_loss = (
+            max(
+                0.0,
+                gripper_object_distance - self.minimum_closed_gripper_object_distance,
+            )
+            if self.minimum_closed_gripper_object_distance is not None
+            else 0.0
+        )
         lift_condition = (
-            gripper_closed
+            commanded_gripper_closed
+            and gripper_closed
             and lifted_meters >= self.spec.minimum_lift_meters
             and not geometry["geometrically_in_receptacle"]
+            and contacts["bilateral_finger_contact_at_end"]
+            and contacts["bilateral_finger_contact_fraction"]
+            >= self.spec.minimum_bilateral_contact_fraction
+            and contacts["maximum_bilateral_contact_gap_updates"]
+            <= self.spec.maximum_bilateral_contact_gap_updates
+            and contacts["bilateral_normal_dot_at_end"]
+            <= self.spec.maximum_bilateral_normal_dot
             and self.trajectory_valid
         )
         if lift_condition:
@@ -409,6 +526,34 @@ class _DroidTaskSuccessTracker:
             self.lift_observed
             or self.consecutive_lift_checks >= self.spec.minimum_lift_checks
         )
+        if self.lift_observed and not commanded_gripper_closed:
+            self.release_command_after_lift_seen = True
+
+        if contacts["maximum_penetration_meters"] > (
+            self.spec.maximum_contact_penetration_meters
+        ):
+            self._invalidate_hard_body_integrity("excessive_contact_penetration")
+        if contacts["maximum_normal_impulse_ns"] > (
+            self.spec.maximum_contact_normal_impulse_ns
+        ):
+            self._invalidate_hard_body_integrity("excessive_contact_impulse")
+        if (
+            self.closed_support_observed
+            and commanded_gripper_closed
+            and closed_support_loss > self.spec.maximum_closed_support_loss_meters
+        ):
+            self._invalidate_hard_body_integrity(
+                "closed_gripper_support_loss_before_release"
+            )
+        if (
+            (self.lift_observed or self.closed_support_observed)
+            and commanded_gripper_closed
+            and geometry["geometrically_in_receptacle"]
+            and not contacts["bilateral_finger_contact_at_end"]
+        ):
+            self._invalidate_hard_body_integrity(
+                "object_entered_receptacle_before_release"
+            )
 
         object_linear_speed = math.sqrt(
             sum(value * value for value in state.object_linear_velocity)
@@ -432,7 +577,10 @@ class _DroidTaskSuccessTracker:
         candidate = (
             self.lift_observed
             and self.trajectory_valid
+            and self.hard_body_integrity_valid
+            and self.release_command_after_lift_seen
             and geometry["geometrically_in_receptacle"]
+            and contacts["receptacle_contact_at_end"]
             and released
             and settled
         )
@@ -449,9 +597,14 @@ class _DroidTaskSuccessTracker:
             "phase": "post_action",
             "action_index": action_index,
             "observed_gripper_position": observed_gripper_position,
+            "commanded_gripper_closed": commanded_gripper_closed,
             "gripper_closed": gripper_closed,
             "gripper_released": released,
+            "release_command_after_lift_seen": self.release_command_after_lift_seen,
             "object_displacement_meters": object_displacement,
+            "gripper_object_distance_meters": gripper_object_distance,
+            "closed_support_observed": self.closed_support_observed,
+            "closed_support_loss_meters": closed_support_loss,
             "object_displacement_valid": displacement_valid,
             "trajectory_valid": self.trajectory_valid,
             "object_lift_meters": lifted_meters,
@@ -459,6 +612,11 @@ class _DroidTaskSuccessTracker:
             "consecutive_lift_checks": self.consecutive_lift_checks,
             "required_lift_checks": self.spec.minimum_lift_checks,
             "policy_driven_lift_observed": self.lift_observed,
+            **contacts,
+            "hard_body_integrity": (
+                "pass" if self.hard_body_integrity_valid else "violated"
+            ),
+            "hard_body_integrity_reason": self.hard_body_integrity_reason,
             **geometry,
             "object_linear_speed_mps": object_linear_speed,
             "object_angular_speed_rps": object_angular_speed,
@@ -469,6 +627,285 @@ class _DroidTaskSuccessTracker:
             "consecutive_settled_checks": self.consecutive_settled_checks,
             "required_settled_checks": self.spec.required_settled_checks,
             "success": success,
+        }
+
+    def _invalidate_hard_body_integrity(self, reason: str) -> None:
+        if self.hard_body_integrity_valid:
+            self.hard_body_integrity_valid = False
+            self.hard_body_integrity_reason = reason
+
+    def _contact_evidence(self, trace: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(trace, Mapping):
+            raise HostedDroidError("contact integrity telemetry is missing")
+        if trace.get("schema_version") != 1:
+            raise HostedDroidError("contact integrity telemetry schema is unsupported")
+        if trace.get("complete") is not True:
+            raise HostedDroidError("contact integrity telemetry is incomplete")
+        expected_limits = {
+            "maximum_penetration_m": self.spec.maximum_contact_penetration_meters,
+            "maximum_normal_impulse_ns": (self.spec.maximum_contact_normal_impulse_ns),
+        }
+        limits = trace.get("limits")
+        if not isinstance(limits, Mapping) or set(limits) != set(expected_limits):
+            raise HostedDroidError("contact integrity limits are incomplete")
+        for name, expected in expected_limits.items():
+            value = limits.get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not math.isclose(float(value), expected, rel_tol=1e-9, abs_tol=1e-12)
+            ):
+                raise HostedDroidError(f"contact integrity limit {name} is invalid")
+        violations = trace.get("violations")
+        if not isinstance(violations, list):
+            raise HostedDroidError("contact integrity violations are invalid")
+        samples = trace.get("samples")
+        requested = trace.get("requested_updates")
+        captured = trace.get("captured_updates")
+        if (
+            not isinstance(samples, list)
+            or not samples
+            or isinstance(requested, bool)
+            or not isinstance(requested, int)
+            or isinstance(captured, bool)
+            or not isinstance(captured, int)
+            or requested != captured
+            or captured != len(samples)
+        ):
+            raise HostedDroidError("contact integrity update count is invalid")
+
+        expected_pairs = {
+            _LEFT_FINGER_CONTACT: (
+                self.spec.left_finger_prim_path,
+                self.spec.object_prim_path,
+            ),
+            _RIGHT_FINGER_CONTACT: (
+                self.spec.right_finger_prim_path,
+                self.spec.object_prim_path,
+            ),
+            _RECEPTACLE_CONTACT: (
+                self.spec.object_prim_path,
+                self.spec.receptacle_prim_path,
+            ),
+        }
+        maximum_penetration = 0.0
+        maximum_normal_impulse = 0.0
+        bilateral_contact_updates = 0
+        receptacle_contact_updates = 0
+        last_contacts: set[str] = set()
+        last_bilateral_normal_dot: float | None = None
+        bilateral_contact_flags: list[bool] = []
+        for expected_update_index, sample in enumerate(samples):
+            if not isinstance(sample, Mapping):
+                raise HostedDroidError("contact integrity sample is invalid")
+            if sample.get("update_index") != expected_update_index:
+                raise HostedDroidError("contact integrity update index is invalid")
+            physics_dt = sample.get("physics_dt_seconds")
+            if (
+                isinstance(physics_dt, bool)
+                or not isinstance(physics_dt, (int, float))
+                or not math.isfinite(float(physics_dt))
+                or float(physics_dt) <= 0
+            ):
+                raise HostedDroidError("contact integrity physics dt is invalid")
+            physics_dt = float(physics_dt)
+            pairs = sample.get("pairs")
+            if not isinstance(pairs, list):
+                raise HostedDroidError("contact integrity pair list is invalid")
+            by_label: dict[str, Mapping[str, Any]] = {}
+            for pair in pairs:
+                if not isinstance(pair, Mapping) or not isinstance(
+                    pair.get("label"), str
+                ):
+                    raise HostedDroidError("contact integrity pair is invalid")
+                label = cast(str, pair["label"])
+                if label in by_label:
+                    raise HostedDroidError("contact integrity pair label is duplicated")
+                by_label[label] = pair
+            if set(by_label) != set(expected_pairs):
+                raise HostedDroidError("contact integrity pair labels are incomplete")
+
+            contacts_this_update: set[str] = set()
+            mean_normals: dict[str, tuple[float, float, float]] = {}
+            for label, pair in by_label.items():
+                if pair.get("complete") is not True:
+                    raise HostedDroidError("contact integrity pair is incomplete")
+                sensor_path, filter_path = expected_pairs[label]
+                if (
+                    pair.get("sensor_path") != sensor_path
+                    or pair.get("filter_path") != filter_path
+                ):
+                    raise HostedDroidError("contact integrity pair paths are invalid")
+                contacts_list = pair.get("contacts")
+                if not isinstance(contacts_list, list):
+                    raise HostedDroidError("contact integrity contacts are invalid")
+                contact_count = pair.get("contact_count")
+                if (
+                    isinstance(contact_count, bool)
+                    or not isinstance(contact_count, int)
+                    or contact_count != len(contacts_list)
+                ):
+                    raise HostedDroidError("contact integrity contact count is invalid")
+                if contacts_list:
+                    contacts_this_update.add(label)
+                normals: list[tuple[float, float, float]] = []
+                for contact in contacts_list:
+                    if not isinstance(contact, Mapping):
+                        raise HostedDroidError("contact integrity point is invalid")
+                    penetration = contact.get("penetration_m")
+                    if (
+                        isinstance(penetration, bool)
+                        or not isinstance(penetration, (int, float))
+                        or not math.isfinite(float(penetration))
+                        or float(penetration) < 0
+                    ):
+                        raise HostedDroidError(
+                            "contact integrity penetration is invalid"
+                        )
+                    maximum_penetration = max(maximum_penetration, float(penetration))
+                    impulse = contact.get("normal_impulse_ns")
+                    force = contact.get("normal_force_n")
+                    if (
+                        isinstance(impulse, bool)
+                        or not isinstance(impulse, (int, float))
+                        or not math.isfinite(float(impulse))
+                        or float(impulse) < 0
+                        or isinstance(force, bool)
+                        or not isinstance(force, (int, float))
+                        or not math.isfinite(float(force))
+                        or float(force) < 0
+                        or not math.isclose(
+                            float(force),
+                            float(impulse) / physics_dt,
+                            rel_tol=1e-5,
+                            abs_tol=1e-8,
+                        )
+                    ):
+                        raise HostedDroidError(
+                            "contact integrity normal impulse is invalid"
+                        )
+                    maximum_normal_impulse = max(maximum_normal_impulse, float(impulse))
+                    normal = _finite_triplet(
+                        contact.get("normal_filter_to_sensor"),
+                        "contact_integrity.normal_filter_to_sensor",
+                    )
+                    normal_length = math.sqrt(sum(value * value for value in normal))
+                    if normal_length <= 1e-9:
+                        raise HostedDroidError("contact integrity normal is degenerate")
+                    normals.append(
+                        cast(
+                            tuple[float, float, float],
+                            tuple(value / normal_length for value in normal),
+                        )
+                    )
+                if normals:
+                    mean = tuple(
+                        sum(normal[axis] for normal in normals) / len(normals)
+                        for axis in range(3)
+                    )
+                    mean_length = math.sqrt(sum(value * value for value in mean))
+                    if mean_length <= 1e-9:
+                        raise HostedDroidError(
+                            "contact integrity mean normal is degenerate"
+                        )
+                    mean_normals[label] = cast(
+                        tuple[float, float, float],
+                        tuple(value / mean_length for value in mean),
+                    )
+
+                friction_contacts = pair.get("friction_contacts")
+                if not isinstance(friction_contacts, list):
+                    raise HostedDroidError("contact integrity friction data is invalid")
+                for friction_contact in friction_contacts:
+                    if not isinstance(friction_contact, Mapping):
+                        raise HostedDroidError(
+                            "contact integrity friction point is invalid"
+                        )
+                    vector = _finite_triplet(
+                        friction_contact.get("impulse_vector_ns"),
+                        "contact_integrity.friction_impulse",
+                    )
+                    magnitude = friction_contact.get("impulse_magnitude_ns")
+                    expected_magnitude = math.sqrt(
+                        sum(value * value for value in vector)
+                    )
+                    if (
+                        isinstance(magnitude, bool)
+                        or not isinstance(magnitude, (int, float))
+                        or not math.isfinite(float(magnitude))
+                        or float(magnitude) < 0
+                        or not math.isclose(
+                            float(magnitude),
+                            expected_magnitude,
+                            rel_tol=1e-5,
+                            abs_tol=1e-8,
+                        )
+                    ):
+                        raise HostedDroidError(
+                            "contact integrity friction impulse is invalid"
+                        )
+            bilateral_contact = {
+                _LEFT_FINGER_CONTACT,
+                _RIGHT_FINGER_CONTACT,
+            }.issubset(contacts_this_update)
+            bilateral_contact_flags.append(bilateral_contact)
+            bilateral_normal_dot_this_update: float | None = None
+            if bilateral_contact:
+                bilateral_contact_updates += 1
+                left_normal = mean_normals[_LEFT_FINGER_CONTACT]
+                right_normal = mean_normals[_RIGHT_FINGER_CONTACT]
+                bilateral_normal_dot_this_update = sum(
+                    left * right
+                    for left, right in zip(left_normal, right_normal, strict=True)
+                )
+            last_bilateral_normal_dot = bilateral_normal_dot_this_update
+            if _RECEPTACLE_CONTACT in contacts_this_update:
+                receptacle_contact_updates += 1
+            last_contacts = contacts_this_update
+
+        maximum_bilateral_gap = 0
+        current_gap = 0
+        for has_bilateral_contact in bilateral_contact_flags:
+            if has_bilateral_contact:
+                current_gap = 0
+            else:
+                current_gap += 1
+                maximum_bilateral_gap = max(maximum_bilateral_gap, current_gap)
+
+        computed_within_limits = (
+            maximum_penetration <= self.spec.maximum_contact_penetration_meters
+            and maximum_normal_impulse <= self.spec.maximum_contact_normal_impulse_ns
+        )
+        if trace.get("within_configured_limits") is not computed_within_limits:
+            raise HostedDroidError("contact integrity limit verdict is inconsistent")
+        if bool(violations) is computed_within_limits or not all(
+            isinstance(violation, Mapping) for violation in violations
+        ):
+            raise HostedDroidError("contact integrity violations are inconsistent")
+
+        return {
+            "contact_integrity_complete": True,
+            "maximum_penetration_meters": maximum_penetration,
+            "maximum_allowed_penetration_meters": (
+                self.spec.maximum_contact_penetration_meters
+            ),
+            "maximum_normal_impulse_ns": maximum_normal_impulse,
+            "maximum_allowed_normal_impulse_ns": (
+                self.spec.maximum_contact_normal_impulse_ns
+            ),
+            "bilateral_finger_contact_updates": bilateral_contact_updates,
+            "bilateral_finger_contact_fraction": (
+                bilateral_contact_updates / len(samples)
+            ),
+            "maximum_bilateral_contact_gap_updates": maximum_bilateral_gap,
+            "bilateral_finger_contact_at_end": {
+                _LEFT_FINGER_CONTACT,
+                _RIGHT_FINGER_CONTACT,
+            }.issubset(last_contacts),
+            "bilateral_normal_dot_at_end": last_bilateral_normal_dot,
+            "receptacle_contact_updates": receptacle_contact_updates,
+            "receptacle_contact_at_end": _RECEPTACLE_CONTACT in last_contacts,
         }
 
     def _geometry(self, state: _DroidTaskState) -> dict[str, Any]:
@@ -872,7 +1309,7 @@ class _EvidenceRecorder:
             "phase": phase,
             "action_index": action_index,
             "capture_method": (
-                f"read_only_usd_bounds_and_{state.velocity_source}_velocity"
+                f"read_only_usd_bounds_and_{state.velocity_source}_rigid_state"
             ),
             "state": state.to_dict(),
             "evaluation": dict(evaluation),
@@ -1146,16 +1583,26 @@ _DROID_INITIAL_ARM_JOINT_POSITIONS = (
     3 * math.pi / 5,
     0.0,
 )
-_DROID_DYNAMICS_PROFILE = "nvidia_droid_isaaclab"
+_DROID_DYNAMICS_PROFILE = "cybernetics_droid_contact_v1"
 _DROID_DYNAMICS_STDOUT_PREFIX = "DROID_DYNAMICS_PROFILE="
 _DROID_PHYSICS_HZ = 120.0
 _DROID_GRIPPER_VELOCITY_LIMIT_RADIANS = 1.0
 _DROID_GRIPPER_STIFFNESS = 100.0
 _DROID_GRIPPER_DAMPING = 0.0002
 _DROID_GRIPPER_MAX_FORCE = 16.5
-_DROID_FINGER_PAD_MIN_FRICTION = 2.0
-_DROID_CUBE_MIN_FRICTION = 10.0
+_DROID_FINGER_STATIC_FRICTION = 1.5
+_DROID_FINGER_DYNAMIC_FRICTION = 1.2
+_DROID_CUBE_STATIC_FRICTION = 0.8
+_DROID_CUBE_DYNAMIC_FRICTION = 0.6
+_DROID_RECEPTACLE_STATIC_FRICTION = 0.6
+_DROID_RECEPTACLE_DYNAMIC_FRICTION = 0.5
+_DROID_TABLE_STATIC_FRICTION = 0.5
+_DROID_TABLE_DYNAMIC_FRICTION = 0.4
+_DROID_FRICTION_COMBINE_MODE = "average"
 _DROID_CUBE_MASS_KG = 0.04
+_DROID_CONTACT_OFFSET_METERS = 0.002
+_DROID_REST_OFFSET_METERS = 0.0
+_DROID_MAX_DEPENETRATION_VELOCITY_MPS = 3.0
 _CAMERA_CAPTURE_ATTEMPTS = 10
 _CAMERA_CAPTURE_RETRY_SECONDS = 0.5
 _CAMERA_WARMUP_STEPS = 32
@@ -1489,6 +1936,12 @@ print({prefix} + json.dumps(payload, sort_keys=True))
     def _configure_robot_dynamics(self, mcp: MCPClient) -> dict[str, Any]:
         robot_path = json.dumps(self.config.robot_prim_path)
         cube_path = json.dumps("/World/rubiks_cube")
+        receptacle_path = json.dumps(
+            self.config.task_success.receptacle_prim_path
+            if self.config.task_success is not None
+            else "/World/_24_bowl"
+        )
+        table_path = json.dumps("/World/table")
         joint_settings = json.dumps(
             {
                 **{
@@ -1519,6 +1972,7 @@ import math
 import omni.kit.app
 import omni.timeline
 import omni.usd
+from isaacsim.core.api import PhysicsContext
 from isaacsim.core.simulation_manager import SimulationManager
 from pxr import PhysxSchema, Usd, UsdPhysics, UsdShade
 
@@ -1535,9 +1989,44 @@ timeline.set_ticks_per_frame(1)
 timeline.set_time_codes_per_second({_DROID_PHYSICS_HZ})
 robot_path = {robot_path}
 cube_path = {cube_path}
+receptacle_path = {receptacle_path}
+table_path = {table_path}
 root = stage.GetPrimAtPath(robot_path)
 if not root.IsValid():
     raise RuntimeError(f"DROID robot prim not found: {{robot_path}}")
+
+def define_physics_material(path, static_friction, dynamic_friction):
+    material = UsdShade.Material.Define(stage, path)
+    material_api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+    material_api.CreateStaticFrictionAttr(static_friction)
+    material_api.CreateDynamicFrictionAttr(dynamic_friction)
+    material_api.CreateRestitutionAttr(0.0)
+    PhysxSchema.PhysxMaterialAPI.Apply(
+        material.GetPrim()
+    ).CreateFrictionCombineModeAttr({_DROID_FRICTION_COMBINE_MODE!r})
+    return material
+
+stage.DefinePrim("/World/droid_eval_physics", "Scope")
+finger_material = define_physics_material(
+    "/World/droid_eval_physics/FingerMaterial",
+    {_DROID_FINGER_STATIC_FRICTION},
+    {_DROID_FINGER_DYNAMIC_FRICTION},
+)
+cube_material = define_physics_material(
+    "/World/droid_eval_physics/CubeMaterial",
+    {_DROID_CUBE_STATIC_FRICTION},
+    {_DROID_CUBE_DYNAMIC_FRICTION},
+)
+receptacle_material = define_physics_material(
+    "/World/droid_eval_physics/ReceptacleMaterial",
+    {_DROID_RECEPTACLE_STATIC_FRICTION},
+    {_DROID_RECEPTACLE_DYNAMIC_FRICTION},
+)
+table_material = define_physics_material(
+    "/World/droid_eval_physics/TableMaterial",
+    {_DROID_TABLE_STATIC_FRICTION},
+    {_DROID_TABLE_DYNAMIC_FRICTION},
+)
 
 joint_settings = json.loads({json.dumps(joint_settings)})
 configured_joints = []
@@ -1573,13 +2062,15 @@ for prim in Usd.PrimRange(root):
     if prim.HasAPI(UsdPhysics.RigidBodyAPI):
         rigid_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
         rigid_api.GetDisableGravityAttr().Set(True)
-        rigid_api.GetMaxDepenetrationVelocityAttr().Set(5.0)
+        rigid_api.GetMaxDepenetrationVelocityAttr().Set(
+            {_DROID_MAX_DEPENETRATION_VELOCITY_MPS}
+        )
         rigid_bodies += 1
     if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
         articulation_api = PhysxSchema.PhysxArticulationAPI.Apply(prim)
         articulation_api.GetEnabledSelfCollisionsAttr().Set(False)
         articulation_api.GetSolverPositionIterationCountAttr().Set(64)
-        articulation_api.GetSolverVelocityIterationCountAttr().Set(0)
+        articulation_api.GetSolverVelocityIterationCountAttr().Set(1)
         articulation_roots += 1
 
 missing_joints = sorted(set(joint_settings) - set(configured_joints))
@@ -1601,12 +2092,68 @@ for prim in stage.Traverse():
         physics_scenes += 1
 if physics_scenes < 1:
     raise RuntimeError("DROID dynamics profile found no physics scene")
+physics_context = PhysicsContext(set_defaults=False)
+physics_context.set_solver_type("TGS")
+physics_context.set_solve_articulation_contact_last(True)
 
 cube_root = stage.GetPrimAtPath(cube_path)
 if not cube_root.IsValid():
     raise RuntimeError("DROID cube prim unavailable: %s" % cube_path)
 # The scene payload omits mass, so pin the benchmark value before rebuilding PhysX.
 UsdPhysics.MassAPI.Apply(cube_root).CreateMassAttr({_DROID_CUBE_MASS_KG})
+cube_rigid_api = PhysxSchema.PhysxRigidBodyAPI.Apply(cube_root)
+cube_rigid_api.GetEnableCCDAttr().Set(True)
+cube_rigid_api.GetMaxDepenetrationVelocityAttr().Set(
+    {_DROID_MAX_DEPENETRATION_VELOCITY_MPS}
+)
+receptacle_root = stage.GetPrimAtPath(receptacle_path)
+if not receptacle_root.IsValid():
+    raise RuntimeError("DROID receptacle prim unavailable: %s" % receptacle_path)
+if receptacle_root.HasAPI(UsdPhysics.RigidBodyAPI):
+    PhysxSchema.PhysxRigidBodyAPI.Apply(
+        receptacle_root
+    ).GetMaxDepenetrationVelocityAttr().Set(
+        {_DROID_MAX_DEPENETRATION_VELOCITY_MPS}
+    )
+table_root = stage.GetPrimAtPath(table_path)
+if not table_root.IsValid():
+    raise RuntimeError("DROID table prim unavailable: %s" % table_path)
+
+finger_binding_paths = [
+    robot_path + "/Gripper/Robotiq_2F_85/left_inner_finger",
+    robot_path + "/Gripper/Robotiq_2F_85/right_inner_finger",
+]
+
+def configure_contact_root(path, material):
+    profile_root = stage.GetPrimAtPath(path)
+    if not profile_root.IsValid():
+        raise RuntimeError("DROID contact root unavailable: %s" % path)
+    UsdShade.MaterialBindingAPI(profile_root).Bind(
+        material,
+        UsdShade.Tokens.strongerThanDescendants,
+        "physics",
+    )
+    configured = 0
+    for prim in Usd.PrimRange(profile_root):
+        if not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        collision_api = PhysxSchema.PhysxCollisionAPI.Apply(prim)
+        collision_api.CreateContactOffsetAttr({_DROID_CONTACT_OFFSET_METERS})
+        collision_api.CreateRestOffsetAttr({_DROID_REST_OFFSET_METERS})
+        configured += 1
+    if configured < 1:
+        raise RuntimeError("DROID contact root has no collision geometry: %s" % path)
+    return configured
+
+configured_finger_collisions = sum(
+    configure_contact_root(path, finger_material)
+    for path in finger_binding_paths
+)
+configured_cube_collisions = configure_contact_root(cube_path, cube_material)
+configured_receptacle_collisions = configure_contact_root(
+    receptacle_path, receptacle_material
+)
+configured_table_collisions = configure_contact_root(table_path, table_material)
 
 app = omni.kit.app.get_app()
 old_physics_view = SimulationManager.get_physics_sim_view()
@@ -1705,6 +2252,7 @@ def collision_profile(profile_root):
     collision_count = 0
     contact_offsets = set()
     rest_offsets = set()
+    entries = []
     for prim in Usd.PrimRange(profile_root):
         if not prim.HasAPI(UsdPhysics.CollisionAPI):
             continue
@@ -1721,11 +2269,43 @@ def collision_profile(profile_root):
             contact_offsets.add(contact_offset)
         if rest_offset is not None:
             rest_offsets.add(rest_offset)
+        approximation = prim.GetAttribute("physics:approximation")
+        entries.append({{
+            "prim_path": str(prim.GetPath()),
+            "prim_type": prim.GetTypeName(),
+            "approximation": (
+                str(approximation.Get())
+                if approximation
+                and approximation.IsValid()
+                and approximation.Get() is not None
+                else None
+            ),
+            "contact_offset": contact_offset,
+            "rest_offset": rest_offset,
+        }})
     return {{
         "collision_count": collision_count,
         "contact_offsets": sorted(contact_offsets, key=str),
         "rest_offsets": sorted(rest_offsets, key=str),
+        "entries": entries,
     }}
+
+def require_contact_offsets(profile, label):
+    for entry in profile["entries"]:
+        if not math.isclose(
+            entry["contact_offset"],
+            {_DROID_CONTACT_OFFSET_METERS},
+            rel_tol=1e-6,
+            abs_tol=1e-9,
+        ) or not math.isclose(
+            entry["rest_offset"],
+            {_DROID_REST_OFFSET_METERS},
+            rel_tol=1e-6,
+            abs_tol=1e-9,
+        ):
+            raise RuntimeError(
+                "DROID contact offsets mismatch for %s: %s" % (label, entry)
+            )
 
 def mass_profile(profile_root):
     entries = []
@@ -1794,10 +2374,6 @@ if not math.isclose(
         % ({_DROID_CUBE_MASS_KG}, authored_cube_mass)
     )
 
-finger_binding_paths = [
-    robot_path + "/Gripper/Robotiq_2F_85/left_inner_finger",
-    robot_path + "/Gripper/Robotiq_2F_85/right_inner_finger",
-]
 finger_bindings = []
 robot_materials = {{}}
 bound_robot_collisions = 0
@@ -1812,21 +2388,20 @@ for binding_path in finger_binding_paths:
         raise RuntimeError(
             "DROID finger physics material unavailable: %s" % binding_path
         )
-    binding_collision_count = sum(
-        1
-        for prim in Usd.PrimRange(binding_prim)
-        if prim.HasAPI(UsdPhysics.CollisionAPI)
-    )
+    binding_collision_profile = collision_profile(binding_prim)
+    binding_collision_count = binding_collision_profile["collision_count"]
     if binding_collision_count < 1:
         raise RuntimeError(
             "DROID finger physics binding has no collision geometry: %s"
             % binding_path
         )
     bound_robot_collisions += binding_collision_count
+    require_contact_offsets(binding_collision_profile, binding_path)
     robot_materials[material["path"]] = material
     finger_bindings.append({{
         "binding_path": binding_path,
         "collision_count": binding_collision_count,
+        "collision_profile": binding_collision_profile,
         "material_path": material["path"],
     }})
 robot_collisions["bound_collision_count"] = bound_robot_collisions
@@ -1845,22 +2420,92 @@ cube_collisions["material_bindings"] = [{{
     "material_path": cube_material["path"],
 }}]
 cube_collisions["materials"] = [cube_material]
+require_contact_offsets(cube_collisions, cube_path)
+
+receptacle_collisions = collision_profile(receptacle_root)
+receptacle_material_profile = material_profile_from_binding(receptacle_root)
+if receptacle_material_profile is None:
+    raise RuntimeError("DROID receptacle physics material unavailable")
+receptacle_collisions["materials"] = [receptacle_material_profile]
+require_contact_offsets(receptacle_collisions, receptacle_path)
+
+table_collisions = collision_profile(table_root)
+table_material_profile = material_profile_from_binding(table_root)
+if table_material_profile is None:
+    raise RuntimeError("DROID table physics material unavailable")
+table_collisions["materials"] = [table_material_profile]
+require_contact_offsets(table_collisions, table_path)
 
 robot_materials = robot_collisions["materials"]
-if not any(
-    material["static_friction"] >= {_DROID_FINGER_PAD_MIN_FRICTION}
-    and material["dynamic_friction"] >= {_DROID_FINGER_PAD_MIN_FRICTION}
-    and material["friction_combine_mode"] == "max"
+if len(robot_materials) != 1 or not all(
+    math.isclose(
+        material["static_friction"],
+        {_DROID_FINGER_STATIC_FRICTION},
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    )
+    and math.isclose(
+        material["dynamic_friction"],
+        {_DROID_FINGER_DYNAMIC_FRICTION},
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    )
+    and material["friction_combine_mode"] == {_DROID_FRICTION_COMBINE_MODE!r}
     for material in robot_materials
 ):
     raise RuntimeError("DROID finger-pad physics material mismatch")
 cube_materials = cube_collisions["materials"]
-if not any(
-    material["static_friction"] >= {_DROID_CUBE_MIN_FRICTION}
-    and material["dynamic_friction"] >= {_DROID_CUBE_MIN_FRICTION}
+if len(cube_materials) != 1 or not all(
+    math.isclose(
+        material["static_friction"],
+        {_DROID_CUBE_STATIC_FRICTION},
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    )
+    and math.isclose(
+        material["dynamic_friction"],
+        {_DROID_CUBE_DYNAMIC_FRICTION},
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    )
+    and material["friction_combine_mode"] == {_DROID_FRICTION_COMBINE_MODE!r}
     for material in cube_materials
 ):
     raise RuntimeError("DROID cube physics material mismatch")
+if not (
+    math.isclose(
+        receptacle_material_profile["static_friction"],
+        {_DROID_RECEPTACLE_STATIC_FRICTION},
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    )
+    and math.isclose(
+        receptacle_material_profile["dynamic_friction"],
+        {_DROID_RECEPTACLE_DYNAMIC_FRICTION},
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    )
+    and receptacle_material_profile["friction_combine_mode"]
+    == {_DROID_FRICTION_COMBINE_MODE!r}
+):
+    raise RuntimeError("DROID receptacle physics material mismatch")
+if not (
+    math.isclose(
+        table_material_profile["static_friction"],
+        {_DROID_TABLE_STATIC_FRICTION},
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    )
+    and math.isclose(
+        table_material_profile["dynamic_friction"],
+        {_DROID_TABLE_DYNAMIC_FRICTION},
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    )
+    and table_material_profile["friction_combine_mode"]
+    == {_DROID_FRICTION_COMBINE_MODE!r}
+):
+    raise RuntimeError("DROID table physics material mismatch")
 
 runtime_profile = {{
     "status": "success",
@@ -1874,12 +2519,30 @@ runtime_profile = {{
     "articulation_roots": articulation_roots,
     "rigid_bodies": rigid_bodies,
     "physics_scenes": physics_scenes,
+    "solver_type": "TGS",
+    "solver_position_iterations": 64,
+    "solver_velocity_iterations": 1,
+    "solve_articulation_contact_last": True,
+    "cube_ccd_enabled": True,
+    "contact_offset_meters": {_DROID_CONTACT_OFFSET_METERS},
+    "rest_offset_meters": {_DROID_REST_OFFSET_METERS},
+    "max_depenetration_velocity_mps": (
+        {_DROID_MAX_DEPENETRATION_VELOCITY_MPS}
+    ),
+    "configured_finger_contact_collisions": configured_finger_collisions,
+    "configured_cube_contact_collisions": configured_cube_collisions,
+    "configured_receptacle_contact_collisions": (
+        configured_receptacle_collisions
+    ),
+    "configured_table_contact_collisions": configured_table_collisions,
     "physics_context_reinitialized": True,
     "physics_view_replaced": True,
     "timeline_state": "paused",
     "gripper_drive": gripper_profile,
     "robot_collisions": robot_collisions,
     "cube_collisions": cube_collisions,
+    "receptacle_collisions": receptacle_collisions,
+    "table_collisions": table_collisions,
     "cube_mass": cube_mass,
 }}
 print(
@@ -2256,6 +2919,11 @@ print({{"status": "success", "prim_path": {prim_path}}})
                         task_state,
                         action_index=action_steps,
                         observed_gripper_position=observed_gripper_position,
+                        commanded_gripper_closed=joint_positions[-1] > 0,
+                        contact_integrity=cast(
+                            Mapping[str, Any],
+                            simulation_timing.get("contact_integrity"),
+                        ),
                     )
                     if evidence is not None:
                         evidence.write_task_state(
@@ -2289,7 +2957,7 @@ print({{"status": "success", "prim_path": {prim_path}}})
             task_success_action_index=tracker.success_action_index,
             task_success_checks=tracker.checks,
             task_success_reason=(
-                "policy_lift_release_and_settled_placement_proven"
+                "physically_credible_policy_placement_proven"
                 if task_success
                 else "max_action_steps_reached_without_valid_placement"
             ),
@@ -2302,6 +2970,7 @@ print({{"status": "success", "prim_path": {prim_path}}})
     ) -> _DroidTaskState:
         object_path = json.dumps(spec.object_prim_path)
         receptacle_path = json.dumps(spec.receptacle_prim_path)
+        gripper_reference_path = json.dumps(spec.gripper_reference_prim_path)
         prefix = json.dumps(_TASK_STATE_STDOUT_PREFIX)
         code = f"""
 import json
@@ -2335,13 +3004,13 @@ def as_numpy(value):
         return value.numpy()
     return np.asarray(value)
 
-def read_physics_tensor_velocities(paths):
+def read_physics_tensor_states(paths):
     from isaacsim.core.simulation_manager import SimulationManager
 
     simulation_view = SimulationManager.get_physics_simulation_view()
     if simulation_view is None:
         raise RuntimeError("physics tensor simulation view is unavailable")
-    velocities = {{}}
+    states = {{}}
     for path in paths:
         prim = stage.GetPrimAtPath(path)
         if not prim.IsValid() or not prim.HasAPI(UsdPhysics.RigidBodyAPI):
@@ -2356,53 +3025,63 @@ def read_physics_tensor_velocities(paths):
                 f"requested={{path}}; matched={{matched_paths}}"
             )
         values = as_numpy(body_view.get_velocities()).reshape(body_view.count, 6)[0]
-        velocities[path] = {{
+        transform = as_numpy(body_view.get_transforms()).reshape(body_view.count, 7)[0]
+        states[path] = {{
+            "position": [float(transform[i]) for i in range(3)],
             "linear": [float(values[i]) for i in range(3)],
             "angular": [float(values[i]) for i in range(3, 6)],
         }}
-    return velocities
+    return states
 
-def read_legacy_dynamic_control_velocities(paths):
+def read_legacy_dynamic_control_states(paths):
     from omni.isaac.dynamic_control import _dynamic_control
 
     dynamic_control = _dynamic_control.acquire_dynamic_control_interface()
-    velocities = {{}}
+    states = {{}}
     for path in paths:
         handle = dynamic_control.get_rigid_body(path)
         if handle == _dynamic_control.INVALID_HANDLE:
             raise RuntimeError(f"legacy rigid-body handle unavailable: {{path}}")
         linear = dynamic_control.get_rigid_body_linear_velocity(handle)
         angular = dynamic_control.get_rigid_body_angular_velocity(handle)
-        velocities[path] = {{
+        pose = dynamic_control.get_rigid_body_pose(handle)
+        states[path] = {{
+            "position": [float(pose.p[i]) for i in range(3)],
             "linear": [float(linear[i]) for i in range(3)],
             "angular": [float(angular[i]) for i in range(3)],
         }}
-    return velocities
+    return states
 
-def read_velocities(paths):
+def read_states(paths):
     try:
-        return read_physics_tensor_velocities(paths), "physics_tensor"
+        return read_physics_tensor_states(paths), "physics_tensor"
     except Exception as tensor_error:
         try:
-            return read_legacy_dynamic_control_velocities(paths), "legacy_dynamic_control"
+            return read_legacy_dynamic_control_states(paths), "legacy_dynamic_control"
         except Exception as legacy_error:
             raise RuntimeError(
-                "rigid-body velocity unavailable; "
+                "rigid-body state unavailable; "
                 f"physics_tensor={{tensor_error}}; "
                 f"legacy_dynamic_control={{legacy_error}}"
             ) from legacy_error
 
 object_path = {object_path}
 receptacle_path = {receptacle_path}
-velocities, velocity_source = read_velocities([object_path, receptacle_path])
+gripper_reference_path = {gripper_reference_path}
+states, velocity_source = read_states(
+    [object_path, receptacle_path, gripper_reference_path]
+)
 payload = {{
     "object_path": object_path,
     "receptacle_path": receptacle_path,
     "velocity_source": velocity_source,
     "object_bounds": read_bounds(object_path),
     "receptacle_bounds": read_bounds(receptacle_path),
-    "object_velocity": velocities[object_path],
-    "receptacle_velocity": velocities[receptacle_path],
+    "object_velocity": states[object_path],
+    "receptacle_velocity": states[receptacle_path],
+    "object_runtime_position": states[object_path]["position"],
+    "gripper_reference_path": gripper_reference_path,
+    "gripper_reference_position": states[gripper_reference_path]["position"],
 }}
 print({prefix} + json.dumps(payload, sort_keys=True))
 """
@@ -2593,6 +3272,7 @@ print({prefix} + json.dumps(payload, sort_keys=True))
         num_steps: int,
         observe_joints: list[str] | None = None,
         observe_cap: int | None = None,
+        contact_integrity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
             arguments: dict[str, Any] = {
@@ -2603,6 +3283,8 @@ print({prefix} + json.dumps(payload, sort_keys=True))
                 arguments["observe_joints"] = observe_joints
             if observe_cap is not None:
                 arguments["observe_cap"] = observe_cap
+            if contact_integrity is not None:
+                arguments["contact_integrity"] = dict(contact_integrity)
             result = self._call(mcp, "isaac.step_simulation", arguments)
         except BaseException as step_exc:
             try:
@@ -2645,6 +3327,11 @@ print({prefix} + json.dumps(payload, sort_keys=True))
             num_steps=physics_steps_per_action,
             observe_joints=[self.config.robot_prim_path],
             observe_cap=1,
+            contact_integrity=(
+                _contact_integrity_request(self.config.task_success)
+                if self.config.task_success is not None
+                else None
+            ),
         )
         after = self._simulation_state(mcp)
         stepped = step.get("stepped")
@@ -2684,6 +3371,7 @@ print({prefix} + json.dumps(payload, sort_keys=True))
                 "observed_simulation_seconds": observed_seconds,
                 "timeline_drift_seconds": drift_seconds,
                 "joint_target_control_source": control_source,
+                "contact_integrity": step.get("contact_integrity"),
             },
         )
 
@@ -2759,6 +3447,10 @@ def _parse_task_state(
         raise HostedDroidError("Isaac task state returned the wrong object prim")
     if payload.get("receptacle_path") != spec.receptacle_prim_path:
         raise HostedDroidError("Isaac task state returned the wrong receptacle prim")
+    if payload.get("gripper_reference_path") != spec.gripper_reference_prim_path:
+        raise HostedDroidError(
+            "Isaac task state returned the wrong gripper reference prim"
+        )
     velocity = payload.get("object_velocity")
     if not isinstance(velocity, Mapping):
         raise HostedDroidError("Isaac task state is missing object velocity")
@@ -2795,6 +3487,14 @@ def _parse_task_state(
         receptacle_angular_velocity=_finite_triplet(
             receptacle_velocity.get("angular"),
             "receptacle_velocity.angular",
+        ),
+        object_runtime_position=_finite_triplet(
+            payload.get("object_runtime_position"),
+            "object_runtime_position",
+        ),
+        gripper_reference_position=_finite_triplet(
+            payload.get("gripper_reference_position"),
+            "gripper_reference_position",
         ),
     )
 
@@ -2985,6 +3685,11 @@ def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
                 "name": config.task_success.name,
                 "object_prim_path": config.task_success.object_prim_path,
                 "receptacle_prim_path": config.task_success.receptacle_prim_path,
+                "left_finger_prim_path": (config.task_success.left_finger_prim_path),
+                "right_finger_prim_path": (config.task_success.right_finger_prim_path),
+                "gripper_reference_prim_path": (
+                    config.task_success.gripper_reference_prim_path
+                ),
                 "minimum_lift_meters": config.task_success.minimum_lift_meters,
                 "minimum_lift_checks": config.task_success.minimum_lift_checks,
                 "horizontal_containment_margin_meters": (
@@ -3016,6 +3721,24 @@ def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
                 ),
                 "gripper_released_threshold": (
                     config.task_success.gripper_released_threshold
+                ),
+                "maximum_contact_penetration_meters": (
+                    config.task_success.maximum_contact_penetration_meters
+                ),
+                "maximum_contact_normal_impulse_ns": (
+                    config.task_success.maximum_contact_normal_impulse_ns
+                ),
+                "maximum_closed_support_loss_meters": (
+                    config.task_success.maximum_closed_support_loss_meters
+                ),
+                "minimum_bilateral_contact_fraction": (
+                    config.task_success.minimum_bilateral_contact_fraction
+                ),
+                "maximum_bilateral_contact_gap_updates": (
+                    config.task_success.maximum_bilateral_contact_gap_updates
+                ),
+                "maximum_bilateral_normal_dot": (
+                    config.task_success.maximum_bilateral_normal_dot
                 ),
                 "required_settled_checks": (
                     config.task_success.required_settled_checks
