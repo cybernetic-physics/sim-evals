@@ -1548,17 +1548,19 @@ def finalize_hosted_evidence_manifest(
     """Write the manifest last so every durable artifact is hash-bound."""
 
     root = results_dir.expanduser().resolve()
-    if terminal_record is None:
-        terminal_record = next(
-            (name for name in ("result.json", "error.json") if (root / name).is_file()),
-            None,
-        )
-    if terminal_record is not None and not (root / terminal_record).is_file():
+    present_terminal_records = [
+        name for name in ("result.json", "error.json") if (root / name).is_file()
+    ]
+    if len(present_terminal_records) != 1:
         raise HostedDroidError(
-            f"hosted evidence terminal record is missing: {terminal_record}"
+            "hosted evidence requires exactly one result.json or error.json"
         )
-    if terminal_record not in {"result.json", "error.json"}:
-        raise HostedDroidError("hosted evidence requires one terminal record")
+    if terminal_record is None:
+        terminal_record = present_terminal_records[0]
+    elif terminal_record != present_terminal_records[0]:
+        raise HostedDroidError(
+            "hosted evidence terminal record does not match the durable record"
+        )
     files = _artifact_inventory(root)
     provenance = {
         "artifact_producer": _validate_manifest_provenance(
@@ -1626,6 +1628,13 @@ def verify_hosted_evidence_manifest(results_dir: Path) -> dict[str, Any]:
     if manifest["files"] != files:
         raise HostedDroidError("hosted evidence manifest file inventory mismatch")
     terminal_record = cast(str, manifest["terminal_record"])
+    present_terminal_records = {
+        name for name in ("result.json", "error.json") if name in files
+    }
+    if present_terminal_records != {terminal_record}:
+        raise HostedDroidError(
+            "hosted evidence manifest requires exactly one terminal record"
+        )
     if terminal_record not in files:
         raise HostedDroidError("hosted evidence manifest terminal record is missing")
     terminal_semantics = _terminal_evidence_semantics(root, terminal_record)
