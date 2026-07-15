@@ -42,7 +42,21 @@ _TRANSIENT_MCP_RETRIES = 12
 _HOSTED_MCP_CREDENTIAL_TTL_SECONDS = 86_400
 _DROID_EXTERNAL_CAMERA_ROOT_PREFIX = "/World/droid_eval_"
 _DROID_WRIST_CAMERA_PREFIX = "droid_eval_wrist_cam_"
+_DROID_VIEWER_CAMERA_NAME = "viewer_cam"
+_DROID_POLICY_CAMERA_ROLES = ("exterior_1", "exterior_2", "wrist")
+_DROID_CAMERA_ROLES = frozenset((*_DROID_POLICY_CAMERA_ROLES, "viewer"))
 _ROBOT_METADATA_STDOUT_PREFIX = "DROID_ROBOT_METADATA="
+_CAMERA_CALIBRATION_STDOUT_PREFIX = "DROID_CAMERA_CALIBRATION="
+_VIEWER_CAMERA_RESOLUTION = (1280, 720)
+_CAMERA_POSITION_TOLERANCE_METERS = 1e-5
+_CAMERA_ORIENTATION_ALIGNMENT_TOLERANCE = 1e-6
+_CAMERA_OPTICS_TOLERANCE = 1e-5
+_LEGACY_CAMERA_CONTRACT_MARKERS = (
+    "unsupported camera contract",
+    "unexpected keyword",
+    "unexpected argument",
+    "extra inputs are not permitted",
+)
 _PI0_DROID_POLICY_PROFILE: dict[str, Any] = {
     "base_model": "pi0-droid",
     "openpi_config": "pi0_droid_jointpos_polaris",
@@ -89,14 +103,57 @@ class SimulationClientAPI(Protocol):
 
 @dataclass(frozen=True)
 class CameraSpec:
+    role: str
     prim_path: str
     position: tuple[float, float, float]
     orientation_wxyz: tuple[float, float, float, float]
     focal_length: float
-    clipping_range: tuple[float, float] = (0.05, 100.0)
+    clipping_range: tuple[float, float] = (0.01, 1_000_000.0)
     focus_distance: float = 28.0
     horizontal_aperture: float = 5.376
     vertical_aperture: float = 3.024
+    projection: str = "perspective"
+    horizontal_aperture_offset: float = 0.0
+    vertical_aperture_offset: float = 0.0
+    f_stop: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.role not in _DROID_CAMERA_ROLES:
+            raise ValueError(f"unsupported DROID camera role: {self.role!r}")
+        if not self.prim_path.startswith("/World/"):
+            raise ValueError("camera prim_path must be beneath /World")
+        if self.projection != "perspective":
+            raise ValueError("DROID cameras require perspective projection")
+        vectors = (
+            ("position", self.position, 3),
+            ("orientation_wxyz", self.orientation_wxyz, 4),
+            ("clipping_range", self.clipping_range, 2),
+        )
+        for name, values, size in vectors:
+            if len(values) != size or not all(math.isfinite(value) for value in values):
+                raise ValueError(f"camera {name} must contain {size} finite values")
+        if math.sqrt(sum(value * value for value in self.orientation_wxyz)) <= 1e-12:
+            raise ValueError("camera orientation_wxyz must not be zero")
+        near, far = self.clipping_range
+        if near <= 0 or far <= near:
+            raise ValueError("camera clipping_range must satisfy 0 < near < far")
+        for name, value in (
+            ("focal_length", self.focal_length),
+            ("focus_distance", self.focus_distance),
+            ("horizontal_aperture", self.horizontal_aperture),
+            ("vertical_aperture", self.vertical_aperture),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"camera {name} must be positive and finite")
+        for name, value in (
+            ("horizontal_aperture_offset", self.horizontal_aperture_offset),
+            ("vertical_aperture_offset", self.vertical_aperture_offset),
+            ("f_stop", self.f_stop),
+        ):
+            if not math.isfinite(value):
+                raise ValueError(f"camera {name} must be finite")
+        if self.f_stop < 0:
+            raise ValueError("camera f_stop must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -283,6 +340,17 @@ class HostedDroidConfig:
             raise ValueError("policy_mode must be native or sde")
         if len(self.cameras) != 3:
             raise ValueError("DROID requires exactly three RGB cameras")
+        roles = tuple(camera.role for camera in self.cameras)
+        if roles != _DROID_POLICY_CAMERA_ROLES:
+            raise ValueError(
+                "DROID cameras must be ordered as exterior_1, exterior_2, wrist"
+            )
+        paths = tuple(camera.prim_path for camera in self.cameras)
+        if len(set(paths)) != len(paths):
+            raise ValueError("DROID policy camera paths must be distinct")
+        viewer_path = _viewer_camera_for(self.cameras[0]).prim_path
+        if viewer_path in paths:
+            raise ValueError("DROID viewer camera path must not overlap policy cameras")
         for name, value in (
             ("image_width", self.image_width),
             ("image_height", self.image_height),
@@ -479,6 +547,15 @@ class _DroidTaskSuccessTracker:
             <= self.spec.maximum_object_displacement_per_action_meters
         )
         self.trajectory_valid = self.trajectory_valid and displacement_valid
+        if contacts["maximum_penetration_meters"] > (
+            self.spec.maximum_contact_penetration_meters
+        ):
+            self._invalidate_hard_body_integrity("excessive_contact_penetration")
+        if contacts["maximum_normal_impulse_ns"] > (
+            self.spec.maximum_contact_normal_impulse_ns
+        ):
+            self._invalidate_hard_body_integrity("excessive_contact_impulse")
+        self.trajectory_valid = self.trajectory_valid and self.hard_body_integrity_valid
         lifted_meters = (
             state.object_bounds.center[2] - self.initial_state.object_bounds.center[2]
         )
@@ -517,6 +594,7 @@ class _DroidTaskSuccessTracker:
             and contacts["bilateral_normal_dot_at_end"]
             <= self.spec.maximum_bilateral_normal_dot
             and self.trajectory_valid
+            and self.hard_body_integrity_valid
         )
         if lift_condition:
             self.consecutive_lift_checks += 1
@@ -529,14 +607,6 @@ class _DroidTaskSuccessTracker:
         if self.lift_observed and not commanded_gripper_closed:
             self.release_command_after_lift_seen = True
 
-        if contacts["maximum_penetration_meters"] > (
-            self.spec.maximum_contact_penetration_meters
-        ):
-            self._invalidate_hard_body_integrity("excessive_contact_penetration")
-        if contacts["maximum_normal_impulse_ns"] > (
-            self.spec.maximum_contact_normal_impulse_ns
-        ):
-            self._invalidate_hard_body_integrity("excessive_contact_impulse")
         if (
             self.closed_support_observed
             and commanded_gripper_closed
@@ -554,6 +624,7 @@ class _DroidTaskSuccessTracker:
             self._invalidate_hard_body_integrity(
                 "object_entered_receptacle_before_release"
             )
+        self.trajectory_valid = self.trajectory_valid and self.hard_body_integrity_valid
 
         object_linear_speed = math.sqrt(
             sum(value * value for value in state.object_linear_velocity)
@@ -633,6 +704,16 @@ class _DroidTaskSuccessTracker:
         if self.hard_body_integrity_valid:
             self.hard_body_integrity_valid = False
             self.hard_body_integrity_reason = reason
+
+    def terminal_failure_reason(self) -> str | None:
+        if not self.hard_body_integrity_valid:
+            return (
+                "hard_body_integrity_violation:"
+                f"{self.hard_body_integrity_reason or 'unknown'}"
+            )
+        if not self.trajectory_valid:
+            return "trajectory_violation:object_displacement"
+        return None
 
     def _contact_evidence(self, trace: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(trace, Mapping):
@@ -1625,23 +1706,42 @@ def _default_cameras() -> tuple[CameraSpec, ...]:
     wrist_parent = "/World/robot/Gripper/Robotiq_2F_85/base_link"
     return (
         CameraSpec(
+            "exterior_1",
             f"{external_root}/external_cam",
             (0.05, 0.57, 0.66),
             (-0.393, -0.195, 0.399, 0.805),
             2.1,
         ),
         CameraSpec(
+            "exterior_2",
             f"{external_root}/external_cam_2",
             (0.05, -0.57, 0.66),
             (0.805, 0.399, -0.195, -0.393),
             2.1,
         ),
         CameraSpec(
+            "wrist",
             f"{wrist_parent}/droid_eval_wrist_cam_{generation}",
             (0.011, -0.031, -0.074),
             (-0.420, 0.570, 0.576, -0.409),
             2.8,
         ),
+    )
+
+
+def _viewer_camera_for(policy_camera: CameraSpec) -> CameraSpec:
+    """Return a viewer-only clone that cannot mutate a policy observation."""
+
+    return CameraSpec(
+        "viewer",
+        f"{policy_camera.prim_path.rsplit('/', 1)[0]}/{_DROID_VIEWER_CAMERA_NAME}",
+        policy_camera.position,
+        policy_camera.orientation_wxyz,
+        policy_camera.focal_length,
+        clipping_range=policy_camera.clipping_range,
+        focus_distance=policy_camera.focus_distance,
+        horizontal_aperture=policy_camera.horizontal_aperture,
+        vertical_aperture=policy_camera.vertical_aperture,
     )
 
 
@@ -1717,7 +1817,8 @@ class HostedDroidRunner:
                     runtime_dynamics = self._configure_robot_dynamics(mcp)
                     self._retire_previous_cameras(mcp)
                     created_cameras = self._ensure_cameras(mcp)
-                    self._set_viewer_camera(mcp, created_cameras[0])
+                    viewer_camera = self._ensure_viewer_camera(mcp)
+                    self._set_viewer_camera(mcp, viewer_camera.prim_path)
                     joint_indices = self._joint_indices(mcp)
                     initial_control_source = self._reset_robot_for_policy(
                         mcp,
@@ -1742,6 +1843,15 @@ class HostedDroidRunner:
                                 "control_hz": control_hz,
                                 "robot_dynamics_profile": _DROID_DYNAMICS_PROFILE,
                                 "runtime_dynamics": runtime_dynamics,
+                                "policy_camera_paths": list(created_cameras),
+                                "policy_camera_roles": [
+                                    camera.role for camera in self.config.cameras
+                                ],
+                                "policy_camera_calibration": (
+                                    "validated_before_and_after_every_capture_bundle"
+                                ),
+                                "viewer_camera_path": viewer_camera.prim_path,
+                                "viewer_camera_isolated_from_policy": True,
                                 "initial_arm_joint_targets": list(
                                     _DROID_INITIAL_ARM_JOINT_POSITIONS
                                 ),
@@ -2667,32 +2777,82 @@ print(
     def _ensure_cameras(self, mcp: MCPClient) -> list[str]:
         created: list[str] = []
         for camera in self.config.cameras:
-            arguments = {
-                "prim_path": camera.prim_path,
-                "position": list(camera.position),
-                "orientation": list(camera.orientation_wxyz),
-                "resolution": [self.config.image_width, self.config.image_height],
-                "focal_length": camera.focal_length,
-                "clipping_range": list(camera.clipping_range),
-                "focus_distance": camera.focus_distance,
-                "horizontal_aperture": camera.horizontal_aperture,
-                "vertical_aperture": camera.vertical_aperture,
-            }
-            if self._try_call(mcp, "isaac.create_camera", arguments) is None:
-                self._configure_legacy_camera(mcp, camera)
-                self._call(
-                    mcp,
-                    "isaac.create_camera",
-                    {
-                        "prim_path": camera.prim_path,
-                        "resolution": [
-                            self.config.image_width,
-                            self.config.image_height,
-                        ],
-                    },
-                )
+            self._create_camera(
+                mcp,
+                camera,
+                resolution=(self.config.image_width, self.config.image_height),
+            )
             created.append(camera.prim_path)
         return created
+
+    def _ensure_viewer_camera(self, mcp: MCPClient) -> CameraSpec:
+        viewer_camera = _viewer_camera_for(self.config.cameras[0])
+        self._create_camera(
+            mcp,
+            viewer_camera,
+            resolution=_VIEWER_CAMERA_RESOLUTION,
+        )
+        return viewer_camera
+
+    def _create_camera(
+        self,
+        mcp: MCPClient,
+        camera: CameraSpec,
+        *,
+        resolution: tuple[int, int],
+    ) -> None:
+        arguments = {
+            "prim_path": camera.prim_path,
+            "position": list(camera.position),
+            "orientation": list(camera.orientation_wxyz),
+            "resolution": list(resolution),
+            "focal_length": camera.focal_length,
+            "clipping_range": list(camera.clipping_range),
+            "focus_distance": camera.focus_distance,
+            "horizontal_aperture": camera.horizontal_aperture,
+            "vertical_aperture": camera.vertical_aperture,
+        }
+        try:
+            self._call(mcp, "isaac.create_camera", arguments)
+        except HostedDroidError as exc:
+            if not _is_legacy_camera_contract_failure(exc):
+                raise
+        else:
+            self._configure_camera_image_contract(mcp, camera)
+            return
+        self._configure_legacy_camera(mcp, camera)
+        self._call(
+            mcp,
+            "isaac.create_camera",
+            {
+                "prim_path": camera.prim_path,
+                "resolution": list(resolution),
+            },
+        )
+
+    def _configure_camera_image_contract(
+        self,
+        mcp: MCPClient,
+        camera: CameraSpec,
+    ) -> None:
+        prim_path = json.dumps(camera.prim_path)
+        projection = json.dumps(camera.projection)
+        code = f"""
+import omni.usd
+from pxr import UsdGeom, Vt
+
+stage = omni.usd.get_context().get_stage()
+camera = UsdGeom.Camera.Get(stage, {prim_path})
+if not camera or not camera.GetPrim().IsValid():
+    raise RuntimeError("camera prim is missing after creation")
+camera.GetProjectionAttr().Set({projection})
+camera.GetHorizontalApertureOffsetAttr().Set({camera.horizontal_aperture_offset})
+camera.GetVerticalApertureOffsetAttr().Set({camera.vertical_aperture_offset})
+camera.GetFStopAttr().Set({camera.f_stop})
+camera.GetClippingPlanesAttr().Set(Vt.Vec4fArray())
+print({{"status": "success", "prim_path": {prim_path}}})
+"""
+        self._call(mcp, "isaac.execute_script", {"code": code})
 
     def _retire_previous_cameras(self, mcp: MCPClient) -> None:
         current_paths = {camera.prim_path for camera in self.config.cameras}
@@ -2761,13 +2921,249 @@ print({{"status": "success", "active_camera": str(viewport.camera_path)}})
 """
         self._call(mcp, "isaac.execute_script", {"code": code})
 
+    def _validate_policy_cameras(self, mcp: MCPClient) -> None:
+        expected = [
+            {
+                "role": camera.role,
+                "prim_path": camera.prim_path,
+                "transform_space": (
+                    "world" if camera.role.startswith("exterior_") else "local"
+                ),
+                "position": list(camera.position),
+                "orientation_wxyz": list(camera.orientation_wxyz),
+                "focal_length": camera.focal_length,
+                "clipping_range": list(camera.clipping_range),
+                "focus_distance": camera.focus_distance,
+                "horizontal_aperture": camera.horizontal_aperture,
+                "vertical_aperture": camera.vertical_aperture,
+                "projection": camera.projection,
+                "horizontal_aperture_offset": camera.horizontal_aperture_offset,
+                "vertical_aperture_offset": camera.vertical_aperture_offset,
+                "f_stop": camera.f_stop,
+            }
+            for camera in self.config.cameras
+        ]
+        prefix = json.dumps(_CAMERA_CALIBRATION_STDOUT_PREFIX)
+        code = f"""
+import json
+import math
+import omni.usd
+from pxr import Gf, UsdGeom
+
+stage = omni.usd.get_context().get_stage()
+expected = {json.dumps(expected, sort_keys=True)}
+position_tolerance = {_CAMERA_POSITION_TOLERANCE_METERS}
+orientation_tolerance = {_CAMERA_ORIENTATION_ALIGNMENT_TOLERANCE}
+optics_tolerance = {_CAMERA_OPTICS_TOLERANCE}
+camera_results = []
+xform_cache = UsdGeom.XformCache()
+
+for spec in expected:
+    path = spec["prim_path"]
+    try:
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid() or not prim.IsA(UsdGeom.Camera):
+            raise RuntimeError("camera prim is missing or has the wrong type")
+        if spec["transform_space"] == "world":
+            matrix = xform_cache.GetLocalToWorldTransform(prim)
+        else:
+            matrix = UsdGeom.Xformable(prim).GetLocalTransformation()
+        transform = Gf.Transform(matrix)
+        translation = transform.GetTranslation()
+        scale = transform.GetScale()
+        quaternion = transform.GetRotation().GetQuat()
+        imaginary = quaternion.GetImaginary()
+        actual_orientation = [
+            float(quaternion.GetReal()),
+            float(imaginary[0]),
+            float(imaginary[1]),
+            float(imaginary[2]),
+        ]
+        expected_orientation = spec["orientation_wxyz"]
+        actual_norm = math.sqrt(sum(value * value for value in actual_orientation))
+        expected_norm = math.sqrt(
+            sum(value * value for value in expected_orientation)
+        )
+        if (
+            not math.isfinite(actual_norm)
+            or not math.isfinite(expected_norm)
+            or actual_norm <= 1e-12
+            or expected_norm <= 1e-12
+        ):
+            raise RuntimeError("camera orientation is non-finite or zero")
+        orientation_alignment = abs(
+            sum(
+                actual * wanted
+                for actual, wanted in zip(
+                    actual_orientation,
+                    expected_orientation,
+                )
+            )
+            / (actual_norm * expected_norm)
+        )
+        position_error = math.sqrt(
+            sum(
+                (float(translation[index]) - spec["position"][index]) ** 2
+                for index in range(3)
+            )
+        )
+
+        camera = UsdGeom.Camera(prim)
+        clipping = camera.GetClippingRangeAttr().Get()
+        actual_optics = {{
+            "focal_length": float(camera.GetFocalLengthAttr().Get()),
+            "focus_distance": float(camera.GetFocusDistanceAttr().Get()),
+            "horizontal_aperture": float(
+                camera.GetHorizontalApertureAttr().Get()
+            ),
+            "vertical_aperture": float(camera.GetVerticalApertureAttr().Get()),
+            "horizontal_aperture_offset": float(
+                camera.GetHorizontalApertureOffsetAttr().Get()
+            ),
+            "vertical_aperture_offset": float(
+                camera.GetVerticalApertureOffsetAttr().Get()
+            ),
+            "f_stop": float(camera.GetFStopAttr().Get()),
+            "clipping_range": [float(clipping[0]), float(clipping[1])],
+        }}
+        optics_errors = [
+            abs(actual_optics[name] - spec[name])
+            for name in (
+                "focal_length",
+                "focus_distance",
+                "horizontal_aperture",
+                "vertical_aperture",
+                "horizontal_aperture_offset",
+                "vertical_aperture_offset",
+                "f_stop",
+            )
+        ]
+        optics_errors.extend(
+            abs(actual_optics["clipping_range"][index] - spec["clipping_range"][index])
+            for index in range(2)
+        )
+        maximum_optics_error = max(optics_errors)
+        scale_error = max(abs(float(value) - 1.0) for value in scale)
+        projection = str(camera.GetProjectionAttr().Get())
+        clipping_planes = camera.GetClippingPlanesAttr().Get()
+        clipping_plane_count = len(clipping_planes) if clipping_planes is not None else 0
+        metrics = (
+            position_error,
+            orientation_alignment,
+            maximum_optics_error,
+            scale_error,
+        )
+        issues = []
+        if not all(math.isfinite(value) for value in metrics):
+            issues.append("non_finite")
+        if position_error > position_tolerance:
+            issues.append("position")
+        if 1.0 - min(1.0, orientation_alignment) > orientation_tolerance:
+            issues.append("orientation")
+        if maximum_optics_error > optics_tolerance:
+            issues.append("optics")
+        if scale_error > optics_tolerance:
+            issues.append("scale")
+        if projection != spec["projection"]:
+            issues.append("projection")
+        if clipping_plane_count != 0:
+            issues.append("clipping_planes")
+        camera_results.append({{
+            "role": spec["role"],
+            "prim_path": path,
+            "transform_space": spec["transform_space"],
+            "valid": not issues,
+            "issues": issues,
+            "position_error_meters": position_error,
+            "orientation_alignment": orientation_alignment,
+            "maximum_optics_error": maximum_optics_error,
+            "scale_error": scale_error,
+            "projection": projection,
+            "clipping_plane_count": clipping_plane_count,
+        }})
+    except Exception as error:
+        camera_results.append({{
+            "prim_path": path,
+            "valid": False,
+            "issues": ["unreadable"],
+            "error": str(error),
+        }})
+
+payload = {{
+    "schema_version": 2,
+    "valid": all(result["valid"] for result in camera_results),
+    "cameras": camera_results,
+}}
+print({prefix} + json.dumps(payload, sort_keys=True))
+"""
+        response = self._call(mcp, "isaac.execute_script", {"code": code})
+        stdout = response.get("stdout")
+        if not isinstance(stdout, str):
+            raise HostedDroidError(
+                "isaac.execute_script did not return camera calibration stdout"
+            )
+        encoded = next(
+            (
+                line.removeprefix(_CAMERA_CALIBRATION_STDOUT_PREFIX)
+                for line in reversed(stdout.splitlines())
+                if line.startswith(_CAMERA_CALIBRATION_STDOUT_PREFIX)
+            ),
+            None,
+        )
+        if encoded is None:
+            raise HostedDroidError(
+                "isaac.execute_script did not emit the camera calibration marker"
+            )
+        try:
+            payload = json.loads(encoded)
+        except json.JSONDecodeError as exc:
+            raise HostedDroidError(
+                "Isaac emitted invalid camera calibration JSON"
+            ) from exc
+        cameras = payload.get("cameras") if isinstance(payload, Mapping) else None
+        expected_contract = {
+            (
+                camera.prim_path,
+                camera.role,
+                "world" if camera.role.startswith("exterior_") else "local",
+            )
+            for camera in self.config.cameras
+        }
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema_version") != 2
+            or not isinstance(cameras, list)
+            or len(cameras) != len(expected_contract)
+            or not all(isinstance(camera, Mapping) for camera in cameras)
+            or {
+                (
+                    camera.get("prim_path"),
+                    camera.get("role"),
+                    camera.get("transform_space"),
+                )
+                for camera in cameras
+            }
+            != expected_contract
+        ):
+            raise HostedDroidError("Isaac emitted an incomplete camera calibration")
+        invalid = [camera for camera in cameras if camera.get("valid") is not True]
+        if payload.get("valid") is not True or invalid:
+            details = "; ".join(
+                f"{camera.get('prim_path')}: {camera.get('issues')}"
+                for camera in invalid
+            )
+            raise HostedDroidError(
+                "DROID policy camera calibration drifted before sampling: " + details
+            )
+
     def _configure_legacy_camera(self, mcp: MCPClient, camera: CameraSpec) -> None:
         position = json.dumps(list(camera.position))
         orientation = json.dumps(list(camera.orientation_wxyz))
         prim_path = json.dumps(camera.prim_path)
+        projection = json.dumps(camera.projection)
         code = f"""
 import omni.usd
-from pxr import Gf, UsdGeom
+from pxr import Gf, UsdGeom, Vt
 
 stage = omni.usd.get_context().get_stage()
 camera = UsdGeom.Camera.Define(stage, {prim_path})
@@ -2789,6 +3185,11 @@ camera.GetClippingRangeAttr().Set(
 camera.GetFocusDistanceAttr().Set({camera.focus_distance})
 camera.GetHorizontalApertureAttr().Set({camera.horizontal_aperture})
 camera.GetVerticalApertureAttr().Set({camera.vertical_aperture})
+camera.GetProjectionAttr().Set({projection})
+camera.GetHorizontalApertureOffsetAttr().Set({camera.horizontal_aperture_offset})
+camera.GetVerticalApertureOffsetAttr().Set({camera.vertical_aperture_offset})
+camera.GetFStopAttr().Set({camera.f_stop})
+camera.GetClippingPlanesAttr().Set(Vt.Vec4fArray())
 print({{"status": "success", "prim_path": {prim_path}}})
 """
         self._call(mcp, "isaac.execute_script", {"code": code})
@@ -2833,6 +3234,7 @@ print({{"status": "success", "prim_path": {prim_path}}})
         samples = 0
         action_steps = 0
         tracker: _DroidTaskSuccessTracker | None = None
+        terminal_failure_reason: str | None = None
         if self.config.task_success is not None:
             initial_state = self._capture_task_state(mcp, self.config.task_success)
             tracker = _DroidTaskSuccessTracker(
@@ -2932,7 +3334,10 @@ print({{"status": "success", "prim_path": {prim_path}}})
                             state=task_state,
                             evaluation=task_evaluation,
                         )
-                    should_stop = bool(task_evaluation["success"])
+                    terminal_failure_reason = tracker.terminal_failure_reason()
+                    should_stop = bool(task_evaluation["success"]) or (
+                        terminal_failure_reason is not None
+                    )
                 action_steps += 1
                 if should_stop:
                     break
@@ -2959,7 +3364,8 @@ print({{"status": "success", "prim_path": {prim_path}}})
             task_success_reason=(
                 "physically_credible_policy_placement_proven"
                 if task_success
-                else "max_action_steps_reached_without_valid_placement"
+                else terminal_failure_reason
+                or "max_action_steps_reached_without_valid_placement"
             ),
         )
 
@@ -3116,6 +3522,7 @@ print({prefix} + json.dumps(payload, sort_keys=True))
         sample_index: int,
         evidence: _EvidenceRecorder | None = None,
     ) -> DroidObservation:
+        self._validate_policy_cameras(mcp)
         images = [
             self._capture_rgb(
                 mcp,
@@ -3126,6 +3533,7 @@ print({prefix} + json.dumps(payload, sort_keys=True))
             )
             for camera_index, camera in enumerate(self.config.cameras)
         ]
+        self._validate_policy_cameras(mcp)
         arm_positions, gripper = self._joint_state(mcp, joint_indices)
         return DroidObservation(
             exterior_image_1_left=images[0],
@@ -3538,6 +3946,11 @@ def _is_retryable_mcp_failure(name: str, exc: HostedDroidError) -> bool:
     )
 
 
+def _is_legacy_camera_contract_failure(exc: HostedDroidError) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _LEGACY_CAMERA_CONTRACT_MARKERS)
+
+
 def _is_transport_failure(exc: HostedDroidError) -> bool:
     return any(marker in str(exc) for marker in _TRANSIENT_TRANSPORT_FAILURE_MARKERS)
 
@@ -3632,9 +4045,19 @@ def _validate_policy_response(
     if base_model != "pi0-droid":
         return
     metadata = _response_field(response, "policy_metadata")
-    if not isinstance(metadata, Mapping) or dict(metadata) != _PI0_DROID_POLICY_PROFILE:
+    mismatched_profile_keys = (
+        sorted(_PI0_DROID_POLICY_PROFILE)
+        if not isinstance(metadata, Mapping)
+        else sorted(
+            key
+            for key, expected in _PI0_DROID_POLICY_PROFILE.items()
+            if metadata.get(key) != expected
+        )
+    )
+    if mismatched_profile_keys:
         raise HostedDroidError(
-            "pi0-droid response did not prove the pinned joint-position policy profile"
+            "pi0-droid response did not prove the pinned joint-position policy "
+            f"profile; mismatched keys: {mismatched_profile_keys}"
         )
     if action_chunk.shape != (10, 8):
         raise HostedDroidError(
