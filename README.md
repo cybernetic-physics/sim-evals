@@ -217,7 +217,7 @@ atomic step as each policy action: left finger/cube, right finger/cube, and
 cube/receptacle. A lift requires bilateral finger support at the end of the
 action. Placement requires receptacle support, and a support loss greater than
 1 cm while the close command remains active permanently invalidates the run.
-The provisional scene-1 penetration ceiling is 2 mm; exceeding it, filling a
+The provisional scene-1 penetration ceiling is 1 mm; exceeding it, filling a
 contact buffer, dropping a pair, emitting non-finite data, or omitting any
 update fails closed. This is an evaluator guardrail, not a calibrated
 real-hardware tolerance. Replace it only after paired collision-geometry and
