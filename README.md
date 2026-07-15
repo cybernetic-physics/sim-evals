@@ -330,11 +330,14 @@ the absence of custom clipping planes must all match and remain finite. Missing
 or drifted calibration fails before inference rather than feeding a visually
 plausible wrong view to the policy.
 Explicit pre-dispatch `BRIDGE_OFFLINE` and `ISAAC_UNREACHABLE` responses are
-retried with the configured readiness poll interval. Other command failures are
-not replayed, so ambiguous or application-level errors still fail closed. An
-HTTP 502 is replayed only for absolute `isaac.set_joint_positions` targets,
-where sending the identical target again is idempotent; non-idempotent simulation
-steps still fail closed on transport ambiguity.
+retried with the configured readiness poll interval. Control-plane DNS and
+connection failures reported before MCP bridge dispatch receive the same
+bounded retry window, so an API container replacement does not discard a live
+episode. Other command failures are not replayed, so ambiguous or
+application-level errors still fail closed. An HTTP 502 is replayed only for
+absolute `isaac.set_joint_positions` targets, where sending the identical
+target again is idempotent; non-idempotent simulation steps still fail closed
+on transport ambiguity.
 An action is appended to evidence only after `step_simulation` reports the full
 requested frame count without `timed_out`; partial steps remain failure evidence,
 not acknowledged actions. Before creating a fresh camera generation, the runner
