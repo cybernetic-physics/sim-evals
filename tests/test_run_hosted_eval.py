@@ -338,8 +338,29 @@ class HostedEvalParserTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text())
             manifest["terminal_record"] = "error.json"
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "terminal record is missing"):
+            with self.assertRaisesRegex(ValueError, "exactly one terminal record"):
                 _RecordedPi0Replay.load(source)
+
+    def test_manifest_rejects_dual_terminal_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            _write_replay_evidence(source, applied_action_steps=1)
+            (source / "error.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 9,
+                        "status": "failed",
+                        "execution_status": "failed",
+                        "task_status": "not_evaluated",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "manifest.*inventory"):
+                _RecordedPi0Replay.load(source)
+            with self.assertRaisesRegex(HostedDroidError, "exactly one"):
+                _refresh_manifest(source)
 
     def test_recorded_sampler_rejects_runtime_action_cadence_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
