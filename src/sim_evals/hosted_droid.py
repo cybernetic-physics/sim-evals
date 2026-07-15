@@ -3637,8 +3637,21 @@ for spec in expected:
             "f_stop": float(camera.GetFStopAttr().Get()),
             "clipping_range": [float(clipping[0]), float(clipping[1])],
         }}
-        optics_errors = [
-            abs(actual_optics[name] - spec[name])
+        expected_optics = {{
+            name: spec[name]
+            for name in (
+                "focal_length",
+                "focus_distance",
+                "horizontal_aperture",
+                "vertical_aperture",
+                "horizontal_aperture_offset",
+                "vertical_aperture_offset",
+                "f_stop",
+                "clipping_range",
+            )
+        }}
+        optics_error_by_field = {{
+            name: abs(actual_optics[name] - expected_optics[name])
             for name in (
                 "focal_length",
                 "focus_distance",
@@ -3648,12 +3661,14 @@ for spec in expected:
                 "vertical_aperture_offset",
                 "f_stop",
             )
-        ]
-        optics_errors.extend(
-            abs(actual_optics["clipping_range"][index] - spec["clipping_range"][index])
-            for index in range(2)
+        }}
+        optics_error_by_field["clipping_range_near"] = abs(
+            actual_optics["clipping_range"][0] - expected_optics["clipping_range"][0]
         )
-        maximum_optics_error = max(optics_errors)
+        optics_error_by_field["clipping_range_far"] = abs(
+            actual_optics["clipping_range"][1] - expected_optics["clipping_range"][1]
+        )
+        maximum_optics_error = max(optics_error_by_field.values())
         scale_error = max(abs(float(value) - 1.0) for value in scale)
         projection = str(camera.GetProjectionAttr().Get())
         clipping_planes = camera.GetClippingPlanesAttr().Get()
@@ -3688,6 +3703,9 @@ for spec in expected:
             "position_error_meters": position_error,
             "orientation_alignment": orientation_alignment,
             "maximum_optics_error": maximum_optics_error,
+            "optics_error_by_field": optics_error_by_field,
+            "actual_optics": actual_optics,
+            "expected_optics": expected_optics,
             "scale_error": scale_error,
             "projection": projection,
             "clipping_plane_count": clipping_plane_count,
@@ -3760,7 +3778,17 @@ print({prefix} + json.dumps(payload, sort_keys=True))
         invalid = [camera for camera in cameras if camera.get("valid") is not True]
         if payload.get("valid") is not True or invalid:
             details = "; ".join(
-                f"{camera.get('prim_path')}: {camera.get('issues')}"
+                f"{camera.get('prim_path')}: "
+                + json.dumps(
+                    {
+                        "issues": camera.get("issues"),
+                        "maximum_optics_error": camera.get("maximum_optics_error"),
+                        "optics_error_by_field": camera.get("optics_error_by_field"),
+                        "actual_optics": camera.get("actual_optics"),
+                        "expected_optics": camera.get("expected_optics"),
+                    },
+                    sort_keys=True,
+                )
                 for camera in invalid
             )
             raise HostedDroidError(
