@@ -125,11 +125,13 @@ planes:
 
 Before sampling, the hosted runner inventories the robot's joints through a
 USD-only script that cannot initialize an articulation or physics world. It then
-applies the benchmark's `NVIDIA_DROID` physics profile to the cold robot USD:
+stops the timeline, applies the benchmark's `NVIDIA_DROID` physics profile:
 `400/80` arm drive gains, Panda effort and velocity limits, a 1 rad/s gripper
 limit, 64/0 articulation solver iterations, disabled rigid-body gravity, 5 m/s
-maximum depenetration velocity, 120 Hz physics, and scene CCD. The first exact
-frame initializes physics only after that profile is complete. The runner also
+maximum depenetration velocity, 120 Hz physics, and scene CCD. The physics
+context is explicitly reinitialized after that profile is complete, so later
+tensor views cannot retain stale link metadata. The first exact frame then
+commits the new context before the runtime-only joint read. The runner also
 restores the benchmark arm pose with an open gripper. Fixed play-every-frame
 timeline settings and a matching 120 Hz minimum simulation rate make each app
 update one physics substep. Policy actions use an atomic eight-substep MCP call

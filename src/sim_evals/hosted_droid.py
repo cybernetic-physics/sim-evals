@@ -1261,7 +1261,6 @@ class HostedDroidRunner:
                     self._wait_for_isaac(mcp)
                     repaired_robot = self._ensure_robot(mcp)
                     self._configure_robot_dynamics(mcp)
-                    self._step_while_playing(mcp, num_steps=1)
                     self._retire_previous_cameras(mcp)
                     created_cameras = self._ensure_cameras(mcp)
                     self._set_viewer_camera(mcp, created_cameras[0])
@@ -1503,12 +1502,16 @@ print({prefix} + json.dumps(payload, sort_keys=True))
         code = f"""
 import carb
 import json
+import omni.kit.app
 import omni.timeline
 import omni.usd
+from isaacsim.core.simulation_manager import SimulationManager
 from pxr import PhysxSchema, Usd, UsdPhysics
 
 stage = omni.usd.get_context().get_stage()
 timeline = omni.timeline.get_timeline_interface()
+timeline.pause()
+timeline.commit()
 settings = carb.settings.get_settings()
 settings.set("/app/player/useFixedTimeStepping", True)
 settings.set("/app/player/CompensatePlayDelayInSecs", 0.0)
@@ -1582,6 +1585,37 @@ for prim in stage.Traverse():
 if physics_scenes < 1:
     raise RuntimeError("DROID dynamics profile found no physics scene")
 
+app = omni.kit.app.get_app()
+old_physics_view = SimulationManager.get_physics_sim_view()
+if timeline.is_stopped():
+    timeline.play()
+    timeline.commit()
+timeline.stop()
+timeline.commit()
+app.update()
+if SimulationManager.get_physics_sim_view() is not None:
+    raise RuntimeError("DROID hard stop did not invalidate the physics tensor view")
+
+timeline.play()
+timeline.commit()
+app.update()
+new_physics_view = SimulationManager.get_physics_sim_view()
+if new_physics_view is None or new_physics_view is old_physics_view:
+    raise RuntimeError("DROID physics tensor view was not rebuilt from final USD")
+articulation_view = new_physics_view.create_articulation_view([robot_path])
+if (
+    articulation_view is None
+    or not articulation_view.check()
+    or articulation_view.count != 1
+    or list(articulation_view.prim_paths) != [robot_path]
+    or articulation_view.shared_metatype is None
+):
+    raise RuntimeError("DROID articulation metadata unavailable after physics rebuild")
+timeline.pause()
+timeline.commit()
+if timeline.is_playing() or timeline.is_stopped():
+    raise RuntimeError("DROID physics rebuild did not finish paused")
+
 print(json.dumps({{
     "status": "success",
     "profile": "{_DROID_DYNAMICS_PROFILE}",
@@ -1594,6 +1628,9 @@ print(json.dumps({{
     "articulation_roots": articulation_roots,
     "rigid_bodies": rigid_bodies,
     "physics_scenes": physics_scenes,
+    "physics_context_reinitialized": True,
+    "physics_view_replaced": True,
+    "timeline_state": "paused",
 }}, sort_keys=True))
 """
         self._call(mcp, "isaac.execute_script", {"code": code})
