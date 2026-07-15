@@ -1404,7 +1404,7 @@ def _artifact_inventory(results_dir: Path) -> dict[str, dict[str, Any]]:
     return files
 
 
-def _producer_provenance() -> dict[str, Any]:
+def _runtime_provenance() -> dict[str, Any]:
     repository_root = Path(__file__).resolve().parents[2]
     revision = os.environ.get("SIM_EVALS_REVISION")
     if revision is None:
@@ -1425,10 +1425,117 @@ def _producer_provenance() -> dict[str, Any]:
         except importlib_metadata.PackageNotFoundError:
             return None
 
-    return {
-        "sim_evals_revision": revision,
+    provenance = {
         "sim_evals_version": package_version("sim-evals"),
         "cybernetics_sdk_version": package_version("cybernetic-physics"),
+    }
+    if revision:
+        return {
+            "status": "known",
+            "sim_evals_revision": revision,
+            **provenance,
+        }
+    return {
+        "status": "unknown",
+        "reason": "runtime did not expose a sim-evals revision",
+        **provenance,
+    }
+
+
+def _unknown_artifact_provenance(reason: str) -> dict[str, str]:
+    return {"status": "unknown", "reason": reason}
+
+
+def _validate_manifest_provenance(value: object, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise HostedDroidError(f"hosted evidence {name} provenance is invalid")
+    status = value.get("status")
+    if status == "known":
+        revision = value.get("sim_evals_revision")
+        if not isinstance(revision, str) or not revision.strip():
+            raise HostedDroidError(
+                f"hosted evidence {name} provenance requires a revision"
+            )
+        for key in ("sim_evals_version", "cybernetics_sdk_version"):
+            version = value.get(key)
+            if version is not None and not isinstance(version, str):
+                raise HostedDroidError(
+                    f"hosted evidence {name} provenance has invalid {key}"
+                )
+    elif status == "unknown":
+        if not isinstance(value.get("reason"), str) or not value["reason"].strip():
+            raise HostedDroidError(
+                f"hosted evidence {name} provenance requires an unknown reason"
+            )
+    else:
+        raise HostedDroidError(f"hosted evidence {name} provenance has invalid status")
+    return cast(dict[str, Any], value)
+
+
+def _manifest_identity(
+    *,
+    terminal_record: str,
+    terminal_semantics: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+    files: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": _EVIDENCE_SCHEMA_VERSION,
+        "terminal_record": terminal_record,
+        "terminal_semantics": terminal_semantics,
+        "provenance": provenance,
+        "files": files,
+    }
+
+
+def _manifest_identity_sha256(identity: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _terminal_evidence_semantics(root: Path, terminal_record: str) -> dict[str, str]:
+    try:
+        payload = json.loads((root / terminal_record).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise HostedDroidError("hosted evidence terminal record is invalid") from exc
+    schema_version = (
+        payload.get("schema_version") if isinstance(payload, dict) else None
+    )
+    if (
+        not isinstance(payload, dict)
+        or type(schema_version) is not int
+        or schema_version < 1
+        or schema_version > _EVIDENCE_SCHEMA_VERSION
+    ):
+        raise HostedDroidError("hosted evidence terminal record has an invalid schema")
+    if terminal_record == "result.json":
+        result = payload.get("result")
+        if payload.get("status") != "succeeded" or not isinstance(result, dict):
+            raise HostedDroidError("hosted result terminal semantics are invalid")
+        predicate = result.get("task_success_predicate")
+        task_success = result.get("task_success")
+        if predicate is None and task_success is None:
+            expected_task_status = "not_evaluated"
+        elif isinstance(predicate, str) and type(task_success) is bool:
+            expected_task_status = "passed" if task_success else "failed"
+        else:
+            raise HostedDroidError("hosted result task semantics are invalid")
+        execution_status = payload.get("execution_status", "completed")
+        task_status = payload.get("task_status", expected_task_status)
+        if execution_status != "completed" or task_status != expected_task_status:
+            raise HostedDroidError("hosted result statuses are internally inconsistent")
+    else:
+        if payload.get("status") != "failed":
+            raise HostedDroidError("hosted error terminal semantics are invalid")
+        execution_status = payload.get("execution_status", "failed")
+        task_status = payload.get("task_status", "not_evaluated")
+        if execution_status != "failed" or task_status != "not_evaluated":
+            raise HostedDroidError("hosted error statuses are internally inconsistent")
+    return {
+        "legacy_status": cast(str, payload["status"]),
+        "execution_status": cast(str, execution_status),
+        "task_status": cast(str, task_status),
     }
 
 
@@ -1436,6 +1543,7 @@ def finalize_hosted_evidence_manifest(
     results_dir: Path,
     *,
     terminal_record: str | None = None,
+    artifact_producer: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the manifest last so every durable artifact is hash-bound."""
 
@@ -1449,17 +1557,33 @@ def finalize_hosted_evidence_manifest(
         raise HostedDroidError(
             f"hosted evidence terminal record is missing: {terminal_record}"
         )
+    if terminal_record not in {"result.json", "error.json"}:
+        raise HostedDroidError("hosted evidence requires one terminal record")
     files = _artifact_inventory(root)
-    aggregate = hashlib.sha256(
-        json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    provenance = {
+        "artifact_producer": _validate_manifest_provenance(
+            artifact_producer
+            or _unknown_artifact_provenance(
+                "historical finalization did not identify the artifact producer"
+            ),
+            "artifact producer",
+        ),
+        "manifest_writer": _validate_manifest_provenance(
+            _runtime_provenance(),
+            "manifest writer",
+        ),
+    }
+    terminal_semantics = _terminal_evidence_semantics(root, terminal_record)
+    identity = _manifest_identity(
+        terminal_record=terminal_record,
+        terminal_semantics=terminal_semantics,
+        provenance=provenance,
+        files=files,
+    )
     manifest = {
-        "schema_version": _EVIDENCE_SCHEMA_VERSION,
+        **identity,
         "created_at": _utc_now(),
-        "terminal_record": terminal_record,
-        "aggregate_sha256": aggregate,
-        "producer": _producer_provenance(),
-        "files": files,
+        "aggregate_sha256": _manifest_identity_sha256(identity),
     }
     _atomic_write(
         root / _EVIDENCE_MANIFEST_NAME,
@@ -1484,16 +1608,38 @@ def verify_hosted_evidence_manifest(results_dir: Path) -> dict[str, Any]:
         or manifest.get("schema_version") != _EVIDENCE_SCHEMA_VERSION
         or not isinstance(manifest.get("files"), dict)
         or not isinstance(manifest.get("aggregate_sha256"), str)
+        or manifest.get("terminal_record") not in {"result.json", "error.json"}
+        or not isinstance(manifest.get("terminal_semantics"), dict)
+        or not isinstance(manifest.get("provenance"), dict)
     ):
         raise HostedDroidError("hosted evidence manifest has an invalid schema")
+    provenance = cast(dict[str, Any], manifest["provenance"])
+    _validate_manifest_provenance(
+        provenance.get("artifact_producer"),
+        "artifact producer",
+    )
+    _validate_manifest_provenance(
+        provenance.get("manifest_writer"),
+        "manifest writer",
+    )
     files = _artifact_inventory(root)
     if manifest["files"] != files:
         raise HostedDroidError("hosted evidence manifest file inventory mismatch")
-    aggregate = hashlib.sha256(
-        json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    terminal_record = cast(str, manifest["terminal_record"])
+    if terminal_record not in files:
+        raise HostedDroidError("hosted evidence manifest terminal record is missing")
+    terminal_semantics = _terminal_evidence_semantics(root, terminal_record)
+    if manifest["terminal_semantics"] != terminal_semantics:
+        raise HostedDroidError("hosted evidence terminal semantics mismatch")
+    identity = _manifest_identity(
+        terminal_record=terminal_record,
+        terminal_semantics=terminal_semantics,
+        provenance=provenance,
+        files=files,
+    )
+    aggregate = _manifest_identity_sha256(identity)
     if manifest["aggregate_sha256"] != aggregate:
-        raise HostedDroidError("hosted evidence manifest aggregate mismatch")
+        raise HostedDroidError("hosted evidence manifest identity mismatch")
     return manifest
 
 
@@ -1514,6 +1660,7 @@ class _EvidenceRecorder:
         self._action_record_count = 0
         self._task_state_record_count = 0
         self.started_at = _utc_now()
+        self._artifact_producer = _runtime_provenance()
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.frames_dir.mkdir(parents=True, exist_ok=True)
         self.samples_dir.mkdir(parents=True, exist_ok=True)
@@ -1747,6 +1894,7 @@ class _EvidenceRecorder:
         finalize_hosted_evidence_manifest(
             self.results_dir,
             terminal_record="result.json",
+            artifact_producer=self._artifact_producer,
         )
 
     def write_error(
@@ -1760,7 +1908,7 @@ class _EvidenceRecorder:
             "schema_version": _EVIDENCE_SCHEMA_VERSION,
             "status": "failed",
             "execution_status": "failed",
-            "task_status": "not_completed",
+            "task_status": "not_evaluated",
             "started_at": self.started_at,
             "finished_at": _utc_now(),
             "error": {
@@ -1777,6 +1925,7 @@ class _EvidenceRecorder:
         finalize_hosted_evidence_manifest(
             self.results_dir,
             terminal_record="error.json",
+            artifact_producer=self._artifact_producer,
         )
 
     def _clear_previous_evidence(self) -> None:
@@ -1890,11 +2039,107 @@ _INITIAL_ARM_MOTION_TOLERANCE_RADIANS = 0.005
 _INITIAL_GRIPPER_TOLERANCE = 0.1
 _REPLAY_INITIAL_ARM_TOLERANCE_RADIANS = 0.005
 _REPLAY_INITIAL_GRIPPER_TOLERANCE = 0.01
+_REPLAY_INITIAL_TASK_GEOMETRY_TOLERANCE_METERS = 0.001
+_REPLAY_INITIAL_TASK_VELOCITY_TOLERANCE = 0.01
 _MIN_LUMINANCE_P99 = 12.0
 _MIN_LUMINANCE_STDDEV = 2.0
 _MIN_NON_DARK_FRACTION = 0.01
 _MIN_NON_WHITE_FRACTION = 0.02
 _NON_WHITE_LUMINANCE_CUTOFF = 245.0
+
+_REPLAY_TASK_GEOMETRY_PATHS = (
+    ("object_bounds", "center"),
+    ("object_bounds", "minimum"),
+    ("object_bounds", "maximum"),
+    ("object_bounds", "size"),
+    ("receptacle_bounds", "center"),
+    ("receptacle_bounds", "minimum"),
+    ("receptacle_bounds", "maximum"),
+    ("receptacle_bounds", "size"),
+    ("object_runtime_position",),
+    ("gripper_reference_position",),
+)
+_REPLAY_TASK_VELOCITY_PATHS = (
+    ("object_linear_velocity",),
+    ("object_angular_velocity",),
+    ("receptacle_linear_velocity",),
+    ("receptacle_angular_velocity",),
+)
+
+
+def _replay_task_state_vectors(
+    value: object,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], str]:
+    if not isinstance(value, Mapping):
+        raise ValueError("recorded replay initial task state must be an object")
+
+    def vector(path: tuple[str, ...]) -> np.ndarray:
+        current: object = value
+        for key in path:
+            if not isinstance(current, Mapping) or key not in current:
+                raise ValueError(
+                    "recorded replay initial task state is missing " + ".".join(path)
+                )
+            current = current[key]
+        try:
+            array = np.asarray(current, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "recorded replay initial task state has invalid " + ".".join(path)
+            ) from exc
+        if array.shape != (3,) or not np.isfinite(array).all():
+            raise ValueError(
+                "recorded replay initial task state has invalid " + ".".join(path)
+            )
+        return array
+
+    geometry = {".".join(path): vector(path) for path in _REPLAY_TASK_GEOMETRY_PATHS}
+    velocity = {".".join(path): vector(path) for path in _REPLAY_TASK_VELOCITY_PATHS}
+    velocity_source = value.get("velocity_source")
+    if not isinstance(velocity_source, str) or not velocity_source:
+        raise ValueError("recorded replay initial task state lacks velocity provenance")
+    return geometry, velocity, velocity_source
+
+
+def _compare_replay_task_states(
+    source: object,
+    current: object,
+) -> dict[str, Any]:
+    source_geometry, source_velocity, source_velocity_kind = _replay_task_state_vectors(
+        source
+    )
+    current_geometry, current_velocity, current_velocity_kind = (
+        _replay_task_state_vectors(current)
+    )
+    if source_velocity_kind != current_velocity_kind:
+        raise ValueError("recorded replay initial task velocity provenance changed")
+    geometry_delta = max(
+        float(np.max(np.abs(current_geometry[key] - source_geometry[key])))
+        for key in source_geometry
+    )
+    velocity_delta = max(
+        float(np.max(np.abs(current_velocity[key] - source_velocity[key])))
+        for key in source_velocity
+    )
+    if geometry_delta > _REPLAY_INITIAL_TASK_GEOMETRY_TOLERANCE_METERS:
+        raise ValueError(
+            "recorded replay initial task geometry differs from its source: "
+            f"maximum_delta={geometry_delta:.9f} m"
+        )
+    if velocity_delta > _REPLAY_INITIAL_TASK_VELOCITY_TOLERANCE:
+        raise ValueError(
+            "recorded replay initial task velocity differs from its source: "
+            f"maximum_delta={velocity_delta:.9f}"
+        )
+    return {
+        "source_velocity_provenance": source_velocity_kind,
+        "maximum_geometry_delta_meters": geometry_delta,
+        "maximum_velocity_delta": velocity_delta,
+        "maximum_allowed_geometry_delta_meters": (
+            _REPLAY_INITIAL_TASK_GEOMETRY_TOLERANCE_METERS
+        ),
+        "maximum_allowed_velocity_delta": _REPLAY_INITIAL_TASK_VELOCITY_TOLERANCE,
+    }
 
 
 def _droid_joint_positions_for_policy_action(action: np.ndarray) -> list[float]:
@@ -2075,6 +2320,11 @@ class HostedDroidRunner:
                                         {},
                                     )
                                 ),
+                                "replay_source_artifact_producer": getattr(
+                                    self.sampling_api,
+                                    "source_artifact_producer",
+                                    None,
+                                ),
                                 "replay_initial_state": replay_initial_state,
                                 "robot_dynamics_profile": _DROID_DYNAMICS_PROFILE,
                                 "runtime_dynamics": runtime_dynamics,
@@ -2227,6 +2477,18 @@ class HostedDroidRunner:
             ),
             "maximum_allowed_gripper_delta": _REPLAY_INITIAL_GRIPPER_TOLERANCE,
         }
+
+    def _validate_replay_initial_task_state(
+        self,
+        state: _DroidTaskState,
+    ) -> dict[str, Any] | None:
+        if self.config.action_source != "recorded_replay":
+            return None
+        source = getattr(self.sampling_api, "source_initial_task_state", None)
+        try:
+            return _compare_replay_task_states(source, state.to_dict())
+        except ValueError as exc:
+            raise HostedDroidError(str(exc)) from exc
 
     def _cleanup(
         self,
@@ -3577,16 +3839,24 @@ print({{"status": "success", "prim_path": {prim_path}}})
         terminal_failure_reason: str | None = None
         if self.config.task_success is not None:
             initial_state = self._capture_task_state(mcp, self.config.task_success)
+            replay_task_comparison = self._validate_replay_initial_task_state(
+                initial_state
+            )
             tracker = _DroidTaskSuccessTracker(
                 self.config.task_success,
                 initial_state,
             )
             if evidence is not None:
+                initial_evaluation = tracker.initial_evaluation()
+                if replay_task_comparison is not None:
+                    initial_evaluation["replay_initial_task_state"] = (
+                        replay_task_comparison
+                    )
                 evidence.write_task_state(
                     phase="initial",
                     action_index=None,
                     state=initial_state,
-                    evaluation=tracker.initial_evaluation(),
+                    evaluation=initial_evaluation,
                 )
         should_stop = False
         while action_steps < self.config.max_action_steps:

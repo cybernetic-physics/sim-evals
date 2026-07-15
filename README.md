@@ -242,10 +242,13 @@ python run_hosted_eval.py \
 Replay preflight verifies a manifest-last inventory of every source artifact,
 the schema and producer provenance, PI0 profile, environment, task and camera
 contracts, full sample chunks, sequential sample/chunk mapping, derived runtime
-joint targets, complete task-state coverage, and continuous bounded-drift action
-timing before launching. The fresh runtime must settle within `0.005 rad` per
-arm joint and `0.01` gripper units of the source initial state. Physics rate and
-solver iterations may differ deliberately for a controlled comparison.
+joint targets, complete task-state coverage, source runtime cadence, and
+continuous bounded-drift action timing before launching. The fresh runtime must
+settle within `0.005 rad` per arm joint and `0.01` gripper units of the source
+robot state. Initial cube/bowl bounds, runtime position, and gripper-reference
+geometry must remain within `0.001 m`; initial task velocities must remain within
+`0.01` and retain the same measurement provenance. Physics rate and solver
+iterations may differ deliberately for a controlled comparison.
 
 This is a manifest-bound action-prefix replay under bounded initial-state
 variation, not deterministic episode reproduction. Simulator scheduling,
@@ -465,17 +468,23 @@ Video support is checked before any hosted session work begins. The runner uses
 `ffprobe`, including a complete decode and frame-count validation.
 
 `evidence-manifest.json` is written only after the terminal record and contains
-the byte length and SHA-256 of every other file, an aggregate inventory digest,
-and evaluator/SDK provenance. Verification rejects changed, missing, symlinked,
-or unlisted files. To assign an evidence identity to a completed directory from
-an older runner, finalize it in place after all recovery work is complete:
+the byte length and SHA-256 of every other file. Its aggregate identity also
+binds normalized terminal semantics plus separate artifact-producer and
+manifest-writer revisions. Verification rejects changed, missing, symlinked, or
+unlisted files, status contradictions, and provenance or terminal-record edits.
+Live runs capture their producer automatically. To assign an evidence identity
+to a completed directory from an older runner, finalize it only after all
+recovery work is complete and provide the revision that actually produced it:
 
 ```bash
-python finalize_hosted_evidence.py runs/hosted-production/<RUN_DIRECTORY>
+python finalize_hosted_evidence.py \
+  runs/hosted-production/<RUN_DIRECTORY> \
+  --artifact-revision <PRODUCING_SIM_EVALS_GIT_SHA>
 ```
 
-Running the finalizer again after any mutation creates a new evidence identity;
-retain the prior manifest externally when comparing revisions.
+Omitting `--artifact-revision` marks historical producer provenance as unknown;
+such evidence remains integrity-checkable but is ineligible as a replay source.
+Running the finalizer again after any mutation creates a new evidence identity.
 
 If an older runner completed the policy/simulator loop but failed while encoding
 the MP4, recover the already durable post-action PNGs without moving the robot
