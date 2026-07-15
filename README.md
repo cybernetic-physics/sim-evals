@@ -100,11 +100,11 @@ response = future.result(timeout=2400)
 The observation carries both exterior cameras, the wrist camera, seven arm
 joint positions, one gripper position, and the natural-language instruction.
 The response exposes a robot-space `action_chunk` with shape `[1, N, 8]`. Use an
-eight-action open-loop cadence for DreamZero and ten for the PolaRiS PI0
+eight-action open-loop cadence for both DreamZero and the PolaRiS PI0
 joint-position policy. Each episode gets a fresh sampling session and the
 previous session is cancelled so backend policy state is released.
 
-Hosted evidence schema v7 preserves both the full normalized model output in
+Hosted evidence schema v8 preserves both the full normalized model output in
 `sampled_action_chunk` and the configured open-loop execution slice in
 `action_chunk`. `sampled_action_chunk_shape` records the normalized `[N, 8]`
 shape before horizon or maximum-step truncation.
@@ -138,9 +138,16 @@ update one physics substep. Policy actions use an atomic eight-substep MCP call
 that ends paused and must advance exactly one 15 Hz control interval; timeline
 drift fails the run instead of silently holding targets too long.
 
+The runtime preflight fails closed unless the effective gripper drive remains
+at the benchmark's `100/0.0002/16.5` stiffness, damping, and maximum-force
+values, the resolved finger-pad and cube physics materials retain their
+benchmark friction, and the cube has a positive authored mass or density. It
+archives those values plus collision/contact metadata in `runtime.json`.
+
 Task-acceptance runs require runtime articulation provenance for both DOF order
-and every joint observation; authored USD drive targets are not accepted as
-measured robot state. Before the first policy observation, the commanded
+and every joint observation and target. Authored USD drive targets are not
+accepted as measured robot state or as an actuation fallback. Before the first
+policy observation, the commanded
 benchmark pose must remain within the configured arm/gripper tolerances for two
 consecutive control intervals. Camera retries occur while paused and never add
 unrecorded physics steps between an applied action and its task-state evidence.
@@ -167,7 +174,7 @@ python run_hosted_eval.py \
   --base-model pi0-droid \
   --environment-uri "$CYBERNETICS_DROID_ENV_URI" \
   --task-success-predicate scene1-cube-in-bowl \
-  --open-loop-horizon 10 \
+  --open-loop-horizon 8 \
   --max-action-steps 450 \
   --record-video \
   --video-fps 15 \
