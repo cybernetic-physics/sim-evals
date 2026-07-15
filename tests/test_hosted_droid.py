@@ -24,6 +24,7 @@ from sim_evals.hosted_droid import (
     _DROID_DYNAMICS_PROFILE,
     _DROID_DYNAMICS_STDOUT_PREFIX,
     _DROID_INITIAL_ARM_JOINT_POSITIONS,
+    _contact_integrity_request,
     HostedDroidConfig,
     HostedDroidError,
     HostedDroidRunner,
@@ -76,6 +77,7 @@ def _pi0_policy_profile() -> dict[str, Any]:
 def _task_state_payload(
     *,
     object_center: tuple[float, float, float],
+    gripper_reference_position: tuple[float, float, float] | None = None,
     linear_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
     angular_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> dict[str, Any]:
@@ -99,9 +101,16 @@ def _task_state_payload(
         }
 
     spec = scene1_cube_in_bowl_success_spec()
+    if gripper_reference_position is None:
+        gripper_reference_position = (
+            object_center[0],
+            object_center[1],
+            object_center[2] + 0.10,
+        )
     return {
         "object_path": spec.object_prim_path,
         "receptacle_path": spec.receptacle_prim_path,
+        "gripper_reference_path": spec.gripper_reference_prim_path,
         "velocity_source": "physics_tensor",
         "object_bounds": bounds(object_center, object_half_size),
         "receptacle_bounds": bounds(receptacle_center, receptacle_half_size),
@@ -113,6 +122,94 @@ def _task_state_payload(
             "linear": [0.0, 0.0, 0.0],
             "angular": [0.0, 0.0, 0.0],
         },
+        "object_runtime_position": list(object_center),
+        "gripper_reference_position": list(gripper_reference_position),
+    }
+
+
+def _contact_integrity_payload(
+    request: Mapping[str, Any],
+    *,
+    steps: int,
+    penetration_meters: float = 0.0,
+    normal_impulse_ns: float = 0.01,
+    contact_labels: set[str] | None = None,
+    complete: bool = True,
+) -> dict[str, Any]:
+    pairs = request["pairs"]
+    active_labels = (
+        {str(pair["label"]) for pair in pairs}
+        if contact_labels is None
+        else contact_labels
+    )
+    samples = []
+    for update_index in range(steps):
+        pair_records = []
+        for pair in pairs:
+            label = str(pair["label"])
+            contacts = []
+            if label in active_labels:
+                normal = {
+                    "left-finger-cube": [1.0, 0.0, 0.0],
+                    "right-finger-cube": [-1.0, 0.0, 0.0],
+                }.get(label, [0.0, 0.0, 1.0])
+                contacts.append(
+                    {
+                        "point_m": [0.0, 0.0, 0.0],
+                        "normal_filter_to_sensor": normal,
+                        "signed_separation_m": -penetration_meters,
+                        "penetration_m": penetration_meters,
+                        "normal_impulse_ns": normal_impulse_ns,
+                        "normal_force_n": normal_impulse_ns * 120.0,
+                    }
+                )
+            pair_records.append(
+                {
+                    "label": label,
+                    "sensor_path": pair["sensor_path"],
+                    "filter_path": pair["filter_path"],
+                    "complete": True,
+                    "buffer_saturated": False,
+                    "contact_count": len(contacts),
+                    "contacts": contacts,
+                    "friction_contacts": [],
+                    "maximum_penetration_m": penetration_meters,
+                    "maximum_normal_impulse_ns": (
+                        normal_impulse_ns if contacts else 0.0
+                    ),
+                }
+            )
+        samples.append(
+            {
+                "update_index": update_index,
+                "physics_dt_seconds": 1.0 / 120.0,
+                "pairs": pair_records,
+            }
+        )
+    limits = dict(request["limits"])
+    violations = []
+    if penetration_meters > limits["maximum_penetration_m"]:
+        violations.append({"metric": "maximum_penetration_m"})
+    if normal_impulse_ns > limits["maximum_normal_impulse_ns"]:
+        violations.append({"metric": "maximum_normal_impulse_ns"})
+    return {
+        "schema_version": 1,
+        "capture_source": "test",
+        "sampling_semantics": "after_each_requested_kit_update",
+        "physics_dt_seconds": 1.0 / 120.0,
+        "requested_updates": steps,
+        "captured_updates": steps,
+        "complete": complete,
+        "errors": [] if complete else ["injected incomplete trace"],
+        "saturated_pairs": [],
+        "limits": limits,
+        "within_configured_limits": complete and not violations,
+        "violations": violations,
+        "summary": {
+            "maximum_penetration_m": penetration_meters,
+            "maximum_normal_impulse_ns": normal_impulse_ns,
+        },
+        "samples": samples,
     }
 
 
@@ -294,7 +391,7 @@ class FakeMCP:
                     "stdout": "DROID_TASK_STATE=" + json.dumps(payload) + "\n",
                     "stderr": "",
                 }
-            if "nvidia_droid_isaaclab" in str(arguments["code"]):
+            if "cybernetics_droid_contact_v1" in str(arguments["code"]):
                 self.dynamics_configured = True
                 self.physics_context_reinitialized = all(
                     marker in str(arguments["code"])
@@ -334,6 +431,12 @@ class FakeMCP:
                 result = {"status": "success", **self.step_payloads.pop(0)}
             else:
                 result = {"status": "success", "stepped": arguments["num_steps"]}
+            contact_request = arguments.get("contact_integrity")
+            if contact_request is not None and "contact_integrity" not in result:
+                result["contact_integrity"] = _contact_integrity_payload(
+                    contact_request,
+                    steps=int(arguments["num_steps"]),
+                )
             advanced_steps = int(result.get("advanced_steps", result.get("stepped", 0)))
             if self.dynamics_configured:
                 self.post_dynamics_steps += advanced_steps
@@ -610,13 +713,21 @@ class HostedDroidRunnerTest(unittest.TestCase):
             str(arguments["code"])
             for name, arguments in mcp.calls
             if name == "isaac.execute_script"
-            and "nvidia_droid_isaaclab" in str(arguments["code"])
+            and "cybernetics_droid_contact_v1" in str(arguments["code"])
         )
         ast.parse(dynamics_script)
         self.assertIn("drive.GetStiffnessAttr().Set(400.0)", dynamics_script)
         self.assertIn("drive.GetDampingAttr().Set(80.0)", dynamics_script)
-        self.assertIn("GetSolverVelocityIterationCountAttr().Set(0)", dynamics_script)
-        self.assertIn("GetMaxDepenetrationVelocityAttr().Set(5.0)", dynamics_script)
+        self.assertIn("GetSolverVelocityIterationCountAttr().Set(1)", dynamics_script)
+        self.assertIn('physics_context.set_solver_type("TGS")', dynamics_script)
+        self.assertIn(
+            "physics_context.set_solve_articulation_contact_last(True)",
+            dynamics_script,
+        )
+        self.assertIn("GetEnableCCDAttr().Set(True)", dynamics_script)
+        self.assertIn(
+            "GetMaxDepenetrationVelocityAttr().Set(\n            3.0", dynamics_script
+        )
         self.assertIn("GetTimeStepsPerSecondAttr().Set(120.0)", dynamics_script)
         self.assertIn(
             'settings.set("/persistent/simulation/minFrameRate", int(120.0))',
@@ -641,6 +752,25 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertIn("finger_binding_paths", dynamics_script)
         self.assertIn("material_profile_from_binding", dynamics_script)
         self.assertIn("UsdShade.MaterialBindingAPI", dynamics_script)
+        self.assertIn(
+            '"/World/droid_eval_physics/FingerMaterial",\n    1.5,\n    1.2,',
+            dynamics_script,
+        )
+        self.assertIn(
+            '"/World/droid_eval_physics/CubeMaterial",\n    0.8,\n    0.6,',
+            dynamics_script,
+        )
+        self.assertIn(
+            '"/World/droid_eval_physics/ReceptacleMaterial",\n    0.6,\n    0.5,',
+            dynamics_script,
+        )
+        self.assertIn(
+            '"/World/droid_eval_physics/TableMaterial",\n    0.5,\n    0.4,',
+            dynamics_script,
+        )
+        self.assertIn("CreateFrictionCombineModeAttr('average')", dynamics_script)
+        self.assertIn("CreateContactOffsetAttr(0.002)", dynamics_script)
+        self.assertIn("CreateRestOffsetAttr(0.0)", dynamics_script)
         self.assertIn("ComputeBoundMaterial", dynamics_script)
         self.assertIn("read_offset_metadata", dynamics_script)
         self.assertIn('"schema:+inf"', dynamics_script)
@@ -651,7 +781,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             index
             for index, (name, arguments) in enumerate(mcp.calls)
             if name == "isaac.execute_script"
-            and "nvidia_droid_isaaclab" in str(arguments["code"])
+            and "cybernetics_droid_contact_v1" in str(arguments["code"])
         )
         first_step_index = next(
             index
@@ -965,7 +1095,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             config_payload = json.loads(
                 (results_dir / "config.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(config_payload["schema_version"], 8)
+            self.assertEqual(config_payload["schema_version"], 9)
             self.assertEqual(
                 config_payload["config"]["environment_uri"],
                 config.environment_uri,
@@ -1017,7 +1147,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             runtime_payload = json.loads(
                 (results_dir / "runtime.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(runtime_payload["schema_version"], 8)
+            self.assertEqual(runtime_payload["schema_version"], 9)
             self.assertEqual(
                 runtime_payload["joint_target_control_source"],
                 "runtime_articulation",
@@ -1096,7 +1226,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertEqual(result.task_success_checks, 8)
             self.assertEqual(
                 result.task_success_reason,
-                "policy_lift_release_and_settled_placement_proven",
+                "physically_credible_policy_placement_proven",
             )
             payload = json.loads((results_dir / "result.json").read_text())
             self.assertEqual(
@@ -1120,7 +1250,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertTrue(records[-1]["evaluation"]["success"])
             self.assertEqual(
                 records[-1]["capture_method"],
-                "read_only_usd_bounds_and_physics_tensor_velocity",
+                "read_only_usd_bounds_and_physics_tensor_rigid_state",
             )
             self.assertEqual(
                 records[-1]["state"]["velocity_source"],
@@ -1148,14 +1278,14 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 task_state_script.index(
                     "from isaacsim.core.simulation_manager import SimulationManager"
                 ),
-                task_state_script.index("def read_physics_tensor_velocities"),
+                task_state_script.index("def read_physics_tensor_states"),
             )
             self.assertIn(
-                "read_legacy_dynamic_control_velocities",
+                "read_legacy_dynamic_control_states",
                 task_state_script,
             )
             self.assertIn(
-                "rigid-body velocity unavailable",
+                "rigid-body state unavailable",
                 task_state_script,
             )
             object_paths = {
@@ -1186,6 +1316,248 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 and "DROID_TASK_STATE=" in str(arguments["code"])
             )
             self.assertLess(last_video_capture, last_task_state)
+
+    def test_scene1_acceptance_latches_excessive_penetration(self) -> None:
+        actions = np.zeros((1, 8, 8), dtype=np.float32)
+        actions[0, :5, 7] = 1.0
+        task_states = [
+            _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+            _task_state_payload(object_center=(0.36, -0.08, 0.14)),
+            _task_state_payload(object_center=(0.36, -0.08, 0.15)),
+            _task_state_payload(object_center=(0.375, 0.00, 0.15)),
+            _task_state_payload(object_center=(0.39, 0.08, 0.15)),
+            _task_state_payload(object_center=(0.405, 0.16, 0.15)),
+            *[
+                _task_state_payload(object_center=(0.405, 0.174, 0.105))
+                for _ in range(3)
+            ],
+        ]
+        spec = scene1_cube_in_bowl_success_spec()
+        contact_request = _contact_integrity_request(spec)
+        step_payloads = [
+            {"stepped": 32},
+            {"stepped": 8},
+            {"stepped": 8},
+            *[
+                {
+                    "stepped": 8,
+                    "contact_integrity": _contact_integrity_payload(
+                        contact_request,
+                        steps=8,
+                        penetration_meters=(0.003 if index == 1 else 0.0),
+                    ),
+                }
+                for index in range(8)
+            ],
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "penetration"
+            result = HostedDroidRunner(
+                FakeSimulationClient(
+                    FakeMCP(
+                        readiness_failures=0,
+                        warm=True,
+                        task_state_payloads=task_states,
+                        step_payloads=step_payloads,
+                        closed_gripper_observation=0.34,
+                    )
+                ),
+                FakeSampler(response={"action_chunk": actions}),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=8,
+                    open_loop_horizon=8,
+                    results_dir=results_dir,
+                    task_success=spec,
+                ),
+                sleep=lambda _: None,
+            ).run()
+
+            self.assertFalse(result.task_success)
+            records = [
+                json.loads(line)
+                for line in (results_dir / "task-states.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                records[2]["evaluation"]["hard_body_integrity_reason"],
+                "excessive_contact_penetration",
+            )
+            self.assertEqual(
+                records[-1]["evaluation"]["hard_body_integrity"], "violated"
+            )
+
+    def test_scene1_acceptance_rejects_closed_gripper_support_loss(self) -> None:
+        actions = np.zeros((1, 8, 8), dtype=np.float32)
+        actions[0, :6, 7] = 1.0
+        task_states = [
+            _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+            _task_state_payload(object_center=(0.36, -0.08, 0.14)),
+            _task_state_payload(object_center=(0.36, -0.08, 0.15)),
+            _task_state_payload(object_center=(0.375, 0.00, 0.15)),
+            _task_state_payload(object_center=(0.39, 0.08, 0.15)),
+            _task_state_payload(object_center=(0.405, 0.16, 0.15)),
+            _task_state_payload(
+                object_center=(0.405, 0.174, 0.105),
+                gripper_reference_position=(0.405, 0.16, 0.25),
+            ),
+            _task_state_payload(
+                object_center=(0.405, 0.174, 0.105),
+                gripper_reference_position=(0.405, 0.16, 0.25),
+            ),
+            _task_state_payload(
+                object_center=(0.405, 0.174, 0.105),
+                gripper_reference_position=(0.405, 0.16, 0.25),
+            ),
+        ]
+        spec = scene1_cube_in_bowl_success_spec()
+        request = _contact_integrity_request(spec)
+        step_payloads = [{"stepped": 32}, {"stepped": 8}, {"stepped": 8}]
+        for index in range(8):
+            labels = None
+            if index == 5:
+                labels = {"cube-receptacle"}
+            step_payloads.append(
+                {
+                    "stepped": 8,
+                    "contact_integrity": _contact_integrity_payload(
+                        request,
+                        steps=8,
+                        contact_labels=labels,
+                    ),
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "closed-support-loss"
+            result = HostedDroidRunner(
+                FakeSimulationClient(
+                    FakeMCP(
+                        readiness_failures=0,
+                        warm=True,
+                        task_state_payloads=task_states,
+                        step_payloads=step_payloads,
+                        closed_gripper_observation=0.34,
+                    )
+                ),
+                FakeSampler(response={"action_chunk": actions}),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=8,
+                    open_loop_horizon=8,
+                    results_dir=results_dir,
+                    task_success=spec,
+                ),
+                sleep=lambda _: None,
+            ).run()
+
+            self.assertFalse(result.task_success)
+            self.assertEqual(result.action_steps, 8)
+            records = [
+                json.loads(line)
+                for line in (results_dir / "task-states.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                records[6]["evaluation"]["hard_body_integrity_reason"],
+                "closed_gripper_support_loss_before_release",
+            )
+
+    def test_scene1_acceptance_latches_excessive_contact_impulse(self) -> None:
+        actions = np.zeros((1, 2, 8), dtype=np.float32)
+        actions[0, :, 7] = 1.0
+        spec = scene1_cube_in_bowl_success_spec()
+        request = _contact_integrity_request(spec)
+        step_payloads = [
+            {"stepped": 32},
+            {"stepped": 8},
+            {"stepped": 8},
+            {
+                "stepped": 8,
+                "contact_integrity": _contact_integrity_payload(request, steps=8),
+            },
+            {
+                "stepped": 8,
+                "contact_integrity": _contact_integrity_payload(
+                    request,
+                    steps=8,
+                    normal_impulse_ns=0.75,
+                ),
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "contact-impulse"
+            result = HostedDroidRunner(
+                FakeSimulationClient(
+                    FakeMCP(
+                        readiness_failures=0,
+                        warm=True,
+                        task_state_payloads=[
+                            _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+                            _task_state_payload(object_center=(0.36, -0.08, 0.14)),
+                            _task_state_payload(object_center=(0.36, -0.08, 0.15)),
+                        ],
+                        step_payloads=step_payloads,
+                        closed_gripper_observation=0.34,
+                    )
+                ),
+                FakeSampler(response={"action_chunk": actions}),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=2,
+                    open_loop_horizon=2,
+                    results_dir=results_dir,
+                    task_success=spec,
+                ),
+                sleep=lambda _: None,
+            ).run()
+
+            self.assertFalse(result.task_success)
+            records = [
+                json.loads(line)
+                for line in (results_dir / "task-states.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                records[2]["evaluation"]["hard_body_integrity_reason"],
+                "excessive_contact_impulse",
+            )
+
+    def test_scene1_acceptance_fails_closed_on_incomplete_contact_trace(self) -> None:
+        spec = scene1_cube_in_bowl_success_spec()
+        request = _contact_integrity_request(spec)
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            task_state_payloads=[
+                _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+                _task_state_payload(object_center=(0.36, -0.08, 0.14)),
+            ],
+            step_payloads=[
+                {"stepped": 32},
+                {"stepped": 8},
+                {"stepped": 8},
+                {
+                    "stepped": 8,
+                    "contact_integrity": _contact_integrity_payload(
+                        request,
+                        steps=8,
+                        complete=False,
+                    ),
+                },
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            HostedDroidError, "contact integrity telemetry is incomplete"
+        ):
+            HostedDroidRunner(
+                FakeSimulationClient(mcp),
+                FakeSampler(response={"action_chunk": np.zeros((1, 1, 8))}),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    max_action_steps=1,
+                    task_success=spec,
+                ),
+                sleep=lambda _: None,
+            ).run()
 
     def test_scene1_acceptance_rejects_direct_placement_without_lift(self) -> None:
         actions = np.zeros((1, 4, 8), dtype=np.float32)
