@@ -35,6 +35,9 @@ _TRANSIENT_MCP_FAILURE_MARKERS = (
     "ISAAC_UNREACHABLE",
     "Isaac Sim MCP extension is not ready yet",
     "No bridge connected",
+    "Temporary failure in name resolution",
+    "Name or service not known",
+    "All connection attempts failed",
 )
 _IDEMPOTENT_TRANSPORT_RETRY_TOOLS = frozenset({"isaac.set_joint_positions"})
 _TRANSIENT_TRANSPORT_FAILURE_MARKERS = ("HTTP 502",)

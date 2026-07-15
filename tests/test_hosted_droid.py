@@ -242,6 +242,7 @@ class FakeMCP:
         camera_calibration_results: list[bool] | None = None,
         transient_tool_failures: Mapping[str, int] | None = None,
         transport_tool_failures: Mapping[str, int] | None = None,
+        tool_failure_messages: Mapping[str, list[str]] | None = None,
         step_payloads: list[dict[str, Any]] | None = None,
         task_state_payloads: list[dict[str, Any]] | None = None,
         closed_gripper_observation: float | None = None,
@@ -260,6 +261,10 @@ class FakeMCP:
         self.camera_calibration_results = list(camera_calibration_results or [])
         self.transient_tool_failures = dict(transient_tool_failures or {})
         self.transport_tool_failures = dict(transport_tool_failures or {})
+        self.tool_failure_messages = {
+            name: list(messages)
+            for name, messages in (tool_failure_messages or {}).items()
+        }
         self.step_payloads = list(step_payloads or [])
         self.task_state_payloads = list(task_state_payloads or [])
         self.closed_gripper_observation = closed_gripper_observation
@@ -294,6 +299,9 @@ class FakeMCP:
 
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         self.calls.append((name, dict(arguments)))
+        failure_messages = self.tool_failure_messages.get(name, [])
+        if failure_messages:
+            raise RuntimeError(failure_messages.pop(0))
         transient_failures = self.transient_tool_failures.get(name, 0)
         if transient_failures > 0:
             self.transient_tool_failures[name] = transient_failures - 1
@@ -2276,6 +2284,36 @@ class HostedDroidRunnerTest(unittest.TestCase):
         ).run()
 
         self.assertEqual(result.action_steps, 1)
+        retry_steps = [
+            arguments
+            for name, arguments in mcp.calls
+            if name == "isaac.step_simulation" and arguments["num_steps"] == 2
+        ]
+        self.assertEqual(retry_steps, [])
+
+    def test_camera_capture_survives_a_control_plane_dns_restart_window(self) -> None:
+        restart_errors = [
+            "INTERNAL_ERROR: [Errno -3] Temporary failure in name resolution"
+        ] * 11
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            tool_failure_messages={"isaac.capture_camera_image": restart_errors},
+        )
+        sleeps: list[float] = []
+
+        result = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+            ),
+            sleep=sleeps.append,
+        ).run()
+
+        self.assertEqual(result.action_steps, 1)
+        self.assertEqual(sleeps.count(5.0), 11)
         retry_steps = [
             arguments
             for name, arguments in mcp.calls
