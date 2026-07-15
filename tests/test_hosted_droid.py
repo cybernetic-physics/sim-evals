@@ -26,6 +26,7 @@ from sim_evals.hosted_droid import (
     _DROID_DYNAMICS_PROFILE,
     _DROID_DYNAMICS_STDOUT_PREFIX,
     _DROID_INITIAL_ARM_JOINT_POSITIONS,
+    _parse_task_state,
     _contact_integrity_request,
     _validate_policy_response,
     HostedDroidConfig,
@@ -1126,6 +1127,8 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertFalse((results_dir / "result.json").exists())
             payload = json.loads((results_dir / "error.json").read_text())
             self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["execution_status"], "failed")
+            self.assertEqual(payload["task_status"], "not_evaluated")
             self.assertEqual(payload["error"]["type"], "HostedDroidError")
             self.assertEqual(
                 payload["evidence_errors"],
@@ -1236,6 +1239,50 @@ class HostedDroidRunnerTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(HostedDroidError, "initial gripper state"):
             runner._validate_replay_initial_state(np.zeros(7), 0.011)
+
+    def test_recorded_replay_binds_initial_task_geometry_and_velocity(self) -> None:
+        spec = scene1_cube_in_bowl_success_spec()
+        source_state = _parse_task_state(
+            _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+            spec,
+        )
+        sampler = FakeSampler()
+        sampler.source_initial_task_state = source_state.to_dict()
+        runner = HostedDroidRunner(
+            FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True)),
+            sampler,
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                base_model="pi0-droid",
+                action_source="recorded_replay",
+                replay_source_sha256="a" * 64,
+                keep_session=False,
+                task_success=spec,
+            ),
+        )
+        bounded_state = _parse_task_state(
+            _task_state_payload(object_center=(0.3605, -0.08, 0.10)),
+            spec,
+        )
+        comparison = runner._validate_replay_initial_task_state(bounded_state)
+        self.assertIsNotNone(comparison)
+        self.assertAlmostEqual(comparison["maximum_geometry_delta_meters"], 0.0005)
+
+        shifted_state = _parse_task_state(
+            _task_state_payload(object_center=(0.362, -0.08, 0.10)),
+            spec,
+        )
+        with self.assertRaisesRegex(HostedDroidError, "task geometry"):
+            runner._validate_replay_initial_task_state(shifted_state)
+        moving_state = _parse_task_state(
+            _task_state_payload(
+                object_center=(0.36, -0.08, 0.10),
+                linear_velocity=(0.02, 0.0, 0.0),
+            ),
+            spec,
+        )
+        with self.assertRaisesRegex(HostedDroidError, "task velocity"):
+            runner._validate_replay_initial_task_state(moving_state)
 
     def test_configuration_rejects_invalid_rollout_shape(self) -> None:
         with self.assertRaisesRegex(ValueError, "environment_uri"):
@@ -1387,7 +1434,21 @@ class HostedDroidRunnerTest(unittest.TestCase):
     def test_evidence_manifest_rejects_tampering_and_unlisted_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             results_dir = Path(temporary)
-            (results_dir / "result.json").write_text("{}\n", encoding="utf-8")
+            (results_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 9,
+                        "status": "succeeded",
+                        "execution_status": "completed",
+                        "task_status": "not_evaluated",
+                        "result": {
+                            "task_success": None,
+                            "task_success_predicate": None,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             finalize_hosted_evidence_manifest(
                 results_dir,
                 terminal_record="result.json",

@@ -13,9 +13,43 @@ from run_hosted_eval import (
 )
 from sim_evals.hosted_droid import (
     HostedDroidConfig,
+    HostedDroidError,
     _config_dict,
     finalize_hosted_evidence_manifest,
+    scene1_cube_in_bowl_success_spec,
 )
+
+
+_KNOWN_ARTIFACT_PRODUCER = {
+    "status": "known",
+    "sim_evals_revision": "a" * 40,
+    "sim_evals_version": "0.1.0",
+    "cybernetics_sdk_version": "0.18.0",
+}
+
+
+def _task_state() -> dict[str, object]:
+    return {
+        "object_bounds": {
+            "center": [0.36, -0.08, 0.074],
+            "minimum": [0.33, -0.11, 0.045],
+            "maximum": [0.39, -0.05, 0.103],
+            "size": [0.06, 0.06, 0.058],
+        },
+        "receptacle_bounds": {
+            "center": [0.405, 0.174, 0.074],
+            "minimum": [0.325, 0.093, 0.046],
+            "maximum": [0.486, 0.255, 0.101],
+            "size": [0.161, 0.162, 0.055],
+        },
+        "velocity_source": "physics_tensor",
+        "object_linear_velocity": [0.0, 0.0, 0.0],
+        "object_angular_velocity": [0.0, 0.0, 0.0],
+        "receptacle_linear_velocity": [0.0, 0.0, 0.0],
+        "receptacle_angular_velocity": [0.0, 0.0, 0.0],
+        "object_runtime_position": [0.36, -0.08, 0.074],
+        "gripper_reference_position": [0.36, 0.0, 0.472],
+    }
 
 
 def _pi0_sample(sample_index: int) -> dict[str, object]:
@@ -58,6 +92,8 @@ def _write_replay_evidence(
         instruction="put the cube in the bowl",
         max_action_steps=applied_action_steps,
         open_loop_horizon=8,
+        physics_hz=120.0,
+        task_success=scene1_cube_in_bowl_success_spec(),
     )
     config = {
         "schema_version": 9,
@@ -126,8 +162,18 @@ def _write_replay_evidence(
         json.dumps(
             {
                 "schema_version": 9,
+                "base_model": "pi0-droid",
+                "action_source": "worldlines_policy",
+                "physics_dt": 1.0 / 120.0,
+                "physics_steps_per_action": 8,
+                "physics_hz": 120.0,
+                "target_control_hz": 15.0,
+                "control_hz": 15.0,
+                "solver_position_iterations": 64,
+                "solver_velocity_iterations": 1,
                 "initial_arm_joint_positions": [0.0] * 7,
                 "initial_gripper_position": 0.0,
+                "task_success_predicate": "scene1-cube-in-bowl",
             }
         ),
         encoding="utf-8",
@@ -137,6 +183,9 @@ def _write_replay_evidence(
             "schema_version": 9,
             "record_type": "task_state",
             "action_index": action_index,
+            "phase": "initial" if action_index is None else "post_action",
+            "state": _task_state(),
+            "evaluation": {"predicate": "scene1-cube-in-bowl"},
         }
         for action_index in [None, *range(applied_action_steps)]
     ]
@@ -150,20 +199,29 @@ def _write_replay_evidence(
                 "schema_version": 9,
                 "status": "succeeded",
                 "execution_status": "completed",
-                "task_status": "not_evaluated",
+                "task_status": "failed",
                 "result": {
                     "action_steps": applied_action_steps,
-                    "task_success_predicate": None,
+                    "task_success": False,
+                    "task_success_predicate": "scene1-cube-in-bowl",
                 },
             }
         ),
         encoding="utf-8",
     )
-    finalize_hosted_evidence_manifest(directory, terminal_record="result.json")
+    finalize_hosted_evidence_manifest(
+        directory,
+        terminal_record="result.json",
+        artifact_producer=_KNOWN_ARTIFACT_PRODUCER,
+    )
 
 
 def _refresh_manifest(directory: Path) -> None:
-    finalize_hosted_evidence_manifest(directory, terminal_record="result.json")
+    finalize_hosted_evidence_manifest(
+        directory,
+        terminal_record="result.json",
+        artifact_producer=_KNOWN_ARTIFACT_PRODUCER,
+    )
 
 
 class HostedEvalParserTests(unittest.TestCase):
@@ -231,6 +289,14 @@ class HostedEvalParserTests(unittest.TestCase):
             self.assertEqual(metadata["replay_source_sha256"], sampler.source_sha256)
             self.assertEqual(metadata["replay_actions_sha256"], sampler.actions_sha256)
             self.assertGreaterEqual(len(sampler.source_files_sha256), 5)
+            self.assertEqual(
+                sampler.source_artifact_producer["sim_evals_revision"],
+                "a" * 40,
+            )
+            self.assertEqual(
+                sampler.source_initial_task_state["velocity_source"],
+                "physics_tensor",
+            )
             with self.assertRaisesRegex(RuntimeError, "exhausted"):
                 sampler.sample_droid(object(), timeout=1.0)
 
@@ -243,6 +309,77 @@ class HostedEvalParserTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "manifest.*inventory"):
                 _RecordedPi0Replay.load(source)
+
+    def test_recorded_sampler_rejects_unknown_artifact_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            _write_replay_evidence(source, applied_action_steps=1)
+            finalize_hosted_evidence_manifest(
+                source,
+                terminal_record="result.json",
+            )
+
+            with self.assertRaisesRegex(ValueError, "known artifact provenance"):
+                _RecordedPi0Replay.load(source)
+
+    def test_manifest_identity_binds_provenance_and_terminal_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            _write_replay_evidence(source, applied_action_steps=1)
+            manifest_path = source / "evidence-manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["provenance"]["artifact_producer"]["sim_evals_revision"] = "b" * 40
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                _RecordedPi0Replay.load(source)
+
+            _refresh_manifest(source)
+            manifest = json.loads(manifest_path.read_text())
+            manifest["terminal_record"] = "error.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "terminal record is missing"):
+                _RecordedPi0Replay.load(source)
+
+    def test_recorded_sampler_rejects_runtime_action_cadence_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            _write_replay_evidence(source, applied_action_steps=1)
+            config_path = source / "config.json"
+            config = json.loads(config_path.read_text())
+            config["config"]["physics_hz"] = 240.0
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            runtime_path = source / "runtime.json"
+            runtime = json.loads(runtime_path.read_text())
+            runtime.update(
+                {
+                    "physics_dt": 1.0 / 240.0,
+                    "physics_steps_per_action": 16,
+                    "physics_hz": 240.0,
+                }
+            )
+            runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+            _refresh_manifest(source)
+
+            with self.assertRaisesRegex(ValueError, "action physics dt differs"):
+                _RecordedPi0Replay.load(source)
+
+    def test_recorded_sampler_rejects_inconsistent_terminal_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            _write_replay_evidence(source, applied_action_steps=1)
+            result_path = source / "result.json"
+            result = json.loads(result_path.read_text())
+            result["execution_status"] = "failed"
+            result["task_status"] = "passed"
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            with self.assertRaisesRegex(HostedDroidError, "statuses"):
+                _refresh_manifest(source)
+
+            result["execution_status"] = "completed"
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            with self.assertRaisesRegex(HostedDroidError, "statuses"):
+                _refresh_manifest(source)
 
     def test_recorded_sampler_rejects_timing_discontinuity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -309,6 +446,7 @@ class HostedEvalParserTests(unittest.TestCase):
                 action_source="recorded_replay",
                 replay_source_sha256=sampler.source_sha256,
                 keep_session=False,
+                task_success=scene1_cube_in_bowl_success_spec(),
             )
             _validate_replay_configuration(matching, sampler)
 
@@ -323,6 +461,7 @@ class HostedEvalParserTests(unittest.TestCase):
                         action_source="recorded_replay",
                         replay_source_sha256=sampler.source_sha256,
                         keep_session=False,
+                        task_success=scene1_cube_in_bowl_success_spec(),
                     ),
                     sampler,
                 )

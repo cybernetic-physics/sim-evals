@@ -19,6 +19,7 @@ from sim_evals.hosted_droid import (
     SimulationClientAPI,
     _config_dict,
     _droid_joint_positions_for_policy_action,
+    _replay_task_state_vectors,
     _validate_policy_response,
     scene1_cube_in_bowl_success_spec,
     verify_hosted_evidence_manifest,
@@ -41,9 +42,11 @@ class _RecordedPi0Replay:
         source_sha256: str,
         actions_sha256: str,
         source_files_sha256: dict[str, str],
+        source_artifact_producer: dict[str, object],
         source_config: dict[str, object],
         source_initial_arm_joint_positions: tuple[float, ...],
         source_initial_gripper_position: float,
+        source_initial_task_state: dict[str, object],
         open_loop_horizon: int,
         applied_action_steps: int,
     ) -> None:
@@ -51,9 +54,11 @@ class _RecordedPi0Replay:
         self.source_sha256 = source_sha256
         self.actions_sha256 = actions_sha256
         self.source_files_sha256 = source_files_sha256
+        self.source_artifact_producer = source_artifact_producer
         self.source_config = source_config
         self.source_initial_arm_joint_positions = source_initial_arm_joint_positions
         self.source_initial_gripper_position = source_initial_gripper_position
+        self.source_initial_task_state = source_initial_task_state
         self.open_loop_horizon = open_loop_horizon
         self.applied_action_steps = applied_action_steps
         self._index = 0
@@ -73,7 +78,18 @@ class _RecordedPi0Replay:
             raise ValueError(
                 f"recorded replay rejected its evidence manifest: {exc}"
             ) from exc
+        if manifest.get("terminal_record") != "result.json":
+            raise ValueError("recorded replay requires a result terminal record")
         source_sha256 = cast(str, manifest["aggregate_sha256"])
+        terminal_semantics = cast(dict[str, object], manifest["terminal_semantics"])
+        if terminal_semantics.get("execution_status") != "completed":
+            raise ValueError("recorded replay requires completed execution status")
+        manifest_provenance = cast(dict[str, object], manifest["provenance"])
+        source_artifact_producer = cast(
+            dict[str, object], manifest_provenance["artifact_producer"]
+        )
+        if source_artifact_producer.get("status") != "known":
+            raise ValueError("recorded replay requires known artifact provenance")
         manifest_files = cast(dict[str, dict[str, object]], manifest["files"])
         required_files = {
             "config.json",
@@ -98,7 +114,7 @@ class _RecordedPi0Replay:
             raise ValueError("recorded replay requires schema-v9 config evidence")
         if source_config.get("base_model") != "pi0-droid":
             raise ValueError("recorded replay requires pi0-droid evidence")
-        if source_config.get("action_source") != "worldlines_policy":
+        if source_config.get("action_source") not in {None, "worldlines_policy"}:
             raise ValueError("recorded replay source must be model-driven evidence")
         open_loop_horizon = source_config.get("open_loop_horizon")
         if (
@@ -110,21 +126,9 @@ class _RecordedPi0Replay:
 
         runtime_payload = _json_object(runtime_path)
         result_payload = _json_object(result_path)
-        if runtime_payload.get("schema_version") != 9:
-            raise ValueError("recorded replay requires schema-v9 runtime evidence")
-        initial_arm = _float_array(
-            runtime_payload.get("initial_arm_joint_positions"),
-            "recorded initial arm state",
-            dtype=np.float64,
+        initial_arm, initial_gripper, source_physics_dt, source_physics_steps = (
+            _validate_source_runtime(source_config, runtime_payload)
         )
-        initial_gripper = runtime_payload.get("initial_gripper_position")
-        if (
-            initial_arm.shape != (7,)
-            or isinstance(initial_gripper, bool)
-            or not isinstance(initial_gripper, (int, float))
-            or not np.isfinite(float(initial_gripper))
-        ):
-            raise ValueError("recorded replay has invalid initial robot state")
         if (
             result_payload.get("schema_version") != 9
             or result_payload.get("status") != "succeeded"
@@ -133,6 +137,8 @@ class _RecordedPi0Replay:
             raise ValueError(
                 "recorded replay requires completed schema-v9 result evidence"
             )
+        if result_payload.get("execution_status", "completed") != "completed":
+            raise ValueError("recorded replay requires completed execution status")
 
         raw = actions_path.read_bytes()
         actions_sha256 = hashlib.sha256(raw).hexdigest()
@@ -210,6 +216,20 @@ class _RecordedPi0Replay:
                 if timing is None:
                     raise AssertionError("applied action timing was not validated")
                 before_time, after_time, physics_dt = timing
+                simulation_timing = cast(dict[str, object], record["simulation_timing"])
+                if not np.isclose(
+                    physics_dt,
+                    source_physics_dt,
+                    rtol=0.0,
+                    atol=1e-12,
+                ):
+                    raise ValueError(
+                        "recorded action physics dt differs from runtime evidence"
+                    )
+                if simulation_timing.get("stepped") != source_physics_steps:
+                    raise ValueError(
+                        "recorded action substeps differ from runtime evidence"
+                    )
                 if previous_after_time is not None and not np.isclose(
                     before_time,
                     previous_after_time,
@@ -243,11 +263,9 @@ class _RecordedPi0Replay:
         if result.get("action_steps") != len(applied):
             raise ValueError("recorded result action count does not match its evidence")
         task_records = _jsonl_objects(task_states_path.read_bytes(), task_states_path)
-        task_action_indices = [
-            record.get("action_index")
-            for record in task_records
-            if record.get("record_type") == "task_state"
-        ]
+        if any(record.get("record_type") != "task_state" for record in task_records):
+            raise ValueError("recorded task-state evidence has an unknown record type")
+        task_action_indices = [record.get("action_index") for record in task_records]
         if task_action_indices != [None, *range(len(applied))]:
             raise ValueError("recorded task-state evidence does not cover every action")
         source_task = source_config.get("task_success")
@@ -258,14 +276,38 @@ class _RecordedPi0Replay:
             raise ValueError(
                 "recorded result predicate does not match its configuration"
             )
+        expected_task_status = _expected_source_task_status(result)
+        if terminal_semantics.get("task_status") != expected_task_status:
+            raise ValueError("recorded manifest task status is internally inconsistent")
+        if (
+            result_payload.get("task_status", expected_task_status)
+            != expected_task_status
+        ):
+            raise ValueError("recorded result task status is internally inconsistent")
+        for record_index, record in enumerate(task_records):
+            expected_phase = "initial" if record_index == 0 else "post_action"
+            if record.get("phase") != expected_phase:
+                raise ValueError("recorded task-state evidence has an invalid phase")
+            evaluation = record.get("evaluation")
+            if (
+                not isinstance(evaluation, dict)
+                or evaluation.get("predicate") != source_task_name
+            ):
+                raise ValueError(
+                    "recorded task-state evaluation differs from its predicate"
+                )
+            _replay_task_state_vectors(record.get("state"))
+        source_initial_task_state = cast(dict[str, object], task_records[0]["state"])
         return cls(
             samples=tuple(samples),
             source_sha256=source_sha256,
             actions_sha256=actions_sha256,
             source_files_sha256=source_files_sha256,
+            source_artifact_producer=source_artifact_producer,
             source_config=source_config,
             source_initial_arm_joint_positions=tuple(initial_arm.tolist()),
-            source_initial_gripper_position=float(initial_gripper),
+            source_initial_gripper_position=initial_gripper,
+            source_initial_task_state=source_initial_task_state,
             open_loop_horizon=open_loop_horizon,
             applied_action_steps=len(applied),
         )
@@ -324,6 +366,121 @@ def _jsonl_objects(raw: bytes, path: Path) -> list[dict[str, object]]:
             )
         records.append(record)
     return records
+
+
+def _source_finite_number(
+    value: object,
+    name: str,
+    *,
+    positive: bool = False,
+) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not np.isfinite(float(value))
+        or (positive and float(value) <= 0)
+    ):
+        qualifier = "positive finite" if positive else "finite"
+        raise ValueError(f"recorded runtime {name} must be {qualifier}")
+    return float(value)
+
+
+def _validate_source_runtime(
+    source_config: dict[str, object],
+    runtime: dict[str, object],
+) -> tuple[np.ndarray, float, float, int]:
+    if runtime.get("schema_version") != 9:
+        raise ValueError("recorded replay requires schema-v9 runtime evidence")
+    if runtime.get("base_model") != "pi0-droid":
+        raise ValueError("recorded runtime base model does not match PI0")
+    for name, action_source in (
+        ("config", source_config.get("action_source")),
+        ("runtime", runtime.get("action_source")),
+    ):
+        if action_source not in {None, "worldlines_policy"}:
+            raise ValueError(f"recorded {name} action source is not model-driven")
+
+    physics_dt = _source_finite_number(
+        runtime.get("physics_dt"), "physics_dt", positive=True
+    )
+    physics_steps = runtime.get("physics_steps_per_action")
+    if type(physics_steps) is not int or physics_steps < 1:
+        raise ValueError("recorded runtime physics_steps_per_action must be positive")
+    target_control_hz = _source_finite_number(
+        runtime.get("target_control_hz"), "target_control_hz", positive=True
+    )
+    control_hz = _source_finite_number(
+        runtime.get("control_hz"), "control_hz", positive=True
+    )
+    derived_control_hz = 1.0 / (physics_dt * physics_steps)
+    if not np.isclose(control_hz, derived_control_hz, rtol=0.0, atol=1e-9):
+        raise ValueError("recorded runtime control cadence is internally inconsistent")
+    if not np.isclose(target_control_hz, control_hz, rtol=0.0, atol=1e-9):
+        raise ValueError("recorded runtime control rate differs from its target")
+
+    configured_target = _source_finite_number(
+        source_config.get("target_control_hz"),
+        "configured target_control_hz",
+        positive=True,
+    )
+    if not np.isclose(configured_target, target_control_hz, rtol=0.0, atol=1e-9):
+        raise ValueError("recorded runtime target rate differs from its configuration")
+    configured_steps = source_config.get("physics_steps_per_action")
+    if configured_steps is not None and configured_steps != physics_steps:
+        raise ValueError("recorded runtime substeps differ from its configuration")
+
+    derived_physics_hz = 1.0 / physics_dt
+    for name, value in (
+        ("runtime physics_hz", runtime.get("physics_hz")),
+        ("configured physics_hz", source_config.get("physics_hz")),
+    ):
+        if value is None:
+            continue
+        physics_hz = _source_finite_number(value, name, positive=True)
+        if not np.isclose(physics_hz, derived_physics_hz, rtol=0.0, atol=1e-9):
+            raise ValueError(f"recorded {name} differs from physics_dt")
+
+    for field in ("solver_position_iterations", "solver_velocity_iterations"):
+        configured = source_config.get(field)
+        observed = runtime.get(field)
+        if configured is not None and configured != observed:
+            raise ValueError(f"recorded runtime {field} differs from its configuration")
+
+    task = source_config.get("task_success")
+    task_name = task.get("name") if isinstance(task, dict) else None
+    if not isinstance(task_name, str) or not task_name:
+        raise ValueError("recorded replay requires a task-success contract")
+    if runtime.get("task_success_predicate") != task_name:
+        raise ValueError(
+            "recorded runtime task predicate differs from its configuration"
+        )
+
+    initial_arm = _float_array(
+        runtime.get("initial_arm_joint_positions"),
+        "recorded initial arm state",
+        dtype=np.float64,
+    )
+    initial_gripper = runtime.get("initial_gripper_position")
+    if (
+        initial_arm.shape != (7,)
+        or isinstance(initial_gripper, bool)
+        or not isinstance(initial_gripper, (int, float))
+        or not np.isfinite(float(initial_gripper))
+    ):
+        raise ValueError("recorded replay has invalid initial robot state")
+    return initial_arm, float(initial_gripper), physics_dt, physics_steps
+
+
+def _expected_source_task_status(result: dict[str, object]) -> str:
+    predicate = result.get("task_success_predicate")
+    task_success = result.get("task_success")
+    if predicate is None:
+        if task_success is not None:
+            raise ValueError("recorded result has task success without a predicate")
+        return "not_evaluated"
+    if not isinstance(predicate, str) or type(task_success) is not bool:
+        raise ValueError("recorded result has invalid task-success semantics")
+    return "passed" if task_success else "failed"
 
 
 def _replay_sample_response(
