@@ -32,9 +32,11 @@ from sim_evals.hosted_droid import (
     HostedDroidError,
     HostedDroidRunner,
     MCPClient,
+    finalize_hosted_evidence_manifest,
     finalize_hosted_video_evidence,
     recover_hosted_video_evidence,
     scene1_cube_in_bowl_success_spec,
+    verify_hosted_evidence_manifest,
 )
 from sim_evals.inference.droid_observation import DroidObservation
 from run_hosted_eval import _resolve_open_loop_horizon, _timestamped_results_dir
@@ -1186,6 +1188,55 @@ class HostedDroidRunnerTest(unittest.TestCase):
 
         self.assertEqual(simulation.launch_calls, [])
 
+    def test_recorded_replay_accepts_bounded_initial_state_variation(self) -> None:
+        sampler = FakeSampler()
+        sampler.source_initial_arm_joint_positions = tuple([0.0] * 7)
+        sampler.source_initial_gripper_position = 0.0
+        runner = HostedDroidRunner(
+            FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True)),
+            sampler,
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                base_model="pi0-droid",
+                action_source="recorded_replay",
+                replay_source_sha256="a" * 64,
+                keep_session=False,
+            ),
+        )
+
+        comparison = runner._validate_replay_initial_state(
+            np.asarray([0.004, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            0.009,
+        )
+
+        self.assertIsNotNone(comparison)
+        self.assertAlmostEqual(comparison["maximum_arm_delta_radians"], 0.004)
+        self.assertAlmostEqual(comparison["gripper_delta"], 0.009)
+
+    def test_recorded_replay_rejects_initial_state_outside_bounds(self) -> None:
+        sampler = FakeSampler()
+        sampler.source_initial_arm_joint_positions = tuple([0.0] * 7)
+        sampler.source_initial_gripper_position = 0.0
+        runner = HostedDroidRunner(
+            FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True)),
+            sampler,
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                base_model="pi0-droid",
+                action_source="recorded_replay",
+                replay_source_sha256="a" * 64,
+                keep_session=False,
+            ),
+        )
+
+        with self.assertRaisesRegex(HostedDroidError, "initial arm state"):
+            runner._validate_replay_initial_state(
+                np.asarray([0.006, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                0.0,
+            )
+        with self.assertRaisesRegex(HostedDroidError, "initial gripper state"):
+            runner._validate_replay_initial_state(np.zeros(7), 0.011)
+
     def test_configuration_rejects_invalid_rollout_shape(self) -> None:
         with self.assertRaisesRegex(ValueError, "environment_uri"):
             HostedDroidConfig(environment_uri="")
@@ -1237,7 +1288,19 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 (results_dir / "result.json").read_text(encoding="utf-8")
             )
             self.assertEqual(result_payload["status"], "succeeded")
+            self.assertEqual(result_payload["execution_status"], "completed")
+            self.assertEqual(result_payload["task_status"], "not_evaluated")
             self.assertEqual(result_payload["result"], result.to_dict())
+            self.assertEqual(
+                result_payload["evidence"]["artifact_manifest"],
+                "evidence-manifest.json",
+            )
+            manifest = verify_hosted_evidence_manifest(results_dir)
+            self.assertEqual(manifest["terminal_record"], "result.json")
+            self.assertEqual(
+                manifest["files"]["result.json"]["sha256"],
+                hashlib.sha256((results_dir / "result.json").read_bytes()).hexdigest(),
+            )
             self.assertEqual(len(result_payload["evidence"]["frames"]), 6)
             self.assertEqual(
                 result_payload["evidence"]["actions"],
@@ -1321,6 +1384,22 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 (results_dir / "frames" / "sample-00001-exterior-1.png").is_file()
             )
 
+    def test_evidence_manifest_rejects_tampering_and_unlisted_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary)
+            (results_dir / "result.json").write_text("{}\n", encoding="utf-8")
+            finalize_hosted_evidence_manifest(
+                results_dir,
+                terminal_record="result.json",
+            )
+            verify_hosted_evidence_manifest(results_dir)
+
+            (results_dir / "unlisted.txt").write_text(
+                "late mutation\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(HostedDroidError, "inventory mismatch"):
+                verify_hosted_evidence_manifest(results_dir)
+
     def test_scene1_acceptance_stops_after_policy_lift_release_and_settle(
         self,
     ) -> None:
@@ -1369,6 +1448,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 "physically_credible_policy_placement_proven",
             )
             payload = json.loads((results_dir / "result.json").read_text())
+            self.assertEqual(payload["task_status"], "passed")
             self.assertEqual(
                 payload["evidence"]["task_states"],
                 {"path": "task-states.jsonl", "records": 9},
@@ -2417,6 +2497,34 @@ class HostedDroidRunnerTest(unittest.TestCase):
             if name == "isaac.step_simulation" and arguments["num_steps"] == 2
         ]
         self.assertEqual(retry_steps, [])
+
+    def test_simulation_state_transport_retry_does_not_advance_physics(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            tool_failure_messages={
+                "isaac.get_simulation_state": [
+                    "MCP tool 'isaac.get_simulation_state' transport request failed "
+                    "[MCP_TRANSPORT_CONNECT]"
+                ]
+            },
+        )
+        runner = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(environment_uri="cybernetics://envs/env_droid"),
+            sleep=lambda _: None,
+        )
+
+        state = runner._call(mcp, "isaac.get_simulation_state", {})
+
+        self.assertEqual(state["timeline_state"], "stopped")
+        state_calls = [
+            name for name, _ in mcp.calls if name == "isaac.get_simulation_state"
+        ]
+        step_calls = [name for name, _ in mcp.calls if name == "isaac.step_simulation"]
+        self.assertEqual(len(state_calls), 2)
+        self.assertEqual(step_calls, [])
 
     def test_camera_capture_survives_a_control_plane_dns_restart_window(self) -> None:
         restart_errors = [

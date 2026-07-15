@@ -6,7 +6,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from run_hosted_eval import _RecordedPi0Replay, _parser
+from run_hosted_eval import (
+    _RecordedPi0Replay,
+    _parser,
+    _validate_replay_configuration,
+)
+from sim_evals.hosted_droid import (
+    HostedDroidConfig,
+    _config_dict,
+    finalize_hosted_evidence_manifest,
+)
 
 
 def _pi0_sample(sample_index: int) -> dict[str, object]:
@@ -43,12 +52,16 @@ def _write_replay_evidence(
     applied_action_steps: int = 10,
     first_sample_index: int = 0,
 ) -> None:
+    source_config = HostedDroidConfig(
+        environment_uri="cybernetics://envs/env_droid",
+        base_model="pi0-droid",
+        instruction="put the cube in the bowl",
+        max_action_steps=applied_action_steps,
+        open_loop_horizon=8,
+    )
     config = {
         "schema_version": 9,
-        "config": {
-            "base_model": "pi0-droid",
-            "open_loop_horizon": 8,
-        },
+        "config": _config_dict(source_config),
     }
     (directory / "config.json").write_text(
         json.dumps(config),
@@ -109,6 +122,48 @@ def _write_replay_evidence(
         "\n".join(json.dumps(record) for record in records) + "\n",
         encoding="utf-8",
     )
+    (directory / "runtime.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 9,
+                "initial_arm_joint_positions": [0.0] * 7,
+                "initial_gripper_position": 0.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    task_records = [
+        {
+            "schema_version": 9,
+            "record_type": "task_state",
+            "action_index": action_index,
+        }
+        for action_index in [None, *range(applied_action_steps)]
+    ]
+    (directory / "task-states.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in task_records) + "\n",
+        encoding="utf-8",
+    )
+    (directory / "result.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 9,
+                "status": "succeeded",
+                "execution_status": "completed",
+                "task_status": "not_evaluated",
+                "result": {
+                    "action_steps": applied_action_steps,
+                    "task_success_predicate": None,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    finalize_hosted_evidence_manifest(directory, terminal_record="result.json")
+
+
+def _refresh_manifest(directory: Path) -> None:
+    finalize_hosted_evidence_manifest(directory, terminal_record="result.json")
 
 
 class HostedEvalParserTests(unittest.TestCase):
@@ -174,8 +229,103 @@ class HostedEvalParserTests(unittest.TestCase):
             metadata = first["policy_metadata"]
             self.assertEqual(metadata["evaluation_action_source"], "recorded_replay")
             self.assertEqual(metadata["replay_source_sha256"], sampler.source_sha256)
+            self.assertEqual(metadata["replay_actions_sha256"], sampler.actions_sha256)
+            self.assertGreaterEqual(len(sampler.source_files_sha256), 5)
             with self.assertRaisesRegex(RuntimeError, "exhausted"):
                 sampler.sample_droid(object(), timeout=1.0)
+
+    def test_recorded_sampler_rejects_unmanifested_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            _write_replay_evidence(source, applied_action_steps=1)
+            with (source / "actions.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write("\n")
+
+            with self.assertRaisesRegex(ValueError, "manifest.*inventory"):
+                _RecordedPi0Replay.load(source)
+
+    def test_recorded_sampler_rejects_timing_discontinuity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            _write_replay_evidence(source, applied_action_steps=2)
+            actions_path = source / "actions.jsonl"
+            records = [
+                json.loads(line) for line in actions_path.read_text().splitlines()
+            ]
+            applied = [
+                record
+                for record in records
+                if record.get("record_type") == "applied_action"
+            ]
+            applied[1]["simulation_timing"]["before"]["current_time"] += 0.01
+            applied[1]["simulation_timing"]["after"]["current_time"] += 0.01
+            actions_path.write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            _refresh_manifest(source)
+
+            with self.assertRaisesRegex(ValueError, "timing is not continuous"):
+                _RecordedPi0Replay.load(source)
+
+    def test_recorded_sampler_rejects_excess_timeline_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            _write_replay_evidence(source, applied_action_steps=1)
+            actions_path = source / "actions.jsonl"
+            records = [
+                json.loads(line) for line in actions_path.read_text().splitlines()
+            ]
+            applied = next(
+                record
+                for record in records
+                if record.get("record_type") == "applied_action"
+            )
+            timing = applied["simulation_timing"]
+            drift = 0.003
+            timing["after"]["current_time"] += drift
+            timing["observed_simulation_seconds"] += drift
+            timing["timeline_drift_seconds"] = drift
+            actions_path.write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            _refresh_manifest(source)
+
+            with self.assertRaisesRegex(ValueError, "exceeds the drift bound"):
+                _RecordedPi0Replay.load(source)
+
+    def test_replay_configuration_binds_environment_and_task_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            _write_replay_evidence(source, applied_action_steps=1)
+            sampler = _RecordedPi0Replay.load(source)
+            matching = HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                base_model="pi0-droid",
+                instruction="put the cube in the bowl",
+                max_action_steps=1,
+                open_loop_horizon=8,
+                action_source="recorded_replay",
+                replay_source_sha256=sampler.source_sha256,
+                keep_session=False,
+            )
+            _validate_replay_configuration(matching, sampler)
+
+            with self.assertRaisesRegex(SystemExit, "environment_uri"):
+                _validate_replay_configuration(
+                    HostedDroidConfig(
+                        environment_uri="cybernetics://envs/other",
+                        base_model="pi0-droid",
+                        instruction="put the cube in the bowl",
+                        max_action_steps=1,
+                        open_loop_horizon=8,
+                        action_source="recorded_replay",
+                        replay_source_sha256=sampler.source_sha256,
+                        keep_session=False,
+                    ),
+                    sampler,
+                )
 
     def test_recorded_sampler_rejects_non_contiguous_samples(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -205,6 +355,7 @@ class HostedEvalParserTests(unittest.TestCase):
             actions_path = source / "actions.jsonl"
             records = actions_path.read_text(encoding="utf-8").splitlines()
             actions_path.write_text("\n".join(records[:-1]) + "\n", encoding="utf-8")
+            _refresh_manifest(source)
 
             with self.assertRaisesRegex(ValueError, "complete applied-action prefix"):
                 _RecordedPi0Replay.load(source)
@@ -223,6 +374,7 @@ class HostedEvalParserTests(unittest.TestCase):
                 "\n".join(json.dumps(record) for record in records) + "\n",
                 encoding="utf-8",
             )
+            _refresh_manifest(source)
 
             with self.assertRaisesRegex(ValueError, "does not match its action index"):
                 _RecordedPi0Replay.load(source)
@@ -240,6 +392,7 @@ class HostedEvalParserTests(unittest.TestCase):
                 "\n".join(json.dumps(record) for record in records) + "\n",
                 encoding="utf-8",
             )
+            _refresh_manifest(source)
 
             with self.assertRaisesRegex(ValueError, "joint target"):
                 _RecordedPi0Replay.load(source)
@@ -257,6 +410,7 @@ class HostedEvalParserTests(unittest.TestCase):
                 "\n".join(json.dumps(record) for record in records) + "\n",
                 encoding="utf-8",
             )
+            _refresh_manifest(source)
 
             with self.assertRaisesRegex(ValueError, "requires simulation timing"):
                 _RecordedPi0Replay.load(source)
@@ -273,6 +427,7 @@ class HostedEvalParserTests(unittest.TestCase):
                     )
                     + "\n"
                 )
+            _refresh_manifest(source)
 
             with self.assertRaisesRegex(ValueError, "unknown record type"):
                 _RecordedPi0Replay.load(source)
@@ -285,6 +440,7 @@ class HostedEvalParserTests(unittest.TestCase):
             config = json.loads(config_path.read_text())
             config["schema_version"] = 9.0
             config_path.write_text(json.dumps(config), encoding="utf-8")
+            _refresh_manifest(source)
 
             with self.assertRaisesRegex(ValueError, "schema-v9"):
                 _RecordedPi0Replay.load(source)

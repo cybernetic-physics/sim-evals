@@ -18,6 +18,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Mapping, Protocol, cast
@@ -43,6 +44,7 @@ _TRANSIENT_MCP_FAILURE_MARKERS = (
 _IDEMPOTENT_TRANSPORT_RETRY_TOOLS = frozenset(
     {
         "isaac.capture_camera_image",
+        "isaac.get_simulation_state",
         "isaac.set_joint_positions",
     }
 )
@@ -526,6 +528,7 @@ class _RolloutOutcome:
 
 
 _EVIDENCE_SCHEMA_VERSION = 9
+_EVIDENCE_MANIFEST_NAME = "evidence-manifest.json"
 _EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
 _TASK_STATE_STDOUT_PREFIX = "DROID_TASK_STATE="
 _LEFT_FINGER_CONTACT = "left-finger-cube"
@@ -1373,7 +1376,125 @@ def recover_hosted_video_evidence(results_dir: Path) -> dict[str, Any]:
         results_dir / "video-recovery.json",
         (json.dumps(recovery, indent=2, sort_keys=True) + "\n").encode(),
     )
+    finalize_hosted_evidence_manifest(
+        results_dir,
+        terminal_record=("error.json" if error_path.is_file() else None),
+    )
     return recovery
+
+
+def _artifact_inventory(results_dir: Path) -> dict[str, dict[str, Any]]:
+    root = results_dir.expanduser().resolve()
+    files: dict[str, dict[str, Any]] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise HostedDroidError(
+                f"hosted evidence must not contain symlinks: {path.relative_to(root)}"
+            )
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative == _EVIDENCE_MANIFEST_NAME:
+            continue
+        raw = path.read_bytes()
+        files[relative] = {
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    return files
+
+
+def _producer_provenance() -> dict[str, Any]:
+    repository_root = Path(__file__).resolve().parents[2]
+    revision = os.environ.get("SIM_EVALS_REVISION")
+    if revision is None:
+        try:
+            revision = subprocess.run(
+                ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            revision = None
+
+    def package_version(name: str) -> str | None:
+        try:
+            return importlib_metadata.version(name)
+        except importlib_metadata.PackageNotFoundError:
+            return None
+
+    return {
+        "sim_evals_revision": revision,
+        "sim_evals_version": package_version("sim-evals"),
+        "cybernetics_sdk_version": package_version("cybernetic-physics"),
+    }
+
+
+def finalize_hosted_evidence_manifest(
+    results_dir: Path,
+    *,
+    terminal_record: str | None = None,
+) -> dict[str, Any]:
+    """Write the manifest last so every durable artifact is hash-bound."""
+
+    root = results_dir.expanduser().resolve()
+    if terminal_record is None:
+        terminal_record = next(
+            (name for name in ("result.json", "error.json") if (root / name).is_file()),
+            None,
+        )
+    if terminal_record is not None and not (root / terminal_record).is_file():
+        raise HostedDroidError(
+            f"hosted evidence terminal record is missing: {terminal_record}"
+        )
+    files = _artifact_inventory(root)
+    aggregate = hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest = {
+        "schema_version": _EVIDENCE_SCHEMA_VERSION,
+        "created_at": _utc_now(),
+        "terminal_record": terminal_record,
+        "aggregate_sha256": aggregate,
+        "producer": _producer_provenance(),
+        "files": files,
+    }
+    _atomic_write(
+        root / _EVIDENCE_MANIFEST_NAME,
+        (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(),
+    )
+    return manifest
+
+
+def verify_hosted_evidence_manifest(results_dir: Path) -> dict[str, Any]:
+    """Verify the manifest inventory exactly, including unlisted-file rejection."""
+
+    root = results_dir.expanduser().resolve()
+    manifest_path = root / _EVIDENCE_MANIFEST_NAME
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise HostedDroidError(
+            "hosted evidence manifest is missing or invalid"
+        ) from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != _EVIDENCE_SCHEMA_VERSION
+        or not isinstance(manifest.get("files"), dict)
+        or not isinstance(manifest.get("aggregate_sha256"), str)
+    ):
+        raise HostedDroidError("hosted evidence manifest has an invalid schema")
+    files = _artifact_inventory(root)
+    if manifest["files"] != files:
+        raise HostedDroidError("hosted evidence manifest file inventory mismatch")
+    aggregate = hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if manifest["aggregate_sha256"] != aggregate:
+        raise HostedDroidError("hosted evidence manifest aggregate mismatch")
+    return manifest
 
 
 class _EvidenceRecorder:
@@ -1387,6 +1508,7 @@ class _EvidenceRecorder:
         self.video_frames_dir = results_dir / "video-frames"
         self.video_path = results_dir / "rollout.mp4"
         self.video_manifest_path = self.video_frames_dir / "manifest.json"
+        self.evidence_manifest_path = results_dir / _EVIDENCE_MANIFEST_NAME
         self.runtime_path = results_dir / "runtime.json"
         self._video_metadata: dict[str, Any] | None = None
         self._action_record_count = 0
@@ -1602,16 +1724,29 @@ class _EvidenceRecorder:
             os.close(descriptor)
 
     def write_result(self, result: HostedDroidRunResult) -> None:
+        task_status = (
+            "not_evaluated"
+            if result.task_success_predicate is None
+            else "passed"
+            if result.task_success
+            else "failed"
+        )
         self._write_json(
             self.results_dir / "result.json",
             {
                 "schema_version": _EVIDENCE_SCHEMA_VERSION,
                 "status": "succeeded",
+                "execution_status": "completed",
+                "task_status": task_status,
                 "started_at": self.started_at,
                 "finished_at": _utc_now(),
                 "result": result.to_dict(),
                 "evidence": self._evidence_dict(),
             },
+        )
+        finalize_hosted_evidence_manifest(
+            self.results_dir,
+            terminal_record="result.json",
         )
 
     def write_error(
@@ -1624,6 +1759,8 @@ class _EvidenceRecorder:
         payload: dict[str, Any] = {
             "schema_version": _EVIDENCE_SCHEMA_VERSION,
             "status": "failed",
+            "execution_status": "failed",
+            "task_status": "not_completed",
             "started_at": self.started_at,
             "finished_at": _utc_now(),
             "error": {
@@ -1637,6 +1774,10 @@ class _EvidenceRecorder:
         if evidence_errors:
             payload["evidence_errors"] = evidence_errors
         self._write_json(self.results_dir / "error.json", payload)
+        finalize_hosted_evidence_manifest(
+            self.results_dir,
+            terminal_record="error.json",
+        )
 
     def _clear_previous_evidence(self) -> None:
         for path in (
@@ -1645,6 +1786,7 @@ class _EvidenceRecorder:
             self.actions_path,
             self.task_states_path,
             self.runtime_path,
+            self.evidence_manifest_path,
         ):
             path.unlink(missing_ok=True)
         for path in self.frames_dir.glob("sample-*.png"):
@@ -1687,6 +1829,7 @@ class _EvidenceRecorder:
                 "records": self._task_state_record_count,
             }
         return {
+            "artifact_manifest": _EVIDENCE_MANIFEST_NAME,
             "frames": frames,
             "actions": actions,
             "task_states": task_states,
@@ -1745,6 +1888,8 @@ _INITIAL_SETTLE_STABLE_CHECKS = 2
 _INITIAL_ARM_ERROR_TOLERANCE_RADIANS = 0.05
 _INITIAL_ARM_MOTION_TOLERANCE_RADIANS = 0.005
 _INITIAL_GRIPPER_TOLERANCE = 0.1
+_REPLAY_INITIAL_ARM_TOLERANCE_RADIANS = 0.005
+_REPLAY_INITIAL_GRIPPER_TOLERANCE = 0.01
 _MIN_LUMINANCE_P99 = 12.0
 _MIN_LUMINANCE_STDDEV = 2.0
 _MIN_NON_DARK_FRACTION = 0.01
@@ -1895,6 +2040,10 @@ class HostedDroidRunner:
                             physics_steps_per_action,
                         )
                     )
+                    replay_initial_state = self._validate_replay_initial_state(
+                        initial_arm_positions,
+                        initial_gripper_position,
+                    )
                     if evidence is not None:
                         evidence.write_runtime_metadata(
                             {
@@ -1914,6 +2063,19 @@ class HostedDroidRunner:
                                 "replay_source_sha256": (
                                     self.config.replay_source_sha256
                                 ),
+                                "replay_actions_sha256": getattr(
+                                    self.sampling_api,
+                                    "actions_sha256",
+                                    None,
+                                ),
+                                "replay_source_file_count": len(
+                                    getattr(
+                                        self.sampling_api,
+                                        "source_files_sha256",
+                                        {},
+                                    )
+                                ),
+                                "replay_initial_state": replay_initial_state,
                                 "robot_dynamics_profile": _DROID_DYNAMICS_PROFILE,
                                 "runtime_dynamics": runtime_dynamics,
                                 "policy_camera_paths": list(created_cameras),
@@ -2008,6 +2170,63 @@ class HostedDroidRunner:
             raise HostedDroidError(
                 "recorded replay sampler digest does not match its configuration"
             )
+
+    def _validate_replay_initial_state(
+        self,
+        arm_positions: np.ndarray,
+        gripper_position: float,
+    ) -> dict[str, Any] | None:
+        if self.config.action_source != "recorded_replay":
+            return None
+        try:
+            expected_arm = np.asarray(
+                getattr(
+                    self.sampling_api,
+                    "source_initial_arm_joint_positions",
+                    None,
+                ),
+                dtype=np.float64,
+            )
+        except (TypeError, ValueError):
+            expected_arm = np.asarray([], dtype=np.float64)
+        expected_gripper = getattr(
+            self.sampling_api,
+            "source_initial_gripper_position",
+            None,
+        )
+        if (
+            expected_arm.shape != (7,)
+            or not np.isfinite(expected_arm).all()
+            or isinstance(expected_gripper, bool)
+            or not isinstance(expected_gripper, (int, float))
+            or not math.isfinite(float(expected_gripper))
+        ):
+            raise HostedDroidError(
+                "recorded replay source is missing finite initial robot state"
+            )
+        arm_delta = np.abs(np.asarray(arm_positions, dtype=np.float64) - expected_arm)
+        gripper_delta = abs(float(gripper_position) - float(expected_gripper))
+        maximum_arm_delta = float(np.max(arm_delta))
+        if maximum_arm_delta > _REPLAY_INITIAL_ARM_TOLERANCE_RADIANS:
+            raise HostedDroidError(
+                "recorded replay initial arm state differs from its source: "
+                f"maximum_delta={maximum_arm_delta:.9f} rad"
+            )
+        if gripper_delta > _REPLAY_INITIAL_GRIPPER_TOLERANCE:
+            raise HostedDroidError(
+                "recorded replay initial gripper state differs from its source: "
+                f"delta={gripper_delta:.9f}"
+            )
+        return {
+            "source_arm_joint_positions": expected_arm.tolist(),
+            "source_gripper_position": float(expected_gripper),
+            "maximum_arm_delta_radians": maximum_arm_delta,
+            "gripper_delta": gripper_delta,
+            "maximum_allowed_arm_delta_radians": (
+                _REPLAY_INITIAL_ARM_TOLERANCE_RADIANS
+            ),
+            "maximum_allowed_gripper_delta": _REPLAY_INITIAL_GRIPPER_TOLERANCE,
+        }
 
     def _cleanup(
         self,
