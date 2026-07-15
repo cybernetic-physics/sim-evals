@@ -157,6 +157,7 @@ class FakeMCP:
         self.runtime_info_source = runtime_info_source
         self.runtime_joint_source = runtime_joint_source
         self.dynamics_configured = False
+        self.physics_context_reinitialized = False
         self.post_dynamics_steps = 0
         self.physics_dt = 1.0 / 60.0
         self.current_time = 0.0
@@ -202,7 +203,9 @@ class FakeMCP:
             if not self.robot_loaded:
                 return {"status": "error", "message": "robot missing"}
             if arguments.get("require_runtime") and (
-                not self.dynamics_configured or self.post_dynamics_steps < 1
+                not self.dynamics_configured
+                or not self.physics_context_reinitialized
+                or self.post_dynamics_steps < 1
             ):
                 return {
                     "status": "error",
@@ -288,6 +291,20 @@ class FakeMCP:
                 }
             if "nvidia_droid_isaaclab" in str(arguments["code"]):
                 self.dynamics_configured = True
+                self.physics_context_reinitialized = all(
+                    marker in str(arguments["code"])
+                    for marker in (
+                        "timeline.stop()",
+                        "SimulationManager.get_physics_sim_view() is not None",
+                        "timeline.play()",
+                        "new_physics_view is old_physics_view",
+                        "articulation_view.shared_metatype is None",
+                    )
+                )
+                self.physics_dt = 1.0 / 120.0
+                self.current_time += self.physics_dt
+                self.post_dynamics_steps += 1
+                self.timeline_state = "paused"
             return {"status": "success", "result": {"status": "success"}}
         if name == "isaac.step_simulation":
             if self.step_payloads:
@@ -520,7 +537,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
         step_calls = [
             args for name, args in mcp.calls if name == "isaac.step_simulation"
         ]
-        self.assertEqual(step_calls[-1]["num_steps"], 4)
+        self.assertEqual(step_calls[-1]["num_steps"], 8)
         self.assertTrue(all(call["pause_after"] for call in step_calls))
         robot_info_calls = [
             args for name, args in mcp.calls if name == "isaac.get_robot_info"
@@ -580,6 +597,13 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertIn("timeline.set_play_every_frame(True)", dynamics_script)
         self.assertIn("timeline.set_ticks_per_frame(1)", dynamics_script)
         self.assertIn("timeline.set_time_codes_per_second(120.0)", dynamics_script)
+        self.assertIn("timeline.stop()", dynamics_script)
+        self.assertIn("timeline.commit()", dynamics_script)
+        self.assertIn("if timeline.is_stopped():", dynamics_script)
+        self.assertIn("SimulationManager.get_physics_sim_view()", dynamics_script)
+        self.assertIn("new_physics_view is old_physics_view", dynamics_script)
+        self.assertIn("articulation_view.shared_metatype is None", dynamics_script)
+        self.assertIn("physics_context_reinitialized", dynamics_script)
         self.assertIn("configured_gripper = True", dynamics_script)
         self.assertIn("57.29577951308232", dynamics_script)
         dynamics_index = next(
@@ -610,13 +634,13 @@ class HostedDroidRunnerTest(unittest.TestCase):
             and "DROID_ROBOT_METADATA=" in str(arguments["code"])
         )
         self.assertLess(last_metadata_index, dynamics_index)
-        self.assertLess(dynamics_index, first_step_index)
-        self.assertLess(first_step_index, runtime_info_index)
+        self.assertLess(dynamics_index, runtime_info_index)
         self.assertLess(runtime_info_index, initial_pose_index)
+        self.assertLess(initial_pose_index, first_step_index)
         self.assertEqual(simulation.launch_calls[0][1]["wait"], False)
         self.assertEqual(len(simulation.wait_calls), 1)
-        self.assertAlmostEqual(result.physics_dt, 1.0 / 60.0)
-        self.assertEqual(result.physics_steps_per_action, 4)
+        self.assertAlmostEqual(result.physics_dt, 1.0 / 120.0)
+        self.assertEqual(result.physics_steps_per_action, 8)
         self.assertAlmostEqual(result.control_hz, 15.0)
 
     def test_requests_maximum_mcp_ttl_for_1000_action_run(self) -> None:
@@ -1733,7 +1757,6 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 readiness_failures=0,
                 warm=True,
                 step_payloads=[
-                    {"stepped": 1},
                     {"stepped": 32},
                     {"stepped": 12},
                     {"stepped": 12},
@@ -1771,11 +1794,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
             readiness_failures=0,
             warm=True,
             step_payloads=[
-                {"stepped": 1},
                 {"stepped": 32},
-                {"stepped": 4},
-                {"stepped": 4},
-                {"stepped": 4, "advanced_steps": 8},
+                {"stepped": 8},
+                {"stepped": 8},
+                {"stepped": 8, "advanced_steps": 16},
             ],
         )
         runner = HostedDroidRunner(
