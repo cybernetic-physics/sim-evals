@@ -382,6 +382,23 @@ Checkpoint roles are deliberately different:
   interval and at the final training episode. Resume training only from one of
   these replay-bearing directories.
 
+Run deterministic promotion evidence from a frozen replay-bearing checkpoint
+without collecting replay or updating/checkpointing the controller:
+
+```bash
+python run_hosted_dsrl.py \
+  --environment-uri "$CYBERNETICS_DROID_ENV_URI" \
+  --episodes 0 \
+  --eval-episodes 1 \
+  --resume "$PWD/runs/hosted-dsrl/train/controller/checkpoint-000010" \
+  --record-video \
+  --results-dir "$PWD/runs/hosted-dsrl/promotion-eval"
+```
+
+Evaluation-only mode requires both `--resume` and at least one eval episode. It
+accepts only a replay-bearing checkpoint, so a successful video can be tied to
+an existing trained controller rather than one mutated immediately beforehand.
+
 Each episode creates a fresh PI0 sampling session and a fresh owned simulation
 session. The runner also verifies the pinned PI0 checkpoint lineage and the
 SHA-256 acknowledgement of the exact `[10, 32]` noise tensor before applying
@@ -422,7 +439,9 @@ Launches are sequential. The manifest records each workflow id immediately,
 resumes an existing run instead of duplicating it, verifies the immutable source
 binding before launch or resume and again on the terminal result, and stores only
 exact ready output-version URIs. No workflow is created by the default dry-run
-mode.
+mode. A sidecar advisory lock serializes the complete load/create, launch, poll,
+and manifest-write lifecycle across local processes so two launchers cannot
+create a workflow for the same planned variant.
 
 Omit `--results-dir` to create a collision-resistant UTC directory such as
 `runs/hosted-droid/20260712T140506.123456Z`. The final console JSON reports the

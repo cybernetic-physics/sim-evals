@@ -73,7 +73,7 @@ _LEGACY_CAMERA_CONTRACT_MARKERS = (
     "unexpected argument",
     "extra inputs are not permitted",
 )
-_PI0_DROID_POLICY_PROFILE: dict[str, Any] = {
+PI0_DROID_POLICY_PROFILE: dict[str, Any] = {
     "base_model": "pi0-droid",
     "openpi_config": "pi0_droid_jointpos_polaris",
     "checkpoint_uri": "gs://openpi-assets/checkpoints/polaris/pi0_droid_jointpos_polaris",
@@ -4893,11 +4893,11 @@ def _validate_policy_response(
         return
     metadata = _response_field(response, "policy_metadata")
     mismatched_profile_keys = (
-        sorted(_PI0_DROID_POLICY_PROFILE)
+        sorted(PI0_DROID_POLICY_PROFILE)
         if not isinstance(metadata, Mapping)
         else sorted(
             key
-            for key, expected in _PI0_DROID_POLICY_PROFILE.items()
+            for key, expected in PI0_DROID_POLICY_PROFILE.items()
             if metadata.get(key) != expected
         )
     )

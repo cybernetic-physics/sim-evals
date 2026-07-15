@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import call, patch
 
 import numpy as np
 import pytest
@@ -272,6 +273,37 @@ def test_torch_checkpoint_loader_rejects_corruption(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="hash"):
         TorchDsrlController.load_checkpoint(checkpoint_dir, device="cpu")
+
+
+def test_checkpoint_fsyncs_each_file_and_atomic_directory_entry(tmp_path) -> None:
+    pytest.importorskip("torch")
+    controller = TorchDsrlController(_small_config())
+    observation = _observation(14)
+    controller.record_transition(
+        SimpleNamespace(
+            observation=observation,
+            next_observation=_observation(15),
+            dsrl_action=controller.select_action(observation),
+            reward=-1.0,
+            discount=controller.gamma**10,
+            mask=1.0,
+            policy_metadata=_base_policy_metadata(),
+        )
+    )
+    checkpoint_dir = tmp_path / "checkpoint"
+
+    with (
+        patch("sim_evals.dsrl.os.fsync") as fsync,
+        patch("sim_evals.dsrl._fsync_directory") as fsync_directory,
+    ):
+        controller.save_checkpoint(checkpoint_dir, include_replay=True)
+
+    assert fsync.call_count == 3
+    assert fsync_directory.call_args_list == [
+        call(checkpoint_dir),
+        call(checkpoint_dir),
+        call(checkpoint_dir),
+    ]
 
 
 def test_training_resume_rejects_lightweight_checkpoint(tmp_path) -> None:

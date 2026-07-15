@@ -3,7 +3,10 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import multiprocessing
+import queue
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -99,6 +102,78 @@ class FakeWorkflowClient:
             status="failed",
             error_message="builder could not validate the scene",
         )
+
+
+class _ConcurrentWorkflowClient:
+    def __init__(self, created_variants: Any) -> None:
+        self.created_variants = created_variants
+
+    def create_simulation_from_prompt(
+        self,
+        *,
+        prompt: str,
+        environment: ImmutableEnvironmentVersion,
+        budget_turns: int,
+        budget_seconds: float,
+        workspace_id: str | None,
+    ) -> WorkflowRunSnapshot:
+        del budget_turns, budget_seconds, workspace_id
+        variant_line = next(
+            line for line in prompt.splitlines() if line.startswith("Variant id: ")
+        )
+        variant_id = variant_line.removeprefix("Variant id: ")
+        self.created_variants.put(variant_id)
+        # Keep the create window open long enough that an unlocked peer would
+        # read the same planned variant and duplicate it.
+        time.sleep(0.2)
+        return WorkflowRunSnapshot(
+            run_id=f"wfr_{variant_id}",
+            status="queued",
+            input={
+                "prompt": prompt,
+                "sessionMode": "environment",
+                "environmentId": environment.environment_id,
+                "environmentVersionId": environment.version_id,
+            },
+        )
+
+    def get_workflow_run(self, run_id: str) -> WorkflowRunSnapshot:
+        variant_id = run_id.removeprefix("wfr_")
+        return WorkflowRunSnapshot(
+            run_id=run_id,
+            status="completed",
+            input={
+                "sessionMode": "environment",
+                "environmentId": "env_droid",
+                "environmentVersionId": "ver_immutable",
+            },
+            result={
+                "environmentId": f"env_{variant_id}",
+                "environmentVersionId": f"ver_{variant_id}",
+                "environmentVersionStatus": "ready",
+            },
+        )
+
+
+def _launch_one_process(
+    manifest: Any,
+    manifest_path: str,
+    created_variants: Any,
+    start: Any,
+    results: Any,
+) -> None:
+    start.wait()
+    try:
+        result = launch_curriculum(
+            manifest,
+            _ConcurrentWorkflowClient(created_variants),
+            manifest_path=manifest_path,
+            max_launches=1,
+            poll_interval_seconds=0,
+        )
+        results.put(("ok", len(result.output_environment_uris)))
+    except BaseException as exc:  # pragma: no cover - reported in parent process
+        results.put(("error", type(exc).__name__, str(exc)))
 
 
 class CurriculumPlanTests(unittest.TestCase):
@@ -287,6 +362,71 @@ class CurriculumLaunchTests(unittest.TestCase):
             client._request("POST", "/v1/workflows/runs", json_body={})
 
         self.assertNotIn("internal", str(raised.exception))
+
+    def test_rest_adapter_translates_transport_failure_with_chained_cause(self) -> None:
+        transport_error = TimeoutError("socket detail must remain in the cause")
+
+        class _HttpClient:
+            @staticmethod
+            def request(*_args: object, **_kwargs: object) -> None:
+                raise transport_error
+
+        client = object.__new__(CyberneticsWorkflowRunClient)
+        client._client = _HttpClient()
+        client.api_key = "not-a-real-key"
+
+        with self.assertRaisesRegex(
+            CurriculumWorkflowError,
+            r"^POST /v1/workflows/runs transport request failed$",
+        ) as raised:
+            client._request("POST", "/v1/workflows/runs", json_body={})
+
+        self.assertIs(raised.exception.__cause__, transport_error)
+        self.assertNotIn("socket detail", str(raised.exception))
+
+    @unittest.skipUnless(
+        "fork" in multiprocessing.get_all_start_methods(),
+        "requires POSIX advisory locks",
+    )
+    def test_concurrent_launchers_do_not_duplicate_a_variant_workflow(self) -> None:
+        context = multiprocessing.get_context("fork")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            write_manifest(self.manifest, path)
+            created_variants = context.Queue()
+            results = context.Queue()
+            start = context.Event()
+            processes = [
+                context.Process(
+                    target=_launch_one_process,
+                    args=(self.manifest, str(path), created_variants, start, results),
+                )
+                for _ in range(2)
+            ]
+            for process in processes:
+                process.start()
+            start.set()
+            for process in processes:
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=2)
+                    self.fail("concurrent curriculum launcher did not finish")
+                self.assertEqual(process.exitcode, 0)
+
+            outcomes = [results.get(timeout=2) for _ in processes]
+            variants = [created_variants.get(timeout=2) for _ in processes]
+            persisted = load_manifest(path)
+
+            self.assertEqual(sorted(outcomes), [("ok", 1), ("ok", 2)])
+        self.assertEqual(len(set(variants)), 2)
+        self.assertEqual(
+            set(variants),
+            {variant.variant_id for variant in self.manifest.variants[:2]},
+        )
+        self.assertEqual(len(persisted.output_environment_uris), 2)
+        with self.assertRaises(queue.Empty):
+            created_variants.get(timeout=0.05)
 
     def test_resumes_recorded_run_before_creating_next(self) -> None:
         running = self.manifest.with_execution(

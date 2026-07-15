@@ -152,12 +152,14 @@ class CyberneticsDreamZeroClientTest(unittest.TestCase):
                 return self.value
 
         class Sampler:
+            metadata = {"ack": "matching"}
+
             def sample_droid(self, _observation, **kwargs):
                 self.options = kwargs
                 return Future(
                     {
                         "action_chunk": np.zeros((10, 8), dtype=np.float32),
-                        "policy_metadata": {"ack": "matching"},
+                        "policy_metadata": dict(self.metadata),
                     }
                 )
 
@@ -187,11 +189,17 @@ class CyberneticsDreamZeroClientTest(unittest.TestCase):
         with patch.dict("sys.modules", {"cybernetics": fake_sdk}):
             api = CyberneticsSDKDroidSamplingAPI(base_model="pi0-droid")
             response = api.sample_droid(observation, dsrl_action=action, timeout=19)
+            sampler.metadata = {"ack": "different"}
+            with self.assertRaisesRegex(ValueError, "noise acknowledgement mismatch"):
+                api.sample_droid(observation, dsrl_action=action, timeout=19)
             api.close()
 
         np.testing.assert_array_equal(observed_actions[0], action)
         self.assertIs(sampler.options["dsrl_action"].__class__, SDKDsrlAction)
-        self.assertEqual(checked_metadata, [{"ack": "matching"}])
+        self.assertEqual(
+            checked_metadata,
+            [{"ack": "matching"}, {"ack": "different"}],
+        )
         self.assertEqual(response["action_chunk"].shape, (10, 8))
 
     def test_collects_raw_droid_observation_and_consumes_action_chunk(self) -> None:

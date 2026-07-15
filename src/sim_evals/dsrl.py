@@ -451,8 +451,12 @@ class TorchDsrlController:
             "numpy_rng_state": self._rng.bit_generator.state,
             "torch_generator_state": self._torch_generator.get_state(),
         }
-        self._torch.save(state, temp_path)
+        with temp_path.open("wb") as output:
+            self._torch.save(state, output)
+            output.flush()
+            os.fsync(output.fileno())
         os.replace(temp_path, checkpoint_path)
+        _fsync_directory(path)
         replay_path = None
         if include_replay:
             replay_path = path / "replay.npz"
@@ -471,11 +475,15 @@ class TorchDsrlController:
                     cursor=np.asarray([self.replay.cursor], dtype=np.int64),
                     size=np.asarray([self.replay.size], dtype=np.int64),
                 )
+                output.flush()
+                os.fsync(output.fileno())
             os.replace(replay_temp, replay_path)
+            _fsync_directory(path)
         else:
             stale_replay = path / "replay.npz"
             if stale_replay.exists():
                 stale_replay.unlink()
+                _fsync_directory(path)
         manifest = {
             "schema_version": 1,
             "method": DSRL_METHOD_VARIANT,
@@ -507,6 +515,9 @@ class TorchDsrlController:
         expected_base_policy_metadata: Mapping[str, Any] | None = None,
         require_replay: bool = False,
     ) -> "TorchDsrlController":
+        # Optimizer and RNG state require pickle-compatible loading. Resume paths
+        # must therefore be trusted, locally produced pipeline artifacts; hashes
+        # above detect corruption but do not authenticate a malicious file.
         try:
             import torch
         except ImportError as exc:
@@ -1089,8 +1100,26 @@ def _base_policy_lineage(metadata: Mapping[str, Any]) -> dict[str, Any]:
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_bytes(encoded)
-    os.replace(temporary, path)
+    try:
+        with temporary.open("wb") as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 __all__ = [

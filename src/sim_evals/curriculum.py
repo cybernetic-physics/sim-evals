@@ -8,6 +8,7 @@ output version URI after every state transition.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -16,9 +17,10 @@ import os
 import random
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Protocol, Sequence, cast
+from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, Sequence, cast
 
 
 CURRICULUM_SCHEMA_VERSION = "droid-scene-curriculum/v1"
@@ -420,12 +422,17 @@ class CyberneticsWorkflowRunClient:
         *,
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        response = self._client.request(
-            method,
-            path,
-            json=json_body,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-        )
+        try:
+            response = self._client.request(
+                method,
+                path,
+                json=json_body,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise CurriculumWorkflowError(
+                f"{method} {path} transport request failed"
+            ) from exc
         status_code = getattr(response, "status_code", None)
         if not isinstance(status_code, int) or status_code < 200 or status_code >= 300:
             detail = _safe_http_error_detail(response)
@@ -497,6 +504,7 @@ def write_manifest(manifest: CurriculumManifest, path: str | Path) -> Path:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)
     return destination
@@ -518,17 +526,19 @@ def load_or_create_manifest(
 ) -> CurriculumManifest:
     """Resume only when the persisted immutable plan matches the requested plan."""
 
-    planned = plan_curriculum(config)
     destination = Path(path)
-    if not destination.exists():
-        write_manifest(planned, destination)
-        return planned
-    existing = load_manifest(destination)
-    if not _constant_time_equal(existing.plan_sha256, planned.plan_sha256):
-        raise CurriculumError(
-            "existing manifest describes a different curriculum plan; choose a new path"
-        )
-    return existing
+    with _manifest_lock(destination):
+        planned = plan_curriculum(config)
+        if not destination.exists():
+            write_manifest(planned, destination)
+            return planned
+        existing = load_manifest(destination)
+        if not _constant_time_equal(existing.plan_sha256, planned.plan_sha256):
+            raise CurriculumError(
+                "existing manifest describes a different curriculum plan; "
+                "choose a new path"
+            )
+        return existing
 
 
 def launch_curriculum(
@@ -551,6 +561,51 @@ def launch_curriculum(
     already recorded as running.  A timeout preserves that running run id so a
     later invocation resumes it instead of creating a duplicate.
     """
+
+    destination = Path(manifest_path)
+    with _manifest_lock(destination):
+        if destination.exists():
+            current = load_manifest(destination)
+            if not _constant_time_equal(
+                current.plan_sha256,
+                manifest.plan_sha256,
+            ):
+                raise CurriculumError(
+                    "persisted manifest describes a different curriculum plan"
+                )
+        else:
+            write_manifest(manifest, destination)
+            current = manifest
+        return _launch_curriculum_locked(
+            current,
+            client,
+            manifest_path=destination,
+            max_launches=max_launches,
+            budget_turns=budget_turns,
+            budget_seconds=budget_seconds,
+            workflow_timeout_seconds=workflow_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            workspace_id=workspace_id,
+            monotonic=monotonic,
+            sleep=sleep,
+        )
+
+
+def _launch_curriculum_locked(
+    manifest: CurriculumManifest,
+    client: WorkflowRunClient,
+    *,
+    manifest_path: Path,
+    max_launches: int,
+    budget_turns: int,
+    budget_seconds: float,
+    workflow_timeout_seconds: float,
+    poll_interval_seconds: float,
+    workspace_id: str | None,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> CurriculumManifest:
+    """Run one sequential launch plan while the manifest lock is held."""
 
     _require_bounded_int(
         max_launches,
@@ -1082,6 +1137,34 @@ def _safe_http_error_detail(response: Any) -> str | None:
     if code and message:
         return f"{code}: {message}"
     return code or message
+
+
+@contextmanager
+def _manifest_lock(manifest_path: Path) -> Iterator[None]:
+    """Serialize all durable execution-state decisions across local processes."""
+
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = manifest_path.with_name(f".{manifest_path.name}.lock")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 __all__ = [

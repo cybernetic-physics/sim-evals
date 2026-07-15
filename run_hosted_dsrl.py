@@ -21,6 +21,7 @@ from typing import Any, Protocol, cast
 
 from sim_evals.dsrl import DsrlConfig, TorchDsrlController
 from sim_evals.hosted_droid import (
+    PI0_DROID_POLICY_PROFILE,
     HostedDroidConfig,
     HostedDroidRunner,
     SimulationClientAPI,
@@ -36,17 +37,7 @@ _MAX_UNGATED_TRAIN_EPISODES = 1
 _IMMUTABLE_ENVIRONMENT_URI = re.compile(
     r"^cybernetics://envs/[^/?#]+/versions/[^/?#]+$"
 )
-_EXPECTED_PI0_BASE_POLICY_LINEAGE: dict[str, Any] = {
-    "base_model": "pi0-droid",
-    "openpi_config": "pi0_droid_jointpos_polaris",
-    "checkpoint_uri": (
-        "gs://openpi-assets/checkpoints/polaris/pi0_droid_jointpos_polaris"
-    ),
-    "openpi_source_commit": "714ec9aa5e4e9b73b98c6bf3a328f377268e26f9",
-    "action_space": "droid_joint_position",
-    "action_horizon": 10,
-    "action_dim": 8,
-}
+_EXPECTED_PI0_BASE_POLICY_LINEAGE = dict(PI0_DROID_POLICY_PROFILE)
 
 
 class _CheckpointableDsrlController(Protocol):
@@ -160,7 +151,15 @@ def _parser() -> argparse.ArgumentParser:
             "(or CYBERNETICS_DROID_ENV_URI)"
         ),
     )
-    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=1,
+        help=(
+            "training episodes; use 0 only with --resume and one or more "
+            "--eval-episodes"
+        ),
+    )
     parser.add_argument(
         "--allow-zero-success-training",
         action="store_true",
@@ -263,8 +262,17 @@ def _validate_args(args: argparse.Namespace) -> None:
             "--environment-uri must pin an immutable "
             "cybernetics://envs/.../versions/... version"
         )
-    if args.episodes < 1:
-        raise ValueError("--episodes must be at least 1")
+    if args.episodes < 0:
+        raise ValueError("--episodes must not be negative")
+    if args.episodes == 0:
+        if args.eval_episodes < 1:
+            raise ValueError(
+                "--episodes 0 requires at least one --eval-episodes rollout"
+            )
+        if args.resume is None:
+            raise ValueError(
+                "--episodes 0 evaluation requires a replay-bearing --resume checkpoint"
+            )
     if (
         args.episodes > _MAX_UNGATED_TRAIN_EPISODES
         and not args.allow_zero_success_training

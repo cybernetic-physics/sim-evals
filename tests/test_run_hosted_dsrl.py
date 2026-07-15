@@ -42,6 +42,7 @@ class _FakeController:
         self.updates = 0
         self.checkpoint_calls: list[tuple[Path, bool]] = []
         self.base_policy_metadata = base_policy_metadata
+        self.replay_entries = 7
 
     @property
     def gamma(self) -> float:
@@ -53,6 +54,7 @@ class _FakeController:
             "base_policy_frozen": True,
             "transitions": self.transitions,
             "updates": self.updates,
+            "replay_size": self.replay_entries,
             "base_policy_metadata": self.base_policy_metadata,
         }
 
@@ -149,6 +151,37 @@ class HostedDsrlParserTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "limited to 1000"):
             _validate_args(args)
+
+    def test_eval_only_requires_both_resume_and_eval_episode(self) -> None:
+        args = _parser().parse_args(
+            [
+                "--environment-uri",
+                "cybernetics://envs/env_123/versions/ver_456",
+                "--episodes",
+                "0",
+                "--eval-episodes",
+                "1",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "replay-bearing --resume"):
+            _validate_args(args)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkpoint = Path(temporary_directory)
+            args = _parser().parse_args(
+                [
+                    "--environment-uri",
+                    "cybernetics://envs/env_123/versions/ver_456",
+                    "--episodes",
+                    "0",
+                    "--eval-episodes",
+                    "0",
+                    "--resume",
+                    str(checkpoint),
+                ]
+            )
+            with self.assertRaisesRegex(ValueError, "at least one --eval-episodes"):
+                _validate_args(args)
 
     def test_resume_rejects_controller_hyperparameter_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -387,6 +420,68 @@ class HostedDsrlTrainingTests(unittest.TestCase):
         self.assertEqual(manifest["status"], "failed")
         self.assertEqual(manifest["completed_train_episodes"], 0)
         self.assertEqual(controller.checkpoint_calls, [])
+
+    def test_eval_only_from_checkpoint_does_not_mutate_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            results_dir = root / "run"
+            checkpoint = root / "checkpoint-000010"
+            checkpoint.mkdir()
+            args = _args(
+                results_dir,
+                episodes=0,
+                eval_episodes=2,
+                extra_args=["--resume", str(checkpoint)],
+            )
+            controller = _FakeController()
+            sampler_count = 0
+            runner_calls: list[dict[str, object]] = []
+
+            def sampler_factory() -> _FakeSampler:
+                nonlocal sampler_count
+                sampler = _FakeSampler(sampler_count)
+                sampler_count += 1
+                return sampler
+
+            class EvalRunner:
+                def __init__(
+                    self,
+                    _client: object,
+                    sampler: _FakeSampler,
+                    _config: object,
+                    **kwargs: object,
+                ) -> None:
+                    self.sampler = sampler
+                    runner_calls.append(kwargs)
+
+                def run(self) -> _FakeResult:
+                    self.sampler.close()
+                    return _FakeResult(
+                        f"eval-{self.sampler.identity}",
+                        transitions=0,
+                        updates=controller.updates,
+                    )
+
+            before = dict(controller.metadata())
+            manifest = run_training(
+                args,
+                simulation_client=object(),
+                controller=controller,
+                sampler_factory=sampler_factory,
+                runner_factory=EvalRunner,
+                now=_Clock(),
+            )
+
+        self.assertEqual(sampler_count, 2)
+        self.assertEqual(len(runner_calls), 2)
+        self.assertTrue(all(call["deterministic_dsrl"] for call in runner_calls))
+        self.assertTrue(all(not call["train_dsrl_controller"] for call in runner_calls))
+        self.assertEqual(controller.metadata(), before)
+        self.assertEqual(controller.replay_entries, 7)
+        self.assertEqual(controller.checkpoint_calls, [])
+        self.assertEqual(manifest["completed_train_episodes"], 0)
+        self.assertEqual(manifest["completed_eval_episodes"], 2)
+        self.assertEqual(manifest["latest_checkpoint"], str(checkpoint))
 
     def test_constructor_failure_closes_the_new_sampler(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
