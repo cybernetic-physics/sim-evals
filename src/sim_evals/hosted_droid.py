@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -327,7 +328,12 @@ class HostedDroidConfig:
     open_loop_horizon: int = 8
     physics_steps_per_action: int | None = None
     target_control_hz: float = 15.0
+    physics_hz: float = 240.0
+    solver_position_iterations: int = 64
+    solver_velocity_iterations: int = 1
     runtime_provider: str | None = None
+    action_source: str = "worldlines_policy"
+    replay_source_sha256: str | None = None
     policy_mode: str = "native"
     include_predicted_video: bool = False
     request_timeout_seconds: float = 2400.0
@@ -380,6 +386,40 @@ class HostedDroidConfig:
             raise ValueError("physics_steps_per_action must be at least 1")
         if not math.isfinite(self.target_control_hz) or self.target_control_hz <= 0:
             raise ValueError("target_control_hz must be positive and finite")
+        if not math.isfinite(self.physics_hz) or self.physics_hz <= 0:
+            raise ValueError("physics_hz must be positive and finite")
+        cadence = self.physics_hz / self.target_control_hz
+        if not math.isclose(cadence, round(cadence), rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(
+                "physics_hz must be an integer multiple of target_control_hz"
+            )
+        for name, value in (
+            ("solver_position_iterations", self.solver_position_iterations),
+            ("solver_velocity_iterations", self.solver_velocity_iterations),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.action_source not in {"worldlines_policy", "recorded_replay"}:
+            raise ValueError(
+                "action_source must be worldlines_policy or recorded_replay"
+            )
+        if self.action_source == "recorded_replay":
+            if self.replay_source_sha256 is None or not re.fullmatch(
+                r"[0-9a-f]{64}", self.replay_source_sha256
+            ):
+                raise ValueError(
+                    "recorded_replay requires a lowercase SHA-256 source digest"
+                )
+            if self.base_model != "pi0-droid":
+                raise ValueError("recorded_replay requires base_model=pi0-droid")
+            if self.session_id is not None:
+                raise ValueError("recorded_replay requires a freshly launched session")
+            if self.keep_session:
+                raise ValueError(
+                    "recorded_replay requires evaluator-owned session cleanup"
+                )
+        elif self.replay_source_sha256 is not None:
+            raise ValueError("worldlines_policy must not set replay_source_sha256")
 
 
 @dataclass(frozen=True)
@@ -1679,7 +1719,6 @@ _DROID_INITIAL_ARM_JOINT_POSITIONS = (
 )
 _DROID_DYNAMICS_PROFILE = "cybernetics_droid_contact_v1"
 _DROID_DYNAMICS_STDOUT_PREFIX = "DROID_DYNAMICS_PROFILE="
-_DROID_PHYSICS_HZ = 120.0
 _DROID_GRIPPER_VELOCITY_LIMIT_RADIANS = 1.0
 _DROID_GRIPPER_STIFFNESS = 100.0
 _DROID_GRIPPER_DAMPING = 0.0002
@@ -1699,7 +1738,7 @@ _DROID_REST_OFFSET_METERS = 0.0
 _DROID_MAX_DEPENETRATION_VELOCITY_MPS = 3.0
 _CAMERA_CAPTURE_ATTEMPTS = 10
 _CAMERA_CAPTURE_RETRY_SECONDS = 0.5
-_CAMERA_WARMUP_STEPS = 32
+_CAMERA_WARMUP_ACTION_PERIODS = 4
 _CAMERA_WARMUP_SECONDS = 1.0
 _INITIAL_SETTLE_MAX_CHECKS = 30
 _INITIAL_SETTLE_STABLE_CHECKS = 2
@@ -1711,6 +1750,15 @@ _MIN_LUMINANCE_STDDEV = 2.0
 _MIN_NON_DARK_FRACTION = 0.01
 _MIN_NON_WHITE_FRACTION = 0.02
 _NON_WHITE_LUMINANCE_CUTOFF = 245.0
+
+
+def _droid_joint_positions_for_policy_action(action: np.ndarray) -> list[float]:
+    """Map one validated DROID policy action to runtime joint targets."""
+
+    if action.shape != (8,) or not np.isfinite(action).all():
+        raise ValueError("DROID policy action must contain eight finite values")
+    gripper = GRIPPER_CLOSED_RADIANS if float(action[7]) > 0.5 else 0.0
+    return [*action[:7].astype(float).tolist(), gripper]
 
 
 def _default_cameras() -> tuple[CameraSpec, ...]:
@@ -1777,6 +1825,7 @@ class HostedDroidRunner:
         self._sleep = sleep
 
     def run(self) -> HostedDroidRunResult:
+        self._validate_action_source()
         if self.config.record_video and self.config.results_dir is not None:
             _require_video_backend()
         evidence = (
@@ -1852,8 +1901,19 @@ class HostedDroidRunner:
                                 "base_model": self.config.base_model,
                                 "physics_dt": physics_dt,
                                 "physics_steps_per_action": physics_steps_per_action,
+                                "physics_hz": self.config.physics_hz,
+                                "solver_position_iterations": (
+                                    self.config.solver_position_iterations
+                                ),
+                                "solver_velocity_iterations": (
+                                    self.config.solver_velocity_iterations
+                                ),
                                 "target_control_hz": self.config.target_control_hz,
                                 "control_hz": control_hz,
+                                "action_source": self.config.action_source,
+                                "replay_source_sha256": (
+                                    self.config.replay_source_sha256
+                                ),
                                 "robot_dynamics_profile": _DROID_DYNAMICS_PROFILE,
                                 "runtime_dynamics": runtime_dynamics,
                                 "policy_camera_paths": list(created_cameras),
@@ -1934,6 +1994,21 @@ class HostedDroidRunner:
             evidence.write_result(result)
         return result
 
+    def _validate_action_source(self) -> None:
+        if self.config.action_source != "recorded_replay":
+            return
+        if getattr(self.sampling_api, "action_source", None) != "recorded_replay":
+            raise HostedDroidError(
+                "recorded_replay requires an explicitly marked replay sampler"
+            )
+        if (
+            getattr(self.sampling_api, "source_sha256", None)
+            != self.config.replay_source_sha256
+        ):
+            raise HostedDroidError(
+                "recorded replay sampler digest does not match its configuration"
+            )
+
     def _cleanup(
         self,
         session_id: str | None,
@@ -1941,18 +2016,22 @@ class HostedDroidRunner:
     ) -> list[str]:
         cleanup_errors: list[str] = []
         try:
-            self.sampling_api.close()
-        except Exception as exc:
-            cleanup_errors.append(
-                f"sampling API close failed: {type(exc).__name__}: {exc}"
-            )
-        if owns_session and session_id is not None and not self.config.keep_session:
             try:
-                self.simulation_client.stop_session(session_id)
+                self.sampling_api.close()
             except Exception as exc:
                 cleanup_errors.append(
-                    f"session stop failed: {type(exc).__name__}: {exc}"
+                    f"sampling API close failed: {type(exc).__name__}: {exc}"
                 )
+        finally:
+            if owns_session and session_id is not None and not self.config.keep_session:
+                try:
+                    self.simulation_client.stop_session(session_id)
+                except Exception as exc:
+                    cleanup_errors.append(
+                        f"session stop failed: {type(exc).__name__}: {exc}"
+                    )
+        # A normal stop failure is evidence, but BaseException from sampler close
+        # still propagates after the independent stop attempt above.
         return cleanup_errors
 
     def _wait_for_isaac(self, mcp: MCPClient) -> None:
@@ -2057,6 +2136,9 @@ print({prefix} + json.dumps(payload, sort_keys=True))
         return cast(dict[str, Any], payload)
 
     def _configure_robot_dynamics(self, mcp: MCPClient) -> dict[str, Any]:
+        physics_hz = self.config.physics_hz
+        solver_position_iterations = self.config.solver_position_iterations
+        solver_velocity_iterations = self.config.solver_velocity_iterations
         robot_path = json.dumps(self.config.robot_prim_path)
         cube_path = json.dumps("/World/rubiks_cube")
         receptacle_path = json.dumps(
@@ -2106,10 +2188,10 @@ timeline.commit()
 settings = carb.settings.get_settings()
 settings.set("/app/player/useFixedTimeStepping", True)
 settings.set("/app/player/CompensatePlayDelayInSecs", 0.0)
-settings.set("/persistent/simulation/minFrameRate", int({_DROID_PHYSICS_HZ}))
+settings.set("/persistent/simulation/minFrameRate", int({physics_hz}))
 timeline.set_play_every_frame(True)
 timeline.set_ticks_per_frame(1)
-timeline.set_time_codes_per_second({_DROID_PHYSICS_HZ})
+timeline.set_time_codes_per_second({physics_hz})
 robot_path = {robot_path}
 cube_path = {cube_path}
 receptacle_path = {receptacle_path}
@@ -2192,8 +2274,12 @@ for prim in Usd.PrimRange(root):
     if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
         articulation_api = PhysxSchema.PhysxArticulationAPI.Apply(prim)
         articulation_api.GetEnabledSelfCollisionsAttr().Set(False)
-        articulation_api.GetSolverPositionIterationCountAttr().Set(64)
-        articulation_api.GetSolverVelocityIterationCountAttr().Set(1)
+        articulation_api.GetSolverPositionIterationCountAttr().Set(
+            {solver_position_iterations}
+        )
+        articulation_api.GetSolverVelocityIterationCountAttr().Set(
+            {solver_velocity_iterations}
+        )
         articulation_roots += 1
 
 missing_joints = sorted(set(joint_settings) - set(configured_joints))
@@ -2210,7 +2296,7 @@ physics_scenes = 0
 for prim in stage.Traverse():
     if prim.IsA(UsdPhysics.Scene):
         physx_scene_api = PhysxSchema.PhysxSceneAPI.Apply(prim)
-        physx_scene_api.GetTimeStepsPerSecondAttr().Set({_DROID_PHYSICS_HZ})
+        physx_scene_api.GetTimeStepsPerSecondAttr().Set({physics_hz})
         physx_scene_api.GetEnableCCDAttr().Set(True)
         physics_scenes += 1
 if physics_scenes < 1:
@@ -2633,7 +2719,7 @@ if not (
 runtime_profile = {{
     "status": "success",
     "profile": "{_DROID_DYNAMICS_PROFILE}",
-    "physics_hz": {_DROID_PHYSICS_HZ},
+    "physics_hz": {physics_hz},
     "fixed_time_stepping": True,
     "play_every_frame": True,
     "timeline_ticks_per_frame": 1,
@@ -2643,8 +2729,8 @@ runtime_profile = {{
     "rigid_bodies": rigid_bodies,
     "physics_scenes": physics_scenes,
     "solver_type": "TGS",
-    "solver_position_iterations": 64,
-    "solver_velocity_iterations": 1,
+    "solver_position_iterations": {solver_position_iterations},
+    "solver_velocity_iterations": {solver_velocity_iterations},
     "solve_articulation_contact_last": True,
     "cube_ccd_enabled": True,
     "contact_offset_meters": {_DROID_CONTACT_OFFSET_METERS},
@@ -2701,6 +2787,25 @@ print(
             or profile.get("profile") != _DROID_DYNAMICS_PROFILE
         ):
             raise HostedDroidError("Isaac emitted invalid DROID dynamics profile")
+        observed_physics_hz = profile.get("physics_hz")
+        if (
+            isinstance(observed_physics_hz, bool)
+            or not isinstance(observed_physics_hz, (int, float))
+            or not math.isclose(
+                float(observed_physics_hz),
+                physics_hz,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise HostedDroidError("Isaac emitted the wrong DROID physics rate")
+        for field_name, expected in (
+            ("solver_position_iterations", solver_position_iterations),
+            ("solver_velocity_iterations", solver_velocity_iterations),
+        ):
+            observed = profile.get(field_name)
+            if isinstance(observed, bool) or observed != expected:
+                raise HostedDroidError(f"Isaac emitted the wrong DROID {field_name}")
         return cast(dict[str, Any], profile)
 
     def _reset_robot_for_policy(
@@ -2747,7 +2852,10 @@ print(
         physics_steps_per_action: int,
     ) -> tuple[np.ndarray, float]:
         target = np.asarray(_DROID_INITIAL_ARM_JOINT_POSITIONS, dtype=np.float32)
-        self._step_while_playing(mcp, num_steps=_CAMERA_WARMUP_STEPS)
+        self._step_while_playing(
+            mcp,
+            num_steps=(physics_steps_per_action * _CAMERA_WARMUP_ACTION_PERIODS),
+        )
         self._sleep(_CAMERA_WARMUP_SECONDS)
 
         previous: np.ndarray | None = None
@@ -3646,6 +3754,17 @@ print({prefix} + json.dumps(payload, sort_keys=True))
     def _control_cadence(self, mcp: MCPClient) -> tuple[float, int]:
         state = self._simulation_state(mcp)
         physics_dt = state["physics_dt"]
+        expected_physics_dt = 1.0 / self.config.physics_hz
+        if not math.isclose(
+            physics_dt,
+            expected_physics_dt,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise HostedDroidError(
+                "Isaac runtime physics dt does not match the configured DROID rate: "
+                f"expected={expected_physics_dt:.12f}s actual={physics_dt:.12f}s"
+            )
         configured_steps = self.config.physics_steps_per_action
         if configured_steps is not None:
             return physics_dt, configured_steps
@@ -3732,9 +3851,8 @@ print({prefix} + json.dumps(payload, sort_keys=True))
         on_target_accepted: Callable[[list[float], list[int]], None] | None = None,
     ) -> tuple[list[float], list[int], dict[str, Any]]:
         arm_indices, gripper_index = joint_indices
-        gripper = GRIPPER_CLOSED_RADIANS if float(action[7]) > 0.5 else 0.0
         applied_joint_indices = [*arm_indices, gripper_index]
-        joint_positions = [*action[:7].astype(float).tolist(), gripper]
+        joint_positions = _droid_joint_positions_for_policy_action(action)
         control_source = self._set_joint_positions_runtime(
             mcp,
             joint_positions=joint_positions,
@@ -3951,6 +4069,8 @@ def _raise_tool_error(name: str, payload: Mapping[str, Any]) -> None:
 
 
 def _is_retryable_mcp_failure(name: str, exc: HostedDroidError) -> bool:
+    if name == "isaac.step_simulation":
+        return False
     message = str(exc)
     if any(marker in message for marker in _TRANSIENT_MCP_FAILURE_MARKERS):
         return True
@@ -4105,7 +4225,12 @@ def _config_dict(config: HostedDroidConfig) -> dict[str, Any]:
         "open_loop_horizon": config.open_loop_horizon,
         "physics_steps_per_action": config.physics_steps_per_action,
         "target_control_hz": config.target_control_hz,
+        "physics_hz": config.physics_hz,
+        "solver_position_iterations": config.solver_position_iterations,
+        "solver_velocity_iterations": config.solver_velocity_iterations,
         "runtime_provider": config.runtime_provider,
+        "action_source": config.action_source,
+        "replay_source_sha256": config.replay_source_sha256,
         "policy_mode": config.policy_mode,
         "include_predicted_video": config.include_predicted_video,
         "request_timeout_seconds": config.request_timeout_seconds,

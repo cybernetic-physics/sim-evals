@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import tempfile
 import traceback
 import unittest
@@ -137,6 +138,7 @@ def _contact_integrity_payload(
     normal_impulse_ns: float = 0.01,
     contact_labels: set[str] | None = None,
     complete: bool = True,
+    physics_dt_seconds: float = 1.0 / 240.0,
 ) -> dict[str, Any]:
     pairs = request["pairs"]
     active_labels = (
@@ -162,7 +164,7 @@ def _contact_integrity_payload(
                         "signed_separation_m": -penetration_meters,
                         "penetration_m": penetration_meters,
                         "normal_impulse_ns": normal_impulse_ns,
-                        "normal_force_n": normal_impulse_ns * 120.0,
+                        "normal_force_n": normal_impulse_ns / physics_dt_seconds,
                     }
                 )
             pair_records.append(
@@ -184,7 +186,7 @@ def _contact_integrity_payload(
         samples.append(
             {
                 "update_index": update_index,
-                "physics_dt_seconds": 1.0 / 120.0,
+                "physics_dt_seconds": physics_dt_seconds,
                 "pairs": pair_records,
             }
         )
@@ -198,7 +200,7 @@ def _contact_integrity_payload(
         "schema_version": 1,
         "capture_source": "test",
         "sampling_semantics": "after_each_requested_kit_update",
-        "physics_dt_seconds": 1.0 / 120.0,
+        "physics_dt_seconds": physics_dt_seconds,
         "requested_updates": steps,
         "captured_updates": steps,
         "complete": complete,
@@ -442,9 +444,26 @@ class FakeMCP:
                     "stderr": "",
                 }
             if "cybernetics_droid_contact_v1" in str(arguments["code"]):
+                code = str(arguments["code"])
+                physics_hz_match = re.search(r'"physics_hz": ([0-9.]+)', code)
+                position_iterations_match = re.search(
+                    r'"solver_position_iterations": ([0-9]+)', code
+                )
+                velocity_iterations_match = re.search(
+                    r'"solver_velocity_iterations": ([0-9]+)', code
+                )
+                if not (
+                    physics_hz_match
+                    and position_iterations_match
+                    and velocity_iterations_match
+                ):
+                    raise AssertionError("dynamics script omitted solver cadence")
+                physics_hz = float(physics_hz_match.group(1))
+                solver_position_iterations = int(position_iterations_match.group(1))
+                solver_velocity_iterations = int(velocity_iterations_match.group(1))
                 self.dynamics_configured = True
                 self.physics_context_reinitialized = all(
-                    marker in str(arguments["code"])
+                    marker in code
                     for marker in (
                         "timeline.stop()",
                         "SimulationManager.get_physics_sim_view() is not None",
@@ -453,14 +472,16 @@ class FakeMCP:
                         "articulation_view.shared_metatype is None",
                     )
                 )
-                self.physics_dt = 1.0 / 120.0
+                self.physics_dt = 1.0 / physics_hz
                 self.current_time += self.physics_dt
                 self.post_dynamics_steps += 1
                 self.timeline_state = "paused"
                 profile = {
                     "status": "success",
                     "profile": _DROID_DYNAMICS_PROFILE,
-                    "physics_hz": 120.0,
+                    "physics_hz": physics_hz,
+                    "solver_position_iterations": solver_position_iterations,
+                    "solver_velocity_iterations": solver_velocity_iterations,
                     "gripper_drive": {
                         "stiffness": 100.0,
                         "damping": 0.0002,
@@ -486,6 +507,7 @@ class FakeMCP:
                 result["contact_integrity"] = _contact_integrity_payload(
                     contact_request,
                     steps=int(arguments["num_steps"]),
+                    physics_dt_seconds=self.physics_dt,
                 )
             advanced_steps = int(result.get("advanced_steps", result.get("stepped", 0)))
             if self.dynamics_configured:
@@ -611,7 +633,7 @@ class FakeSampler:
         *,
         error: Exception | None = None,
         response: Any | None = None,
-        close_error: Exception | None = None,
+        close_error: BaseException | None = None,
     ) -> None:
         self.observations: list[DroidObservation] = []
         self.timeouts: list[float | None] = []
@@ -717,7 +739,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
         step_calls = [
             args for name, args in mcp.calls if name == "isaac.step_simulation"
         ]
-        self.assertEqual(step_calls[-1]["num_steps"], 8)
+        self.assertEqual(step_calls[-1]["num_steps"], 16)
         self.assertTrue(all(call["pause_after"] for call in step_calls))
         robot_info_calls = [
             args for name, args in mcp.calls if name == "isaac.get_robot_info"
@@ -768,7 +790,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
         ast.parse(dynamics_script)
         self.assertIn("drive.GetStiffnessAttr().Set(400.0)", dynamics_script)
         self.assertIn("drive.GetDampingAttr().Set(80.0)", dynamics_script)
-        self.assertIn("GetSolverVelocityIterationCountAttr().Set(1)", dynamics_script)
+        self.assertIn(
+            "GetSolverVelocityIterationCountAttr().Set(\n            1",
+            dynamics_script,
+        )
         self.assertIn('physics_context.set_solver_type("TGS")', dynamics_script)
         self.assertIn(
             "physics_context.set_solve_articulation_contact_last(True)",
@@ -778,14 +803,14 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertIn(
             "GetMaxDepenetrationVelocityAttr().Set(\n            3.0", dynamics_script
         )
-        self.assertIn("GetTimeStepsPerSecondAttr().Set(120.0)", dynamics_script)
+        self.assertIn("GetTimeStepsPerSecondAttr().Set(240.0)", dynamics_script)
         self.assertIn(
-            'settings.set("/persistent/simulation/minFrameRate", int(120.0))',
+            'settings.set("/persistent/simulation/minFrameRate", int(240.0))',
             dynamics_script,
         )
         self.assertIn("timeline.set_play_every_frame(True)", dynamics_script)
         self.assertIn("timeline.set_ticks_per_frame(1)", dynamics_script)
-        self.assertIn("timeline.set_time_codes_per_second(120.0)", dynamics_script)
+        self.assertIn("timeline.set_time_codes_per_second(240.0)", dynamics_script)
         self.assertIn("timeline.stop()", dynamics_script)
         self.assertIn("timeline.commit()", dynamics_script)
         self.assertIn("if timeline.is_stopped():", dynamics_script)
@@ -860,8 +885,8 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertLess(initial_pose_index, first_step_index)
         self.assertEqual(simulation.launch_calls[0][1]["wait"], False)
         self.assertEqual(len(simulation.wait_calls), 1)
-        self.assertAlmostEqual(result.physics_dt, 1.0 / 120.0)
-        self.assertEqual(result.physics_steps_per_action, 8)
+        self.assertAlmostEqual(result.physics_dt, 1.0 / 240.0)
+        self.assertEqual(result.physics_steps_per_action, 16)
         self.assertAlmostEqual(result.control_hz, 15.0)
 
     def test_requests_maximum_mcp_ttl_for_1000_action_run(self) -> None:
@@ -1104,6 +1129,62 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 payload["evidence_errors"],
                 ["sampling API close failed: RuntimeError: close failed"],
             )
+
+    def test_sampler_interrupt_still_stops_evaluator_owned_session(self) -> None:
+        simulation = FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True))
+        sampler = FakeSampler(close_error=KeyboardInterrupt())
+        runner = HostedDroidRunner(
+            simulation,
+            sampler,
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+                keep_session=False,
+            ),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            runner.run()
+
+        self.assertTrue(sampler.closed)
+        self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
+
+    def test_recorded_replay_requires_fresh_owned_pi0_session(self) -> None:
+        replay = {
+            "environment_uri": "cybernetics://envs/env_droid",
+            "base_model": "pi0-droid",
+            "action_source": "recorded_replay",
+            "replay_source_sha256": "a" * 64,
+            "keep_session": False,
+        }
+
+        HostedDroidConfig(**replay)
+        with self.assertRaisesRegex(ValueError, "freshly launched"):
+            HostedDroidConfig(**replay, session_id="sess_existing")
+        with self.assertRaisesRegex(ValueError, "base_model=pi0-droid"):
+            HostedDroidConfig(**{**replay, "base_model": "dreamzero-droid"})
+        with self.assertRaisesRegex(ValueError, "session cleanup"):
+            HostedDroidConfig(**{**replay, "keep_session": True})
+
+    def test_recorded_replay_rejects_unmarked_sampler_before_launch(self) -> None:
+        simulation = FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True))
+        runner = HostedDroidRunner(
+            simulation,
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                base_model="pi0-droid",
+                action_source="recorded_replay",
+                replay_source_sha256="a" * 64,
+                keep_session=False,
+            ),
+        )
+
+        with self.assertRaisesRegex(HostedDroidError, "marked replay sampler"):
+            runner.run()
+
+        self.assertEqual(simulation.launch_calls, [])
 
     def test_configuration_rejects_invalid_rollout_shape(self) -> None:
         with self.assertRaisesRegex(ValueError, "environment_uri"):
@@ -1394,15 +1475,15 @@ class HostedDroidRunnerTest(unittest.TestCase):
         spec = scene1_cube_in_bowl_success_spec()
         contact_request = _contact_integrity_request(spec)
         step_payloads = [
-            {"stepped": 32},
-            {"stepped": 8},
-            {"stepped": 8},
+            {"stepped": 64},
+            {"stepped": 16},
+            {"stepped": 16},
             *[
                 {
-                    "stepped": 8,
+                    "stepped": 16,
                     "contact_integrity": _contact_integrity_payload(
                         contact_request,
-                        steps=8,
+                        steps=16,
                         penetration_meters=(0.003 if index == 1 else 0.0),
                     ),
                 }
@@ -1476,17 +1557,17 @@ class HostedDroidRunnerTest(unittest.TestCase):
         ]
         spec = scene1_cube_in_bowl_success_spec()
         request = _contact_integrity_request(spec)
-        step_payloads = [{"stepped": 32}, {"stepped": 8}, {"stepped": 8}]
+        step_payloads = [{"stepped": 64}, {"stepped": 16}, {"stepped": 16}]
         for index in range(8):
             labels = None
             if index == 5:
                 labels = {"cube-receptacle"}
             step_payloads.append(
                 {
-                    "stepped": 8,
+                    "stepped": 16,
                     "contact_integrity": _contact_integrity_payload(
                         request,
-                        steps=8,
+                        steps=16,
                         contact_labels=labels,
                     ),
                 }
@@ -1532,18 +1613,18 @@ class HostedDroidRunnerTest(unittest.TestCase):
         spec = scene1_cube_in_bowl_success_spec()
         request = _contact_integrity_request(spec)
         step_payloads = [
-            {"stepped": 32},
-            {"stepped": 8},
-            {"stepped": 8},
+            {"stepped": 64},
+            {"stepped": 16},
+            {"stepped": 16},
             {
-                "stepped": 8,
-                "contact_integrity": _contact_integrity_payload(request, steps=8),
+                "stepped": 16,
+                "contact_integrity": _contact_integrity_payload(request, steps=16),
             },
             {
-                "stepped": 8,
+                "stepped": 16,
                 "contact_integrity": _contact_integrity_payload(
                     request,
-                    steps=8,
+                    steps=16,
                     normal_impulse_ns=0.75,
                 ),
             },
@@ -1601,14 +1682,14 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 _task_state_payload(object_center=(0.36, -0.08, 0.14)),
             ],
             step_payloads=[
-                {"stepped": 32},
-                {"stepped": 8},
-                {"stepped": 8},
+                {"stepped": 64},
+                {"stepped": 16},
+                {"stepped": 16},
                 {
-                    "stepped": 8,
+                    "stepped": 16,
                     "contact_integrity": _contact_integrity_payload(
                         request,
-                        steps=8,
+                        steps=16,
                         complete=False,
                     ),
                 },
@@ -2102,12 +2183,58 @@ class HostedDroidRunnerTest(unittest.TestCase):
             HostedDroidConfig(
                 environment_uri="cybernetics://envs/env_droid",
                 max_action_steps=1,
+                physics_hz=120.0,
             ),
             sleep=lambda _: None,
         ).run()
 
         self.assertEqual(result.physics_steps_per_action, 8)
         self.assertAlmostEqual(result.control_hz, 15.0)
+
+    def test_control_cadence_supports_240_hz_contact_replay_profile(self) -> None:
+        mcp = FakeMCP(readiness_failures=0, warm=True)
+        result = HostedDroidRunner(
+            FakeSimulationClient(mcp),
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+                physics_hz=240.0,
+            ),
+            sleep=lambda _: None,
+        ).run()
+
+        self.assertAlmostEqual(result.physics_dt, 1.0 / 240.0)
+        self.assertEqual(result.physics_steps_per_action, 16)
+        self.assertAlmostEqual(result.control_hz, 15.0)
+        dynamics_script = next(
+            str(arguments["code"])
+            for name, arguments in mcp.calls
+            if name == "isaac.execute_script"
+            and "cybernetics_droid_contact_v1" in str(arguments["code"])
+        )
+        self.assertIn("GetTimeStepsPerSecondAttr().Set(240.0)", dynamics_script)
+        self.assertIn(
+            "GetSolverPositionIterationCountAttr().Set(\n            64",
+            dynamics_script,
+        )
+        self.assertIn(
+            "GetSolverVelocityIterationCountAttr().Set(\n            1", dynamics_script
+        )
+        warmup_steps = [
+            arguments["num_steps"]
+            for name, arguments in mcp.calls
+            if name == "isaac.step_simulation"
+        ][0]
+        self.assertEqual(warmup_steps, 64)
+
+    def test_config_rejects_non_integral_physics_control_cadence(self) -> None:
+        with self.assertRaisesRegex(ValueError, "integer multiple"):
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                physics_hz=200.0,
+                target_control_hz=15.0,
+            )
 
     def test_rejects_unproven_joint_target_control_source(self) -> None:
         mcp = FakeMCP(
@@ -2447,10 +2574,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
             readiness_failures=0,
             warm=True,
             step_payloads=[
-                {"stepped": 32},
-                {"stepped": 8},
-                {"stepped": 8},
-                {"stepped": 8, "advanced_steps": 16},
+                {"stepped": 64},
+                {"stepped": 16},
+                {"stepped": 16},
+                {"stepped": 16, "advanced_steps": 32},
             ],
         )
         runner = HostedDroidRunner(
@@ -2549,6 +2676,41 @@ class HostedDroidRunnerTest(unittest.TestCase):
 
         step_calls = [name for name, _ in mcp.calls if name == "isaac.step_simulation"]
         self.assertEqual(len(step_calls), 1)
+
+    def test_every_transient_step_failure_is_single_dispatch_and_pauses(self) -> None:
+        messages = (
+            "BRIDGE_OFFLINE: no bridge connected",
+            "ISAAC_UNREACHABLE: extension is not ready",
+            "Temporary failure in name resolution",
+            "MCP tool 'isaac.step_simulation' transport request failed "
+            "[MCP_TRANSPORT_CONNECT]",
+            "MCP tool 'isaac.step_simulation' failed with HTTP 502",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                mcp = FakeMCP(
+                    readiness_failures=0,
+                    warm=True,
+                    tool_failure_messages={"isaac.step_simulation": [message]},
+                )
+                runner = HostedDroidRunner(
+                    FakeSimulationClient(mcp),
+                    FakeSampler(),
+                    HostedDroidConfig(environment_uri="cybernetics://envs/env_droid"),
+                    sleep=lambda _: None,
+                )
+
+                with self.assertRaises(HostedDroidError):
+                    runner._step_while_playing(mcp, num_steps=1)
+
+                self.assertEqual(
+                    sum(name == "isaac.step_simulation" for name, _ in mcp.calls),
+                    1,
+                )
+                self.assertEqual(
+                    sum(name == "isaac.pause_simulation" for name, _ in mcp.calls),
+                    1,
+                )
 
     def test_all_black_frames_fail_closed_before_sampling(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2856,7 +3018,6 @@ class HostedDroidRunnerTest(unittest.TestCase):
             warm=True,
             transient_tool_failures={
                 "isaac.capture_camera_image": 2,
-                "isaac.step_simulation": 2,
             },
         )
 
