@@ -167,6 +167,26 @@ finger normals, sparse contact during a claimed lift, and more than `1 cm` of
 gripper-relative object slip while the close command remains active. Placement
 is causal only after a post-lift open command and measured bowl contact.
 
+Before accepting a manipulation episode, prove the hosted runtime can
+distinguish a clean separated control from penetration, excessive impulse, and
+a saturated contact buffer through the same public SDK and session-scoped MCP
+path used by the evaluator:
+
+```bash
+uv run --isolated --no-project \
+  --with /path/to/cybernetic-physics/sdk/python \
+  python run_contact_integrity_smoke.py \
+  --environment-uri cybernetics://envs/ENV_ID/versions/VERSION_ID \
+  --runtime-provider warm_pool
+```
+
+Use `--session-id SESSION_ID --keep-session` to validate an existing session
+before running `run_hosted_eval.py` against that same runtime. The smoke command
+creates rigid bodies only beneath `/World/ContactIntegritySmoke`, removes them
+before returning, saves every raw trace under `runs/contact-integrity/`, and
+exits nonzero unless all four machine-verifiable controls behave as expected.
+Video alone is never accepted as contact-integrity evidence.
+
 Use a Cybernetics SDK release that provides
 `cybernetics.sim.SimulationClient.mcp_session`. Authenticate with the normal
 SDK login or environment-based credential flow; this runner deliberately has
@@ -296,10 +316,19 @@ generation of exterior/wrist cameras, captures RGB PNG artifacts, reads named
 joint positions, samples one policy action chunk, and applies the configured
 open-loop slice before observing again. Fresh camera paths avoid stale path-keyed render
 products on older hosted images; the extension also releases those cached
-wrappers when cameras are replaced or deleted. The runner selects the first
-external camera for the streamed viewer through `isaac.set_active_camera`, with
-an `isaac.execute_script` compatibility fallback for older hosted images. This
-viewer selection does not change any DROID observation camera pose or pixels.
+wrappers when cameras are replaced or deleted. The runner creates a fourth
+viewer-only clone of the first exterior camera and selects that clone through
+`isaac.set_active_camera`, with an `isaac.execute_script` compatibility fallback
+for older hosted images. Interactive viewport navigation can therefore move the
+viewer without changing any image sent to the policy. Before every sample, the
+runner checks the ordered `exterior_1`, `exterior_2`, and `wrist` roles against
+the upstream DROID calibration, then repeats the check after all three frames
+are captured. Exterior poses are verified in world space and the wrist mount in
+gripper-local space. Projection, pose, unit scale, focal length, focus distance,
+apertures and offsets, f-stop, the canonical `(0.01, 1e6)` clipping range, and
+the absence of custom clipping planes must all match and remain finite. Missing
+or drifted calibration fails before inference rather than feeding a visually
+plausible wrong view to the policy.
 Explicit pre-dispatch `BRIDGE_OFFLINE` and `ISAAC_UNREACHABLE` responses are
 retried with the configured readiness poll interval. Other command failures are
 not replayed, so ambiguous or application-level errors still fail closed. An
@@ -311,6 +340,10 @@ requested frame count without `timed_out`; partial steps remain failure evidence
 not acknowledged actions. Before creating a fresh camera generation, the runner
 deletes older evaluator-owned external roots and wrist cameras. The updated
 extension releases their render products, keeping retained sessions bounded.
+An object-motion, contact-penetration, contact-impulse, or grasp-support
+violation is irreversible for task acceptance, so the evaluator stops at that
+action and records the exact terminal reason instead of spending the remaining
+action budget on an episode that can no longer pass.
 Sessions launched successfully by the evaluator remain running after the
 rollout. Use `--stop-session` to opt into cleanup. Attached sessions always
 remain caller-owned. Cleanup always attempts both sampling-client close and an
