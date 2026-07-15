@@ -367,6 +367,11 @@ episode requires an explicit `--allow-zero-success-training` acknowledgement or
 an easier curriculum; do not treat that acknowledgement as evidence that the
 reward is informative.
 
+Resource overrides fail before controller allocation above 8,192 replay
+transitions, 50,000 initial updates, or 512 updates per later transition. These
+are safety ceilings, not recommended training settings; the pinned defaults
+remain 2,048, 5,000, and 30 respectively.
+
 The hosted method is intentionally named
 `dsrl_pixels_proprio_no_vlm_token_v1`: the public sampler does not expose PI0's
 final 2,048-dimensional VLM token. It also uses a bounded replay ring and omits

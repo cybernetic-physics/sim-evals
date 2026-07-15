@@ -294,6 +294,7 @@ class TorchDsrlController:
             "reference_repository": DSRL_REFERENCE_REPOSITORY,
             "reference_commit": DSRL_REFERENCE_COMMIT,
             "base_policy_frozen": True,
+            "critic_backup_entropy": False,
             "reference_deviations": [
                 "final PI0 VLM token omitted because hosted sampling does not expose it",
                 "replay is a bounded hosted ring instead of the reference dynamically growing buffer",
@@ -689,6 +690,9 @@ class TorchDsrlController:
                 next_pixels, next_proprio, next_actions
             )
             target_q = torch.min(target_q_values, dim=0).values
+            # The pinned public DSRL learner calls update_critic with its
+            # backup_entropy=False default. Entropy regularizes the actor and
+            # temperature objectives, but is intentionally absent here.
             target = rewards + discounts * masks * target_q
 
         q_values = self.critic(pixels, proprio, actions)

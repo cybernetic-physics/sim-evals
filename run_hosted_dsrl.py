@@ -34,6 +34,9 @@ from sim_evals.inference.cybernetics_dreamzero import (
 _MAX_EPISODES_PER_RUN = 1_000
 _MAX_ACTION_STEPS_PER_EPISODE = 450
 _MAX_UNGATED_TRAIN_EPISODES = 1
+_MAX_REPLAY_CAPACITY = 8_192
+_MAX_INITIAL_UPDATES = 50_000
+_MAX_UPDATES_PER_TRANSITION = 512
 _IMMUTABLE_ENVIRONMENT_URI = re.compile(
     r"^cybernetics://envs/[^/?#]+/versions/[^/?#]+$"
 )
@@ -229,10 +232,25 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--batch-size", type=int)
-    parser.add_argument("--replay-capacity", type=int)
+    parser.add_argument(
+        "--replay-capacity",
+        type=int,
+        help=f"replay transition capacity (maximum: {_MAX_REPLAY_CAPACITY})",
+    )
     parser.add_argument("--random-exploration-episodes", type=int)
-    parser.add_argument("--initial-updates", type=int)
-    parser.add_argument("--updates-per-transition", type=int)
+    parser.add_argument(
+        "--initial-updates",
+        type=int,
+        help=f"first-trajectory update count (maximum: {_MAX_INITIAL_UPDATES})",
+    )
+    parser.add_argument(
+        "--updates-per-transition",
+        type=int,
+        help=(
+            "later per-transition update count "
+            f"(maximum: {_MAX_UPDATES_PER_TRANSITION})"
+        ),
+    )
     parser.add_argument(
         "--checkpoint-every-episodes",
         type=int,
@@ -306,6 +324,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--checkpoint-every-episodes must be at least 1")
     if args.keep_checkpoints < 1:
         raise ValueError("--keep-checkpoints must be at least 1")
+    for name, maximum in (
+        ("replay_capacity", _MAX_REPLAY_CAPACITY),
+        ("initial_updates", _MAX_INITIAL_UPDATES),
+        ("updates_per_transition", _MAX_UPDATES_PER_TRANSITION),
+    ):
+        value = getattr(args, name)
+        if value is not None and not 1 <= value <= maximum:
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be between 1 and {maximum}"
+            )
     if args.resume is not None and not args.resume.is_dir():
         raise ValueError("--resume must name an existing checkpoint directory")
 

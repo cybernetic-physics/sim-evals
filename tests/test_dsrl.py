@@ -137,6 +137,7 @@ def test_reference_deviations_record_bounded_launcher_defaults() -> None:
     assert any("batch size 256" in deviation for deviation in deviations)
     assert any("seed is 42" in deviation for deviation in deviations)
     assert any("seed 0" in deviation for deviation in deviations)
+    assert controller.metadata()["critic_backup_entropy"] is False
 
 
 def test_dsrl_uses_reference_layer_norm_epsilon() -> None:

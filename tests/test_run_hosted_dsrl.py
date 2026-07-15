@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 from run_hosted_dsrl import (
     _EXPECTED_PI0_BASE_POLICY_LINEAGE,
+    _MAX_INITIAL_UPDATES,
+    _MAX_REPLAY_CAPACITY,
+    _MAX_UPDATES_PER_TRANSITION,
     _build_controller,
     _parser,
     _validate_args,
@@ -150,6 +153,35 @@ class HostedDsrlParserTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "limited to 1000"):
+            _validate_args(args)
+
+    def test_controller_resource_overrides_are_bounded_before_allocation(self) -> None:
+        for flag, maximum in (
+            ("--replay-capacity", _MAX_REPLAY_CAPACITY),
+            ("--initial-updates", _MAX_INITIAL_UPDATES),
+            ("--updates-per-transition", _MAX_UPDATES_PER_TRANSITION),
+        ):
+            for invalid in (0, maximum + 1):
+                with self.subTest(flag=flag, invalid=invalid):
+                    args = _parser().parse_args(
+                        [
+                            "--environment-uri",
+                            "cybernetics://envs/env_123/versions/ver_456",
+                            flag,
+                            str(invalid),
+                        ]
+                    )
+                    with self.assertRaisesRegex(ValueError, "must be between 1"):
+                        _validate_args(args)
+
+            args = _parser().parse_args(
+                [
+                    "--environment-uri",
+                    "cybernetics://envs/env_123/versions/ver_456",
+                    flag,
+                    str(maximum),
+                ]
+            )
             _validate_args(args)
 
     def test_eval_only_requires_both_resume_and_eval_episode(self) -> None:

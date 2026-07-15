@@ -139,6 +139,72 @@ class VariantExecution:
     environment_version_status: str | None = None
     error: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.status not in {"planned", "running", "completed", "failed"}:
+            raise CurriculumError(
+                f"unsupported variant execution status {self.status!r}"
+            )
+        if self.workflow_run_id is not None and not self.workflow_run_id.startswith(
+            "wfr_"
+        ):
+            raise CurriculumError("variant workflowRunId must start with 'wfr_'")
+        if self.output_environment_uri is not None:
+            ImmutableEnvironmentVersion.parse(self.output_environment_uri)
+
+        if self.status == "planned":
+            if any(
+                value is not None
+                for value in (
+                    self.workflow_run_id,
+                    self.output_environment_uri,
+                    self.environment_version_status,
+                    self.error,
+                )
+            ):
+                raise CurriculumError("planned variant execution must be empty")
+            return
+
+        if self.status == "running":
+            if self.workflow_run_id is None:
+                raise CurriculumError(
+                    "running variant execution requires workflowRunId"
+                )
+            if any(
+                value is not None
+                for value in (
+                    self.output_environment_uri,
+                    self.environment_version_status,
+                    self.error,
+                )
+            ):
+                raise CurriculumError(
+                    "running variant execution may contain only workflowRunId"
+                )
+            return
+
+        if self.status == "completed":
+            if self.workflow_run_id is None or self.output_environment_uri is None:
+                raise CurriculumError(
+                    "completed variant execution requires workflowRunId and outputEnvironmentUri"
+                )
+            if self.environment_version_status != "ready":
+                raise CurriculumError(
+                    "completed output environment version must be ready"
+                )
+            if self.error is not None:
+                raise CurriculumError(
+                    "completed variant execution must not contain an error"
+                )
+            return
+
+        if (
+            self.output_environment_uri is not None
+            or self.environment_version_status is not None
+        ):
+            raise CurriculumError("failed variant execution must not expose an output")
+        if self.error is None:
+            raise CurriculumError("failed variant execution requires an error")
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
@@ -660,7 +726,11 @@ def _launch_curriculum_locked(
                 )
             snapshot = client.get_workflow_run(run_id)
             try:
-                _validate_source_binding(snapshot, current.base_environment)
+                _validate_source_binding(
+                    snapshot,
+                    current.base_environment,
+                    expected_prompt=variant.prompt,
+                )
             except Exception as exc:
                 current = current.with_execution(
                     variant_index,
@@ -691,7 +761,11 @@ def _launch_curriculum_locked(
                 write_manifest(current, manifest_path)
                 raise
             try:
-                _validate_source_binding(snapshot, current.base_environment)
+                _validate_source_binding(
+                    snapshot,
+                    current.base_environment,
+                    expected_prompt=variant.prompt,
+                )
             except Exception as exc:
                 current = current.with_execution(
                     variant_index,
@@ -719,7 +793,11 @@ def _launch_curriculum_locked(
             sleep=sleep,
         )
         try:
-            _validate_source_binding(terminal, current.base_environment)
+            _validate_source_binding(
+                terminal,
+                current.base_environment,
+                expected_prompt=variant.prompt,
+            )
         except Exception as exc:
             current = current.with_execution(
                 variant_index,
@@ -751,6 +829,11 @@ def _launch_curriculum_locked(
             if output_environment.uri == current.base_environment.uri:
                 raise CurriculumWorkflowError(
                     f"workflow {terminal.run_id} returned the immutable base version as output"
+                )
+            if output_environment.uri in current.output_environment_uris:
+                raise CurriculumWorkflowError(
+                    f"workflow {terminal.run_id} returned an output version "
+                    "already assigned to another variant"
                 )
         except Exception as exc:
             current = current.with_execution(
@@ -973,12 +1056,15 @@ def _rounded_uniform(
 def _validate_source_binding(
     snapshot: WorkflowRunSnapshot,
     expected: ImmutableEnvironmentVersion,
+    *,
+    expected_prompt: str,
 ) -> None:
     input_payload = snapshot.input
     expected_fields = {
         "sessionMode": "environment",
         "environmentId": expected.environment_id,
         "environmentVersionId": expected.version_id,
+        "prompt": expected_prompt,
     }
     for key, value in expected_fields.items():
         if input_payload.get(key) != value:
@@ -1031,25 +1117,6 @@ def _variant_from_dict(payload: Any) -> CurriculumVariant:
         ),
         error=_optional_string(execution_payload, "error"),
     )
-    if (
-        execution.workflow_run_id is not None
-        and not execution.workflow_run_id.startswith("wfr_")
-    ):
-        raise CurriculumError("variant workflowRunId must start with 'wfr_'")
-    if execution.output_environment_uri is not None:
-        ImmutableEnvironmentVersion.parse(execution.output_environment_uri)
-    if execution.status == "running" and execution.workflow_run_id is None:
-        raise CurriculumError("running variant execution requires workflowRunId")
-    if execution.status == "completed":
-        if (
-            execution.workflow_run_id is None
-            or execution.output_environment_uri is None
-        ):
-            raise CurriculumError(
-                "completed variant execution requires workflowRunId and outputEnvironmentUri"
-            )
-        if execution.environment_version_status != "ready":
-            raise CurriculumError("completed output environment version must be ready")
     return CurriculumVariant(
         variant_id=_require_string(payload, "variantId"),
         split=cast(CurriculumSplit, split),

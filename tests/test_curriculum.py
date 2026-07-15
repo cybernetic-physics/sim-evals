@@ -109,6 +109,7 @@ class FakeWorkflowClient:
 class _ConcurrentWorkflowClient:
     def __init__(self, created_variants: Any) -> None:
         self.created_variants = created_variants
+        self.prompts: dict[str, str] = {}
 
     def create_simulation_from_prompt(
         self,
@@ -124,6 +125,7 @@ class _ConcurrentWorkflowClient:
             line for line in prompt.splitlines() if line.startswith("Variant id: ")
         )
         variant_id = variant_line.removeprefix("Variant id: ")
+        self.prompts[variant_id] = prompt
         self.created_variants.put(variant_id)
         # Keep the create window open long enough that an unlocked peer would
         # read the same planned variant and duplicate it.
@@ -145,6 +147,7 @@ class _ConcurrentWorkflowClient:
             run_id=run_id,
             status="completed",
             input={
+                "prompt": self.prompts[variant_id],
                 "sessionMode": "environment",
                 "environmentId": "env_droid",
                 "environmentVersionId": "ver_immutable",
@@ -275,6 +278,78 @@ class CurriculumPlanTests(unittest.TestCase):
             with self.assertRaisesRegex(CurriculumError, "planSha256"):
                 load_manifest(path)
 
+    def test_variant_execution_rejects_impossible_states(self) -> None:
+        completed_uri = "cybernetics://envs/env_variant/versions/ver_ready"
+        valid = (
+            VariantExecution(),
+            VariantExecution(status="running", workflow_run_id="wfr_running"),
+            VariantExecution(
+                status="completed",
+                workflow_run_id="wfr_completed",
+                output_environment_uri=completed_uri,
+                environment_version_status="ready",
+            ),
+            VariantExecution(status="failed", error="workflow failed"),
+        )
+        self.assertEqual(
+            [execution.status for execution in valid],
+            ["planned", "running", "completed", "failed"],
+        )
+
+        invalid = (
+            {"status": "planned", "workflow_run_id": "wfr_unexpected"},
+            {"status": "running"},
+            {
+                "status": "running",
+                "workflow_run_id": "wfr_running",
+                "error": "unexpected",
+            },
+            {"status": "completed", "workflow_run_id": "wfr_incomplete"},
+            {
+                "status": "completed",
+                "workflow_run_id": "wfr_completed",
+                "output_environment_uri": completed_uri,
+                "environment_version_status": "building",
+            },
+            {
+                "status": "completed",
+                "workflow_run_id": "wfr_completed",
+                "output_environment_uri": completed_uri,
+                "environment_version_status": "ready",
+                "error": "unexpected",
+            },
+            {
+                "status": "failed",
+                "output_environment_uri": completed_uri,
+                "error": "unexpected output",
+            },
+            {"status": "failed"},
+            {"status": "running", "workflow_run_id": "wrong_prefix"},
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(CurriculumError):
+                VariantExecution(**values)
+
+    def test_manifest_loading_rejects_output_on_planned_execution(self) -> None:
+        manifest = plan_curriculum(
+            CurriculumPlanConfig(
+                base_environment_uri=BASE_URI,
+                train_variants=1,
+                validation_variants=1,
+                held_out_variants=1,
+            )
+        )
+        payload = manifest.to_dict()
+        output_uri = "cybernetics://envs/env_variant/versions/ver_ready"
+        payload["variants"][0]["execution"]["outputEnvironmentUri"] = output_uri
+        payload["outputEnvironmentUris"] = [output_uri]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(CurriculumError, "planned variant execution"):
+                load_manifest(path)
+
 
 class CurriculumLaunchTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -325,6 +400,85 @@ class CurriculumLaunchTests(unittest.TestCase):
         for request in client.create_inputs:
             self.assertEqual(request["input"]["environmentId"], "env_droid")
             self.assertEqual(request["input"]["environmentVersionId"], "ver_immutable")
+
+    def test_rejects_duplicate_output_environment_across_variants(self) -> None:
+        class DuplicateOutputClient(FakeWorkflowClient):
+            def get_workflow_run(self, run_id: str) -> WorkflowRunSnapshot:
+                snapshot = super().get_workflow_run(run_id)
+                return replace(
+                    snapshot,
+                    result={
+                        "environmentId": "env_duplicate",
+                        "environmentVersionId": "ver_duplicate",
+                        "environmentVersionStatus": "ready",
+                    },
+                )
+
+        client = DuplicateOutputClient()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            with self.assertRaisesRegex(
+                CurriculumWorkflowError,
+                "already assigned to another variant",
+            ):
+                launch_curriculum(
+                    self.manifest,
+                    client,
+                    manifest_path=path,
+                    max_launches=2,
+                    poll_interval_seconds=0,
+                )
+            persisted = load_manifest(path)
+
+        self.assertEqual(persisted.variants[0].execution.status, "completed")
+        self.assertEqual(persisted.variants[1].execution.status, "failed")
+        self.assertEqual(len(persisted.output_environment_uris), 1)
+
+    def test_creation_snapshot_must_match_the_exact_variant_prompt(self) -> None:
+        class WrongCreatePromptClient(FakeWorkflowClient):
+            def create_simulation_from_prompt(
+                self,
+                *,
+                prompt: str,
+                environment: ImmutableEnvironmentVersion,
+                budget_turns: int,
+                budget_seconds: float,
+                workspace_id: str | None,
+            ) -> WorkflowRunSnapshot:
+                snapshot = super().create_simulation_from_prompt(
+                    prompt=prompt,
+                    environment=environment,
+                    budget_turns=budget_turns,
+                    budget_seconds=budget_seconds,
+                    workspace_id=workspace_id,
+                )
+                return replace(snapshot, input={**snapshot.input, "prompt": "wrong"})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            with self.assertRaisesRegex(CurriculumWorkflowError, "source field prompt"):
+                launch_curriculum(
+                    self.manifest,
+                    WrongCreatePromptClient(),
+                    manifest_path=path,
+                    poll_interval_seconds=0,
+                )
+
+    def test_terminal_snapshot_must_match_the_exact_variant_prompt(self) -> None:
+        class WrongTerminalPromptClient(FakeWorkflowClient):
+            def get_workflow_run(self, run_id: str) -> WorkflowRunSnapshot:
+                snapshot = super().get_workflow_run(run_id)
+                return replace(snapshot, input={**snapshot.input, "prompt": "wrong"})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            with self.assertRaisesRegex(CurriculumWorkflowError, "source field prompt"):
+                launch_curriculum(
+                    self.manifest,
+                    WrongTerminalPromptClient(),
+                    manifest_path=path,
+                    poll_interval_seconds=0,
+                )
 
     def test_live_workflow_snapshot_requires_a_canonical_run_id(self) -> None:
         with self.assertRaisesRegex(CurriculumWorkflowError, "start with 'wfr_'"):
@@ -448,6 +602,16 @@ class CurriculumLaunchTests(unittest.TestCase):
             VariantExecution(status="running", workflow_run_id="wfr_existing"),
         )
         client = FakeWorkflowClient()
+        client._runs["wfr_existing"] = WorkflowRunSnapshot(
+            run_id="wfr_existing",
+            status="running",
+            input={
+                "prompt": self.manifest.variants[0].prompt,
+                "sessionMode": "environment",
+                "environmentId": "env_droid",
+                "environmentVersionId": "ver_immutable",
+            },
+        )
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "manifest.json"
             write_manifest(running, path)
@@ -474,6 +638,7 @@ class CurriculumLaunchTests(unittest.TestCase):
             run_id="wfr_existing",
             status="running",
             input={
+                "prompt": self.manifest.variants[0].prompt,
                 "sessionMode": "environment",
                 "environmentId": "env_droid",
                 "environmentVersionId": "ver_different",
@@ -483,6 +648,38 @@ class CurriculumLaunchTests(unittest.TestCase):
             path = Path(temporary) / "manifest.json"
             write_manifest(running, path)
             with self.assertRaisesRegex(CurriculumWorkflowError, "exact source"):
+                launch_curriculum(
+                    running,
+                    client,
+                    manifest_path=path,
+                    max_launches=1,
+                    poll_interval_seconds=0,
+                )
+            persisted = load_manifest(path)
+
+        self.assertEqual(persisted.variants[0].execution.status, "failed")
+        self.assertEqual(client.events, [("get", "wfr_existing")])
+
+    def test_resume_rejects_a_run_bound_to_a_different_variant_prompt(self) -> None:
+        running = self.manifest.with_execution(
+            0,
+            VariantExecution(status="running", workflow_run_id="wfr_existing"),
+        )
+        client = FakeWorkflowClient()
+        client._runs["wfr_existing"] = WorkflowRunSnapshot(
+            run_id="wfr_existing",
+            status="running",
+            input={
+                "prompt": self.manifest.variants[1].prompt,
+                "sessionMode": "environment",
+                "environmentId": "env_droid",
+                "environmentVersionId": "ver_immutable",
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            write_manifest(running, path)
+            with self.assertRaisesRegex(CurriculumWorkflowError, "source field prompt"):
                 launch_curriculum(
                     running,
                     client,
