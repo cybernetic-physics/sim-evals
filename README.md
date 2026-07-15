@@ -130,17 +130,17 @@ USD-only script that cannot initialize an articulation or physics world. It then
 stops the timeline, applies the `cybernetics_droid_contact_v1` physics profile:
 `400/80` arm drive gains, Panda effort and velocity limits, a 1 rad/s gripper
 limit, 64/1 articulation solver iterations, disabled articulation-link gravity,
-3 m/s maximum depenetration velocity, 120 Hz physics, TGS, scene and cube CCD,
+3 m/s maximum depenetration velocity, 240 Hz physics, TGS, scene and cube CCD,
 late articulation-contact solving, and explicit `2 mm/0 mm` contact/rest
 offsets on task colliders. The physics
 context is explicitly reinitialized after that profile is complete, so later
 tensor views cannot retain stale link metadata. The first exact frame then
 commits the new context before the runtime-only joint read. The runner also
 restores the benchmark arm pose with an open gripper. Fixed play-every-frame
-timeline settings and a matching 120 Hz minimum simulation rate make each app
-update one physics substep. Policy actions use an atomic eight-substep MCP call
-that ends paused and must advance exactly one 15 Hz control interval; timeline
-drift fails the run instead of silently holding targets too long.
+timeline settings and a matching 240 Hz minimum simulation rate make each app
+update one physics substep. Policy actions use an atomic sixteen-substep MCP
+call that ends paused and must advance exactly one 15 Hz control interval;
+timeline drift fails the run instead of silently holding targets too long.
 
 The runtime preflight fails closed unless the gripper drive remains at the
 benchmark's `100/0.0002/16.5` stiffness, damping, and angular-effort values and
@@ -218,6 +218,32 @@ python run_hosted_eval.py \
 ```
 
 PI0 does not support `--policy-mode sde` or `--include-predicted-video`.
+
+To compare physics profiles without changing policy output, replay only the
+verified applied-action prefix from a completed schema-v9 PI0 evidence
+directory:
+
+```bash
+python run_hosted_eval.py \
+  --base-model pi0-droid \
+  --environment-uri "$CYBERNETICS_DROID_ENV_URI" \
+  --task-success-predicate scene1-cube-in-bowl \
+  --replay-evidence-dir "$PWD/runs/hosted-production/SOURCE_RUN" \
+  --physics-hz 240 \
+  --solver-position-iterations 64 \
+  --solver-velocity-iterations 1 \
+  --stop-session \
+  --results-dir "$PWD/runs/hosted-production/pi0-droid-replay"
+```
+
+Replay preflight verifies the source file digest, schema, PI0 profile, full
+sample chunks, sequential sample/chunk mapping, derived runtime joint targets,
+applied-action timing, and the exact applied prefix before launching. Replay
+never constructs a Worldlines client, cannot attach to an existing scene, and
+requires evaluator-owned session cleanup. An ambiguous
+`isaac.step_simulation` transport failure is never retried because doing so
+could apply one policy action twice.
+
 The task predicate is opt-in. Without it, completion continues to mean only
 that the requested policy actions were transported and applied. The predicate
 uses read-only USD bounds and the Isaac 6 physics tensor view for rigid-body
