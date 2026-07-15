@@ -141,8 +141,11 @@ drift fails the run instead of silently holding targets too long.
 The runtime preflight fails closed unless the effective gripper drive remains
 at the benchmark's `100/0.0002/16.5` stiffness, damping, and maximum-force
 values, the resolved finger-pad and cube physics materials retain their
-benchmark friction, and the cube has a positive authored mass or density. It
-archives those values plus collision/contact metadata in `runtime.json`.
+benchmark friction, and the cube has the benchmark's pinned `0.04 kg` mass. The
+source cube payload does not author a positive mass, so the runner authors this
+value before the single physics rebuild and then verifies the composed runtime
+value. It archives those values plus collision/contact metadata in
+`runtime.json`.
 
 Task-acceptance runs require runtime articulation provenance for both DOF order
 and every joint observation and target. Authored USD drive targets are not
