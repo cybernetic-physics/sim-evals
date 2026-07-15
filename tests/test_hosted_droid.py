@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import io
@@ -20,6 +21,8 @@ from PIL import Image
 
 from sim_evals.hosted_droid import (
     GRIPPER_CLOSED_RADIANS,
+    _DROID_DYNAMICS_PROFILE,
+    _DROID_DYNAMICS_STDOUT_PREFIX,
     _DROID_INITIAL_ARM_JOINT_POSITIONS,
     HostedDroidConfig,
     HostedDroidError,
@@ -30,7 +33,7 @@ from sim_evals.hosted_droid import (
     scene1_cube_in_bowl_success_spec,
 )
 from sim_evals.inference.droid_observation import DroidObservation
-from run_hosted_eval import _timestamped_results_dir
+from run_hosted_eval import _resolve_open_loop_horizon, _timestamped_results_dir
 
 
 def _png_base64(
@@ -142,6 +145,7 @@ class FakeMCP:
         closed_gripper_observation: float | None = None,
         runtime_info_source: str | None = "runtime_articulation",
         runtime_joint_source: str | None = "runtime_articulation",
+        runtime_actuation_source: str | None = "runtime_articulation",
     ) -> None:
         self.readiness_failures = readiness_failures
         self.camera_capture_failures = camera_capture_failures
@@ -156,6 +160,7 @@ class FakeMCP:
         self.closed_gripper_observation = closed_gripper_observation
         self.runtime_info_source = runtime_info_source
         self.runtime_joint_source = runtime_joint_source
+        self.runtime_actuation_source = runtime_actuation_source
         self.dynamics_configured = False
         self.physics_context_reinitialized = False
         self.post_dynamics_steps = 0
@@ -305,6 +310,24 @@ class FakeMCP:
                 self.current_time += self.physics_dt
                 self.post_dynamics_steps += 1
                 self.timeline_state = "paused"
+                profile = {
+                    "status": "success",
+                    "profile": _DROID_DYNAMICS_PROFILE,
+                    "physics_hz": 120.0,
+                    "gripper_drive": {
+                        "stiffness": 100.0,
+                        "damping": 0.0002,
+                        "max_force": 16.5,
+                        "max_joint_velocity_degrees": 57.29577951308232,
+                    },
+                }
+                return {
+                    "status": "success",
+                    "stdout": _DROID_DYNAMICS_STDOUT_PREFIX
+                    + json.dumps(profile)
+                    + "\n",
+                    "stderr": "",
+                }
             return {"status": "success", "result": {"status": "success"}}
         if name == "isaac.step_simulation":
             if self.step_payloads:
@@ -347,7 +370,10 @@ class FakeMCP:
                         GRIPPER_CLOSED_RADIANS * self.closed_gripper_observation,
                     )
                 self.joint_positions[joint_index] = position
-            return {"status": "success"}
+            return {
+                "status": "success",
+                "control_source": self.runtime_actuation_source,
+            }
         if name == "isaac.capture_camera_image":
             if self.camera_capture_failures:
                 self.camera_capture_failures -= 1
@@ -522,6 +548,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
         set_calls = [
             args for name, args in mcp.calls if name == "isaac.set_joint_positions"
         ]
+        self.assertTrue(all(call["require_runtime"] for call in set_calls))
         expected_indices = [2, 5, 7, 1, 6, 8, 3, 4]
         self.assertEqual(set_calls[0]["joint_indices"], expected_indices)
         self.assertEqual(set_calls[1]["joint_indices"], expected_indices)
@@ -585,6 +612,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             if name == "isaac.execute_script"
             and "nvidia_droid_isaaclab" in str(arguments["code"])
         )
+        ast.parse(dynamics_script)
         self.assertIn("drive.GetStiffnessAttr().Set(400.0)", dynamics_script)
         self.assertIn("drive.GetDampingAttr().Set(80.0)", dynamics_script)
         self.assertIn("GetSolverVelocityIterationCountAttr().Set(0)", dynamics_script)
@@ -605,6 +633,10 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertIn("articulation_view.shared_metatype is None", dynamics_script)
         self.assertIn("physics_context_reinitialized", dynamics_script)
         self.assertIn("configured_gripper = True", dynamics_script)
+        self.assertIn('"physics:staticFriction"', dynamics_script)
+        self.assertIn('"physxMaterial:frictionCombineMode"', dynamics_script)
+        self.assertIn('("physics:mass", "physics:density")', dynamics_script)
+        self.assertIn("DROID_DYNAMICS_PROFILE=", dynamics_script)
         self.assertIn("57.29577951308232", dynamics_script)
         dynamics_index = next(
             index
@@ -902,6 +934,8 @@ class HostedDroidRunnerTest(unittest.TestCase):
         spec = scene1_cube_in_bowl_success_spec()
         self.assertEqual(spec.object_prim_path, "/World/rubiks_cube")
         self.assertEqual(spec.receptacle_prim_path, "/World/_24_bowl")
+        self.assertEqual(_resolve_open_loop_horizon(None), 8)
+        self.assertEqual(_resolve_open_loop_horizon(3), 3)
 
     def test_writes_config_result_and_first_rgb_triplet(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -922,7 +956,7 @@ class HostedDroidRunnerTest(unittest.TestCase):
             config_payload = json.loads(
                 (results_dir / "config.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(config_payload["schema_version"], 7)
+            self.assertEqual(config_payload["schema_version"], 8)
             self.assertEqual(
                 config_payload["config"]["environment_uri"],
                 config.environment_uri,
@@ -970,6 +1004,27 @@ class HostedDroidRunnerTest(unittest.TestCase):
             self.assertEqual(
                 (results_dir / "actions.jsonl").stat().st_mode & 0o777,
                 0o600,
+            )
+            runtime_payload = json.loads(
+                (results_dir / "runtime.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(runtime_payload["schema_version"], 8)
+            self.assertEqual(
+                runtime_payload["joint_target_control_source"],
+                "runtime_articulation",
+            )
+            self.assertEqual(
+                runtime_payload["runtime_dynamics"]["profile"],
+                _DROID_DYNAMICS_PROFILE,
+            )
+            applied = next(
+                record
+                for record in action_records
+                if record["record_type"] == "applied_action"
+            )
+            self.assertEqual(
+                applied["simulation_timing"]["joint_target_control_source"],
+                "runtime_articulation",
             )
             self.assertFalse((results_dir / "error.json").exists())
 
@@ -1571,6 +1626,35 @@ class HostedDroidRunnerTest(unittest.TestCase):
 
         self.assertEqual(result.physics_steps_per_action, 8)
         self.assertAlmostEqual(result.control_hz, 15.0)
+
+    def test_rejects_unproven_joint_target_control_source(self) -> None:
+        mcp = FakeMCP(
+            readiness_failures=0,
+            warm=True,
+            runtime_actuation_source="usd_drive_target",
+        )
+        simulation = FakeSimulationClient(mcp)
+        runner = HostedDroidRunner(
+            simulation,
+            FakeSampler(),
+            HostedDroidConfig(
+                environment_uri="cybernetics://envs/env_droid",
+                max_action_steps=1,
+                keep_session=False,
+            ),
+            sleep=lambda _: None,
+        )
+
+        with self.assertRaisesRegex(HostedDroidError, "runtime articulation control"):
+            runner.run()
+
+        self.assertEqual(simulation.stopped, ["sess_hosted_droid"])
+        set_call = next(
+            arguments
+            for name, arguments in mcp.calls
+            if name == "isaac.set_joint_positions"
+        )
+        self.assertTrue(set_call["require_runtime"])
 
     def test_gripper_actions_match_reference_binary_threshold(self) -> None:
         mcp = FakeMCP(readiness_failures=0, warm=True)

@@ -336,7 +336,7 @@ class _RolloutOutcome:
     task_success_reason: str | None
 
 
-_EVIDENCE_SCHEMA_VERSION = 7
+_EVIDENCE_SCHEMA_VERSION = 8
 _EVIDENCE_CAMERA_NAMES = ("exterior-1", "exterior-2", "wrist")
 _TASK_STATE_STDOUT_PREFIX = "DROID_TASK_STATE="
 
@@ -1147,8 +1147,14 @@ _DROID_INITIAL_ARM_JOINT_POSITIONS = (
     0.0,
 )
 _DROID_DYNAMICS_PROFILE = "nvidia_droid_isaaclab"
+_DROID_DYNAMICS_STDOUT_PREFIX = "DROID_DYNAMICS_PROFILE="
 _DROID_PHYSICS_HZ = 120.0
 _DROID_GRIPPER_VELOCITY_LIMIT_RADIANS = 1.0
+_DROID_GRIPPER_STIFFNESS = 100.0
+_DROID_GRIPPER_DAMPING = 0.0002
+_DROID_GRIPPER_MAX_FORCE = 16.5
+_DROID_FINGER_PAD_MIN_FRICTION = 2.0
+_DROID_CUBE_MIN_FRICTION = 10.0
 _CAMERA_CAPTURE_ATTEMPTS = 10
 _CAMERA_CAPTURE_RETRY_SECONDS = 0.5
 _CAMERA_WARMUP_STEPS = 32
@@ -1260,12 +1266,15 @@ class HostedDroidRunner:
                 ) as mcp:
                     self._wait_for_isaac(mcp)
                     repaired_robot = self._ensure_robot(mcp)
-                    self._configure_robot_dynamics(mcp)
+                    runtime_dynamics = self._configure_robot_dynamics(mcp)
                     self._retire_previous_cameras(mcp)
                     created_cameras = self._ensure_cameras(mcp)
                     self._set_viewer_camera(mcp, created_cameras[0])
                     joint_indices = self._joint_indices(mcp)
-                    self._reset_robot_for_policy(mcp, joint_indices)
+                    initial_control_source = self._reset_robot_for_policy(
+                        mcp,
+                        joint_indices,
+                    )
                     physics_dt, physics_steps_per_action = self._control_cadence(mcp)
                     control_hz = 1.0 / (physics_dt * physics_steps_per_action)
                     initial_arm_positions, initial_gripper_position = (
@@ -1284,6 +1293,7 @@ class HostedDroidRunner:
                                 "target_control_hz": self.config.target_control_hz,
                                 "control_hz": control_hz,
                                 "robot_dynamics_profile": _DROID_DYNAMICS_PROFILE,
+                                "runtime_dynamics": runtime_dynamics,
                                 "initial_arm_joint_targets": list(
                                     _DROID_INITIAL_ARM_JOINT_POSITIONS
                                 ),
@@ -1292,6 +1302,7 @@ class HostedDroidRunner:
                                 ),
                                 "initial_gripper_target": 0.0,
                                 "initial_gripper_position": initial_gripper_position,
+                                "joint_target_control_source": (initial_control_source),
                                 "joint_measurement_source": "runtime_articulation",
                                 "task_success_predicate": (
                                     self.config.task_success.name
@@ -1474,8 +1485,9 @@ print({prefix} + json.dumps(payload, sort_keys=True))
             raise HostedDroidError("Isaac emitted invalid robot joint metadata")
         return cast(dict[str, Any], payload)
 
-    def _configure_robot_dynamics(self, mcp: MCPClient) -> None:
+    def _configure_robot_dynamics(self, mcp: MCPClient) -> dict[str, Any]:
         robot_path = json.dumps(self.config.robot_prim_path)
+        cube_path = json.dumps("/World/rubiks_cube")
         joint_settings = json.dumps(
             {
                 **{
@@ -1502,6 +1514,7 @@ print({prefix} + json.dumps(payload, sort_keys=True))
         code = f"""
 import carb
 import json
+import math
 import omni.kit.app
 import omni.timeline
 import omni.usd
@@ -1520,6 +1533,7 @@ timeline.set_play_every_frame(True)
 timeline.set_ticks_per_frame(1)
 timeline.set_time_codes_per_second({_DROID_PHYSICS_HZ})
 robot_path = {robot_path}
+cube_path = {cube_path}
 root = stage.GetPrimAtPath(robot_path)
 if not root.IsValid():
     raise RuntimeError(f"DROID robot prim not found: {{robot_path}}")
@@ -1527,6 +1541,7 @@ if not root.IsValid():
 joint_settings = json.loads({json.dumps(joint_settings)})
 configured_joints = []
 configured_gripper = False
+gripper_joint_path = None
 articulation_roots = 0
 rigid_bodies = 0
 for prim in Usd.PrimRange(root):
@@ -1553,6 +1568,7 @@ for prim in Usd.PrimRange(root):
             {gripper_velocity_limit_degrees}
         )
         configured_gripper = True
+        gripper_joint_path = str(prim.GetPath())
     if prim.HasAPI(UsdPhysics.RigidBodyAPI):
         rigid_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
         rigid_api.GetDisableGravityAttr().Set(True)
@@ -1616,7 +1632,171 @@ timeline.commit()
 if timeline.is_playing() or timeline.is_stopped():
     raise RuntimeError("DROID physics rebuild did not finish paused")
 
-print(json.dumps({{
+def read_float(prim, attribute_name, *, required=False):
+    attribute = prim.GetAttribute(attribute_name)
+    value = attribute.Get() if attribute and attribute.IsValid() else None
+    if value is None:
+        if required:
+            raise RuntimeError(
+                "DROID runtime attribute unavailable: %s.%s"
+                % (prim.GetPath(), attribute_name)
+            )
+        return None
+    value = float(value)
+    if not math.isfinite(value):
+        raise RuntimeError(
+            "DROID runtime attribute is not finite: %s.%s"
+            % (prim.GetPath(), attribute_name)
+        )
+    return value
+
+def resolved_physics_materials(collision_prim):
+    current = collision_prim
+    while current and current.IsValid() and not current.IsPseudoRoot():
+        materials = {{}}
+        for relationship in current.GetRelationships():
+            if not str(relationship.GetName()).startswith("material:binding"):
+                continue
+            for target in relationship.GetTargets():
+                material = stage.GetPrimAtPath(target.GetPrimPath())
+                if not material.IsValid():
+                    continue
+                static_friction = read_float(
+                    material,
+                    "physics:staticFriction",
+                )
+                dynamic_friction = read_float(
+                    material,
+                    "physics:dynamicFriction",
+                )
+                if static_friction is None or dynamic_friction is None:
+                    continue
+                combine_attribute = material.GetAttribute(
+                    "physxMaterial:frictionCombineMode"
+                )
+                combine_mode = (
+                    str(combine_attribute.Get())
+                    if combine_attribute
+                    and combine_attribute.IsValid()
+                    and combine_attribute.Get() is not None
+                    else None
+                )
+                materials[str(material.GetPath())] = {{
+                    "path": str(material.GetPath()),
+                    "static_friction": static_friction,
+                    "dynamic_friction": dynamic_friction,
+                    "friction_combine_mode": combine_mode,
+                }}
+        if materials:
+            return list(materials.values())
+        current = current.GetParent()
+    return []
+
+def collision_profile(profile_root):
+    collision_count = 0
+    bound_collision_count = 0
+    contact_offsets = set()
+    rest_offsets = set()
+    materials = {{}}
+    for prim in Usd.PrimRange(profile_root):
+        if not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        collision_count += 1
+        contact_offset = read_float(prim, "physxCollision:contactOffset")
+        rest_offset = read_float(prim, "physxCollision:restOffset")
+        if contact_offset is not None:
+            contact_offsets.add(contact_offset)
+        if rest_offset is not None:
+            rest_offsets.add(rest_offset)
+        resolved = resolved_physics_materials(prim)
+        if resolved:
+            bound_collision_count += 1
+        for material in resolved:
+            materials[material["path"]] = material
+    return {{
+        "collision_count": collision_count,
+        "bound_collision_count": bound_collision_count,
+        "contact_offsets": sorted(contact_offsets),
+        "rest_offsets": sorted(rest_offsets),
+        "materials": [materials[path] for path in sorted(materials)],
+    }}
+
+def mass_profile(profile_root):
+    entries = []
+    for prim in Usd.PrimRange(profile_root):
+        for attribute_name in ("physics:mass", "physics:density"):
+            value = read_float(prim, attribute_name)
+            if value is not None and value > 0:
+                entries.append({{
+                    "prim_path": str(prim.GetPath()),
+                    "attribute": attribute_name,
+                    "value": value,
+                }})
+    return entries
+
+gripper_prim = stage.GetPrimAtPath(gripper_joint_path)
+gripper_drive = UsdPhysics.DriveAPI.Get(
+    gripper_prim,
+    UsdPhysics.Tokens.angular,
+)
+if not gripper_drive or not gripper_drive.GetPrim().IsValid():
+    raise RuntimeError("DROID runtime gripper drive unavailable")
+gripper_profile = {{
+    "joint_path": gripper_joint_path,
+    "stiffness": float(gripper_drive.GetStiffnessAttr().Get()),
+    "damping": float(gripper_drive.GetDampingAttr().Get()),
+    "max_force": float(gripper_drive.GetMaxForceAttr().Get()),
+    "max_joint_velocity_degrees": read_float(
+        gripper_prim,
+        "physxJoint:maxJointVelocity",
+        required=True,
+    ),
+}}
+
+expected_gripper = {{
+    "stiffness": {_DROID_GRIPPER_STIFFNESS},
+    "damping": {_DROID_GRIPPER_DAMPING},
+    "max_force": {_DROID_GRIPPER_MAX_FORCE},
+    "max_joint_velocity_degrees": {gripper_velocity_limit_degrees},
+}}
+for name, expected in expected_gripper.items():
+    actual = gripper_profile[name]
+    if not math.isclose(actual, expected, rel_tol=1e-6, abs_tol=1e-6):
+        raise RuntimeError(
+            "DROID runtime gripper mismatch for %s: expected=%s actual=%s"
+            % (name, expected, actual)
+        )
+
+cube_root = stage.GetPrimAtPath(cube_path)
+if not cube_root.IsValid():
+    raise RuntimeError("DROID cube prim unavailable: %s" % cube_path)
+robot_collisions = collision_profile(root)
+cube_collisions = collision_profile(cube_root)
+cube_mass = mass_profile(cube_root)
+if robot_collisions["collision_count"] < 1:
+    raise RuntimeError("DROID robot collision profile is empty")
+if cube_collisions["collision_count"] < 1:
+    raise RuntimeError("DROID cube collision profile is empty")
+if not cube_mass:
+    raise RuntimeError("DROID cube has no positive authored mass or density")
+
+robot_materials = robot_collisions["materials"]
+if not any(
+    material["static_friction"] >= {_DROID_FINGER_PAD_MIN_FRICTION}
+    and material["dynamic_friction"] >= {_DROID_FINGER_PAD_MIN_FRICTION}
+    and material["friction_combine_mode"] == "max"
+    for material in robot_materials
+):
+    raise RuntimeError("DROID finger-pad physics material mismatch")
+cube_materials = cube_collisions["materials"]
+if not any(
+    material["static_friction"] >= {_DROID_CUBE_MIN_FRICTION}
+    and material["dynamic_friction"] >= {_DROID_CUBE_MIN_FRICTION}
+    for material in cube_materials
+):
+    raise RuntimeError("DROID cube physics material mismatch")
+
+runtime_profile = {{
     "status": "success",
     "profile": "{_DROID_DYNAMICS_PROFILE}",
     "physics_hz": {_DROID_PHYSICS_HZ},
@@ -1631,25 +1811,82 @@ print(json.dumps({{
     "physics_context_reinitialized": True,
     "physics_view_replaced": True,
     "timeline_state": "paused",
-}}, sort_keys=True))
+    "gripper_drive": gripper_profile,
+    "robot_collisions": robot_collisions,
+    "cube_collisions": cube_collisions,
+    "cube_mass": cube_mass,
+}}
+print(
+    "{_DROID_DYNAMICS_STDOUT_PREFIX}"
+    + json.dumps(runtime_profile, sort_keys=True)
+)
 """
-        self._call(mcp, "isaac.execute_script", {"code": code})
+        result = self._call(mcp, "isaac.execute_script", {"code": code})
+        stdout = result.get("stdout")
+        if not isinstance(stdout, str):
+            raise HostedDroidError(
+                "isaac.execute_script did not return DROID dynamics stdout"
+            )
+        encoded_profile = next(
+            (
+                line.removeprefix(_DROID_DYNAMICS_STDOUT_PREFIX)
+                for line in reversed(stdout.splitlines())
+                if line.startswith(_DROID_DYNAMICS_STDOUT_PREFIX)
+            ),
+            None,
+        )
+        if encoded_profile is None:
+            raise HostedDroidError(
+                "isaac.execute_script did not emit the DROID dynamics marker"
+            )
+        try:
+            profile = json.loads(encoded_profile)
+        except json.JSONDecodeError as exc:
+            raise HostedDroidError("Isaac emitted invalid DROID dynamics JSON") from exc
+        if (
+            not isinstance(profile, dict)
+            or profile.get("status") != "success"
+            or profile.get("profile") != _DROID_DYNAMICS_PROFILE
+        ):
+            raise HostedDroidError("Isaac emitted invalid DROID dynamics profile")
+        return cast(dict[str, Any], profile)
 
     def _reset_robot_for_policy(
         self,
         mcp: MCPClient,
         joint_indices: tuple[list[int], int],
-    ) -> None:
+    ) -> str:
         arm_indices, gripper_index = joint_indices
-        self._call(
+        return self._set_joint_positions_runtime(
+            mcp,
+            joint_positions=[*_DROID_INITIAL_ARM_JOINT_POSITIONS, 0.0],
+            joint_indices=[*arm_indices, gripper_index],
+        )
+
+    def _set_joint_positions_runtime(
+        self,
+        mcp: MCPClient,
+        *,
+        joint_positions: list[float],
+        joint_indices: list[int],
+    ) -> str:
+        result = self._call(
             mcp,
             "isaac.set_joint_positions",
             {
                 "prim_path": self.config.robot_prim_path,
-                "joint_positions": [*_DROID_INITIAL_ARM_JOINT_POSITIONS, 0.0],
-                "joint_indices": [*arm_indices, gripper_index],
+                "joint_positions": joint_positions,
+                "joint_indices": joint_indices,
+                "require_runtime": True,
             },
         )
+        control_source = result.get("control_source")
+        if control_source != "runtime_articulation":
+            raise HostedDroidError(
+                "isaac.set_joint_positions did not prove runtime articulation "
+                f"control: {control_source!r}"
+            )
+        return control_source
 
     def _settle_robot_for_policy(
         self,
@@ -2329,14 +2566,10 @@ print({prefix} + json.dumps(payload, sort_keys=True))
         gripper = GRIPPER_CLOSED_RADIANS if float(action[7]) > 0.5 else 0.0
         applied_joint_indices = [*arm_indices, gripper_index]
         joint_positions = [*action[:7].astype(float).tolist(), gripper]
-        self._call(
+        control_source = self._set_joint_positions_runtime(
             mcp,
-            "isaac.set_joint_positions",
-            {
-                "prim_path": self.config.robot_prim_path,
-                "joint_positions": joint_positions,
-                "joint_indices": applied_joint_indices,
-            },
+            joint_positions=joint_positions,
+            joint_indices=applied_joint_indices,
         )
         if on_target_accepted is not None:
             on_target_accepted(joint_positions, applied_joint_indices)
@@ -2384,6 +2617,7 @@ print({prefix} + json.dumps(payload, sort_keys=True))
                 "expected_simulation_seconds": expected_seconds,
                 "observed_simulation_seconds": observed_seconds,
                 "timeline_drift_seconds": drift_seconds,
+                "joint_target_control_source": control_source,
             },
         )
 
