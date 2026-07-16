@@ -755,17 +755,22 @@ def _contact_pose(value: Any, name: str) -> _ContactPose:
 
 
 def _contact_poses_match(left: _ContactPose, right: _ContactPose) -> bool:
-    return (
-        all(
-            _contact_numbers_close(first, second)
-            for first, second in zip(left.position_m, right.position_m, strict=True)
-        )
-        and _quaternion_delta_radians(
-            left.orientation_wxyz,
-            right.orientation_wxyz,
-        )
-        <= 1e-8
+    positions_match = all(
+        _contact_numbers_close(first, second)
+        for first, second in zip(left.position_m, right.position_m, strict=True)
     )
+    orientations_match = any(
+        all(
+            _contact_numbers_close(first, sign * second)
+            for first, second in zip(
+                left.orientation_wxyz,
+                right.orientation_wxyz,
+                strict=True,
+            )
+        )
+        for sign in (1.0, -1.0)
+    )
+    return positions_match and orientations_match
 
 
 def _validate_collision_sweep(
@@ -998,19 +1003,23 @@ def _validate_continuous_collision_evidence(
     previous_filter_pose = parsed_poses["previous_filter"]
     current_filter_pose = parsed_poses["current_filter"]
     if previous is not None:
-        if (
-            previous_endpoint_contact is not previous.current_endpoint_contact
-            or not _contact_poses_match(
-                previous_sensor_pose,
-                previous.current_sensor_pose,
-            )
-            or not _contact_poses_match(
-                previous_filter_pose,
-                previous.current_filter_pose,
-            )
+        discontinuities: list[str] = []
+        if previous_endpoint_contact is not previous.current_endpoint_contact:
+            discontinuities.append("endpoint_contact")
+        if not _contact_poses_match(
+            previous_sensor_pose,
+            previous.current_sensor_pose,
         ):
+            discontinuities.append("sensor_pose")
+        if not _contact_poses_match(
+            previous_filter_pose,
+            previous.current_filter_pose,
+        ):
+            discontinuities.append("filter_pose")
+        if discontinuities:
             raise HostedDroidError(
-                "continuous collision evidence is discontinuous between updates"
+                "continuous collision evidence is discontinuous between updates "
+                f"for {label}: {', '.join(discontinuities)}"
             )
     for phase, path, pose in (
         ("previous", sensor_path, previous_sensor_pose),

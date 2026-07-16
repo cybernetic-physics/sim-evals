@@ -24,10 +24,12 @@ from PIL import Image
 
 from sim_evals.hosted_droid import (
     GRIPPER_CLOSED_RADIANS,
+    _ContactPose,
     _DROID_DYNAMICS_PROFILE,
     _DROID_DYNAMICS_STDOUT_PREFIX,
     _DROID_INITIAL_ARM_JOINT_POSITIONS,
     _DroidTaskSuccessTracker,
+    _contact_poses_match,
     _parse_task_state,
     _contact_integrity_request,
     _validate_policy_response,
@@ -1743,6 +1745,34 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 "right-finger-cube",
                 "cube-receptacle",
             },
+        )
+
+    def test_contact_pose_continuity_is_stable_near_identity(self) -> None:
+        orientation = (
+            0.4087861509214986,
+            -0.7399056725191926,
+            -0.4777720651757142,
+            -0.2390969099056692,
+        )
+        pose = _ContactPose(
+            position_m=(0.1, -0.2, 0.3),
+            orientation_wxyz=orientation,
+        )
+        negated = _ContactPose(
+            position_m=pose.position_m,
+            orientation_wxyz=tuple(-value for value in orientation),
+        )
+
+        self.assertTrue(_contact_poses_match(pose, pose))
+        self.assertTrue(_contact_poses_match(pose, negated))
+        self.assertFalse(
+            _contact_poses_match(
+                pose,
+                _ContactPose(
+                    position_m=(0.1, -0.2, 0.301),
+                    orientation_wxyz=orientation,
+                ),
+            )
         )
 
     def test_contact_integrity_accepts_complete_clear_schema_v2(self) -> None:
