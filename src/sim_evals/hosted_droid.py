@@ -67,6 +67,29 @@ _VIEWER_CAMERA_RESOLUTION = (1280, 720)
 _CAMERA_POSITION_TOLERANCE_METERS = 1e-5
 _CAMERA_ORIENTATION_ALIGNMENT_TOLERANCE = 1e-6
 _CAMERA_OPTICS_TOLERANCE = 1e-5
+_CONTACT_INTEGRITY_SCHEMA_VERSION = 2
+_CONTACT_MAX_CONTACTS_PER_PAIR = 64
+_CONTACT_TRACE_SLOT_BUDGET = 8192
+_CONTINUOUS_COLLISION_SCHEMA_VERSION = 2
+_CONTINUOUS_COLLISION_MAX_ROTATION_RADIANS = math.radians(5.0)
+_CONTINUOUS_COLLISION_MAX_HITS_PER_PAIR = 16
+_CONTINUOUS_COLLISION_MAX_COLLIDERS_PER_PAIR = 32
+_CONTINUOUS_COLLISION_SWEEP_SEMANTICS = (
+    "rotation_safe_sensor_body_obb_backward_in_current_filter_frame"
+)
+_CONTINUOUS_COLLISION_ROTATION_ENVELOPE_METHOD = (
+    "body_centered_symmetric_obb_with_chord_inflation"
+)
+_CONTINUOUS_COLLISION_TRANSLATION_SHAPE_SWEEP_SEMANTICS = (
+    "current_sensor_collision_shapes_backward_through_relative_translation"
+)
+_CONTINUOUS_COLLISION_SAMPLING_SEMANTICS = (
+    "initial_endpoint_overlap_then_pose_contact_rotation_safe_obb_and_"
+    "exact_shape_sweep_after_each_update"
+)
+_CONTINUOUS_COLLISION_MOTION_EPSILON_METERS = 1e-12
+_CONTACT_CAPTURE_SOURCE = "RigidPrim_contact_tensors_and_PhysX_scene_queries"
+_CONTACT_QUATERNION_NORM_TOLERANCE = 1e-3
 _LEGACY_CAMERA_CONTRACT_MARKERS = (
     "unsupported camera contract",
     "unexpected keyword",
@@ -290,10 +313,15 @@ def _contact_integrity_request(spec: DroidTaskSuccessSpec) -> dict[str, Any]:
     """Return the exact rigid-body pairs needed to prove task integrity."""
 
     return {
-        "max_contacts_per_pair": 64,
+        "max_contacts_per_pair": _CONTACT_MAX_CONTACTS_PER_PAIR,
         "limits": {
             "maximum_penetration_m": spec.maximum_contact_penetration_meters,
             "maximum_normal_impulse_ns": (spec.maximum_contact_normal_impulse_ns),
+        },
+        "continuous_collision": {
+            "maximum_sensor_rotation_rad": (_CONTINUOUS_COLLISION_MAX_ROTATION_RADIANS),
+            "maximum_filter_rotation_rad": (_CONTINUOUS_COLLISION_MAX_ROTATION_RADIANS),
+            "max_hits_per_pair": _CONTINUOUS_COLLISION_MAX_HITS_PER_PAIR,
         },
         "pairs": [
             {
@@ -536,6 +564,812 @@ _RIGHT_FINGER_CONTACT = "right-finger-cube"
 _RECEPTACLE_CONTACT = "cube-receptacle"
 
 
+@dataclass(frozen=True)
+class _ContactPose:
+    position_m: tuple[float, float, float]
+    orientation_wxyz: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class _ContinuousCollisionEvidence:
+    previous_sensor_pose: _ContactPose
+    current_sensor_pose: _ContactPose
+    previous_filter_pose: _ContactPose
+    current_filter_pose: _ContactPose
+    previous_endpoint_contact: bool
+    current_endpoint_contact: bool
+    relative_translation_m: float
+    sensor_rotation_rad: float
+    filter_rotation_rad: float
+    relative_rotation_rad: float
+    rotation_envelope_inflation_m: float
+    swept_collision_risk_detected: bool
+    paired_hit_count: int
+
+
+def _contact_mapping(value: Any, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise HostedDroidError(f"{name} must be an object")
+    return value
+
+
+def _contact_number(
+    value: Any,
+    name: str,
+    *,
+    nonnegative: bool = False,
+) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or (nonnegative and float(value) < 0)
+    ):
+        qualifier = "finite and non-negative" if nonnegative else "finite"
+        raise HostedDroidError(f"{name} must be {qualifier}")
+    return float(value)
+
+
+def _contact_integer(
+    value: Any,
+    name: str,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
+        raise HostedDroidError(f"{name} is invalid")
+    return value
+
+
+def _contact_vector(
+    value: Any,
+    name: str,
+    *,
+    length: int,
+) -> tuple[float, ...]:
+    if not isinstance(value, list) or len(value) != length:
+        raise HostedDroidError(f"{name} must contain {length} numbers")
+    result = tuple(_contact_number(item, name) for item in value)
+    return result
+
+
+def _contact_string_list(
+    value: Any,
+    name: str,
+    *,
+    maximum: int,
+) -> list[str]:
+    if not isinstance(value, list) or len(value) > maximum:
+        raise HostedDroidError(f"{name} is invalid")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or item != item.strip():
+            raise HostedDroidError(f"{name} is invalid")
+        result.append(item)
+    if len(set(result)) != len(result):
+        raise HostedDroidError(f"{name} contains duplicates")
+    return result
+
+
+def _absolute_contact_path(value: Any, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or len(value) < 2
+        or not value.startswith("/")
+    ):
+        raise HostedDroidError(f"{name} must be an absolute prim path")
+    return value
+
+
+def _contact_numbers_close(actual: float, expected: float) -> bool:
+    return math.isclose(actual, expected, rel_tol=1e-6, abs_tol=1e-9)
+
+
+def _quaternion_delta_radians(
+    start_wxyz: tuple[float, float, float, float],
+    end_wxyz: tuple[float, float, float, float],
+) -> float:
+    absolute_dot = abs(
+        sum(start * end for start, end in zip(start_wxyz, end_wxyz, strict=True))
+    )
+    return 2.0 * math.acos(min(1.0, max(0.0, absolute_dot)))
+
+
+def _quaternion_multiply(
+    left_wxyz: tuple[float, float, float, float],
+    right_wxyz: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    left_w, left_x, left_y, left_z = left_wxyz
+    right_w, right_x, right_y, right_z = right_wxyz
+    return (
+        left_w * right_w - left_x * right_x - left_y * right_y - left_z * right_z,
+        left_w * right_x + left_x * right_w + left_y * right_z - left_z * right_y,
+        left_w * right_y - left_x * right_z + left_y * right_w + left_z * right_x,
+        left_w * right_z + left_x * right_y - left_y * right_x + left_z * right_w,
+    )
+
+
+def _quaternion_conjugate(
+    value_wxyz: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    w, x, y, z = value_wxyz
+    return (w, -x, -y, -z)
+
+
+def _quaternion_relative_orientation(
+    sensor_wxyz: tuple[float, float, float, float],
+    filter_wxyz: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    return _quaternion_multiply(
+        _quaternion_conjugate(filter_wxyz),
+        sensor_wxyz,
+    )
+
+
+def _vector_in_quaternion_frame(
+    vector_world: tuple[float, float, float],
+    frame_wxyz: tuple[float, float, float, float],
+) -> tuple[float, float, float]:
+    rotated = _quaternion_multiply(
+        _quaternion_multiply(
+            _quaternion_conjugate(frame_wxyz),
+            (0.0, *vector_world),
+        ),
+        frame_wxyz,
+    )
+    return (rotated[1], rotated[2], rotated[3])
+
+
+def _contact_pose(value: Any, name: str) -> _ContactPose:
+    pose = _contact_mapping(value, name)
+    if set(pose) != {"position_m", "orientation_wxyz"}:
+        raise HostedDroidError(f"{name} fields are invalid")
+    position = _contact_vector(
+        pose.get("position_m"),
+        f"{name}.position_m",
+        length=3,
+    )
+    orientation = _contact_vector(
+        pose.get("orientation_wxyz"),
+        f"{name}.orientation_wxyz",
+        length=4,
+    )
+    norm = math.sqrt(sum(component * component for component in orientation))
+    if norm <= 1e-12 or abs(norm - 1.0) > _CONTACT_QUATERNION_NORM_TOLERANCE:
+        raise HostedDroidError(f"{name}.orientation_wxyz must be a unit quaternion")
+    normalized = tuple(component / norm for component in orientation)
+    return _ContactPose(
+        position_m=cast(tuple[float, float, float], position),
+        orientation_wxyz=cast(
+            tuple[float, float, float, float],
+            normalized,
+        ),
+    )
+
+
+def _contact_poses_match(left: _ContactPose, right: _ContactPose) -> bool:
+    return (
+        all(
+            _contact_numbers_close(first, second)
+            for first, second in zip(left.position_m, right.position_m, strict=True)
+        )
+        and _quaternion_delta_radians(
+            left.orientation_wxyz,
+            right.orientation_wxyz,
+        )
+        <= 1e-8
+    )
+
+
+def _validate_collision_sweep(
+    value: Any,
+    *,
+    name: str,
+    filter_path: str,
+    expected_max_hits: int,
+    maximum_distance_m: float,
+) -> int:
+    sweep = _contact_mapping(value, name)
+    if set(sweep) != {
+        "available",
+        "max_hits",
+        "captured_hit_count",
+        "saturated",
+        "hits",
+    }:
+        raise HostedDroidError(f"{name} is incomplete")
+    if sweep.get("available") is not True:
+        raise HostedDroidError(f"{name} is unavailable")
+    if sweep.get("saturated") is not False:
+        raise HostedDroidError(f"{name} is saturated")
+    max_hits = _contact_integer(
+        sweep.get("max_hits"),
+        f"{name} maximum hits",
+        minimum=1,
+        maximum=_CONTINUOUS_COLLISION_MAX_HITS_PER_PAIR,
+    )
+    if max_hits != expected_max_hits:
+        raise HostedDroidError(f"{name} maximum hits are invalid")
+    hits = sweep.get("hits")
+    if not isinstance(hits, list) or len(hits) > max_hits:
+        raise HostedDroidError(f"{name} hits are unbounded")
+    captured_hit_count = _contact_integer(
+        sweep.get("captured_hit_count"),
+        f"{name} captured hit count",
+        maximum=max_hits,
+    )
+    if captured_hit_count != len(hits):
+        raise HostedDroidError(f"{name} hit count is inconsistent")
+
+    filter_prefix = filter_path.rstrip("/") + "/"
+    paired_hit_count = 0
+    for hit in hits:
+        hit_record = _contact_mapping(hit, f"{name} hit")
+        if set(hit_record) != {"rigid_body_path", "collider_path", "distance_m"}:
+            raise HostedDroidError(f"{name} hit fields are invalid")
+        rigid_body_path = _absolute_contact_path(
+            hit_record.get("rigid_body_path"),
+            f"{name} rigid body path",
+        )
+        if rigid_body_path != filter_path:
+            raise HostedDroidError(f"{name} hit path is invalid")
+        paired_hit_count += 1
+        collider_path = hit_record.get("collider_path")
+        if collider_path is not None:
+            collider_path = _absolute_contact_path(
+                collider_path,
+                f"{name} collider path",
+            )
+            if collider_path != filter_path and not collider_path.startswith(
+                filter_prefix
+            ):
+                raise HostedDroidError(f"{name} collider path is invalid")
+        hit_distance = _contact_number(
+            hit_record.get("distance_m"),
+            f"{name} hit distance",
+            nonnegative=True,
+        )
+        if hit_distance > maximum_distance_m + max(
+            1e-9,
+            maximum_distance_m * 1e-6,
+        ):
+            raise HostedDroidError(f"{name} hit exceeds the relative motion")
+    return paired_hit_count
+
+
+def _validate_continuous_collision_evidence(
+    value: Any,
+    *,
+    label: str,
+    sensor_path: str,
+    filter_path: str,
+    manifold_contact: bool,
+    expected_config: Mapping[str, Any],
+    previous: _ContinuousCollisionEvidence | None,
+    shared_poses: dict[tuple[str, str], _ContactPose],
+) -> _ContinuousCollisionEvidence:
+    evidence = _contact_mapping(
+        value,
+        f"contact integrity continuous collision evidence for {label}",
+    )
+    if set(evidence) != {
+        "schema_version",
+        "classification",
+        "passed",
+        "complete",
+        "swept_collision_risk_detected",
+        "tunneling_detected",
+        "failure_reasons",
+        "errors",
+        "sensor_path",
+        "filter_path",
+        "previous_endpoint_contact",
+        "current_endpoint_contact",
+        "poses",
+        "rotation_delta_radians",
+        "maximum_rotation_radians",
+        "relative_motion",
+        "rotation_envelope",
+        "sweep",
+        "translation_shape_sweep",
+        "translation_shape_sweep_semantics",
+        "paired_hit_count",
+        "sensor_collider_paths",
+        "endpoint_evidence",
+        "sweep_semantics",
+        "diagnostic_errors",
+    }:
+        raise HostedDroidError("continuous collision evidence fields are invalid")
+    schema_version = evidence.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != _CONTINUOUS_COLLISION_SCHEMA_VERSION
+    ):
+        raise HostedDroidError("continuous collision evidence schema is unsupported")
+    if evidence.get("sensor_path") != sensor_path:
+        raise HostedDroidError("continuous collision sensor path is invalid")
+    if evidence.get("filter_path") != filter_path:
+        raise HostedDroidError("continuous collision filter path is invalid")
+
+    collider_paths = _contact_string_list(
+        evidence.get("sensor_collider_paths"),
+        "continuous collision sensor collider paths",
+        maximum=_CONTINUOUS_COLLISION_MAX_COLLIDERS_PER_PAIR,
+    )
+    if not collider_paths:
+        raise HostedDroidError("continuous collision sensor collider paths are empty")
+    sensor_prefix = sensor_path.rstrip("/") + "/"
+    for collider_path in collider_paths:
+        _absolute_contact_path(
+            collider_path,
+            "continuous collision sensor collider path",
+        )
+        if collider_path != sensor_path and not collider_path.startswith(sensor_prefix):
+            raise HostedDroidError(
+                "continuous collision sensor collider path is outside the sensor body"
+            )
+    if evidence.get("sweep_semantics") != _CONTINUOUS_COLLISION_SWEEP_SEMANTICS:
+        raise HostedDroidError("continuous collision sweep semantics are invalid")
+    if (
+        evidence.get("translation_shape_sweep_semantics")
+        != _CONTINUOUS_COLLISION_TRANSLATION_SHAPE_SWEEP_SEMANTICS
+    ):
+        raise HostedDroidError(
+            "continuous collision translation shape sweep semantics are invalid"
+        )
+    diagnostic_errors = _contact_string_list(
+        evidence.get("diagnostic_errors"),
+        "continuous collision diagnostic errors",
+        maximum=16,
+    )
+    if diagnostic_errors:
+        raise HostedDroidError("continuous collision diagnostic evidence is incomplete")
+
+    endpoint = _contact_mapping(
+        evidence.get("endpoint_evidence"),
+        "continuous collision endpoint evidence",
+    )
+    if set(endpoint) != {
+        "previous_contact_or_overlap",
+        "current_overlap",
+        "current_manifold_contact",
+        "current_contact_or_overlap",
+    }:
+        raise HostedDroidError("continuous collision endpoint evidence is incomplete")
+    endpoint_values = {
+        name: endpoint.get(name)
+        for name in (
+            "previous_contact_or_overlap",
+            "current_overlap",
+            "current_manifold_contact",
+            "current_contact_or_overlap",
+        )
+    }
+    if not all(type(item) is bool for item in endpoint_values.values()):
+        raise HostedDroidError("continuous collision endpoint evidence is incomplete")
+    previous_endpoint_contact = cast(
+        bool,
+        endpoint_values["previous_contact_or_overlap"],
+    )
+    current_overlap = cast(bool, endpoint_values["current_overlap"])
+    current_manifold_contact = cast(
+        bool,
+        endpoint_values["current_manifold_contact"],
+    )
+    current_endpoint_contact = cast(
+        bool,
+        endpoint_values["current_contact_or_overlap"],
+    )
+    if current_manifold_contact is not manifold_contact:
+        raise HostedDroidError("continuous collision manifold evidence is inconsistent")
+    if current_endpoint_contact is not (current_overlap or current_manifold_contact):
+        raise HostedDroidError("continuous collision endpoint evidence is inconsistent")
+    if (
+        evidence.get("previous_endpoint_contact") is not previous_endpoint_contact
+        or evidence.get("current_endpoint_contact") is not current_endpoint_contact
+    ):
+        raise HostedDroidError(
+            "continuous collision endpoint classification is inconsistent"
+        )
+
+    poses = _contact_mapping(evidence.get("poses"), "continuous collision poses")
+    expected_pose_names = {
+        "previous_sensor",
+        "current_sensor",
+        "previous_filter",
+        "current_filter",
+    }
+    if set(poses) != expected_pose_names:
+        raise HostedDroidError("continuous collision poses are incomplete")
+    parsed_poses = {
+        name: _contact_pose(poses.get(name), f"continuous collision pose {name}")
+        for name in expected_pose_names
+    }
+    previous_sensor_pose = parsed_poses["previous_sensor"]
+    current_sensor_pose = parsed_poses["current_sensor"]
+    previous_filter_pose = parsed_poses["previous_filter"]
+    current_filter_pose = parsed_poses["current_filter"]
+    if previous is not None:
+        if (
+            previous_endpoint_contact is not previous.current_endpoint_contact
+            or not _contact_poses_match(
+                previous_sensor_pose,
+                previous.current_sensor_pose,
+            )
+            or not _contact_poses_match(
+                previous_filter_pose,
+                previous.current_filter_pose,
+            )
+        ):
+            raise HostedDroidError(
+                "continuous collision evidence is discontinuous between updates"
+            )
+    for phase, path, pose in (
+        ("previous", sensor_path, previous_sensor_pose),
+        ("current", sensor_path, current_sensor_pose),
+        ("previous", filter_path, previous_filter_pose),
+        ("current", filter_path, current_filter_pose),
+    ):
+        existing = shared_poses.get((phase, path))
+        if existing is not None and not _contact_poses_match(existing, pose):
+            raise HostedDroidError(
+                "continuous collision poses disagree for a shared rigid body"
+            )
+        shared_poses[(phase, path)] = pose
+
+    sensor_rotation = _quaternion_delta_radians(
+        previous_sensor_pose.orientation_wxyz,
+        current_sensor_pose.orientation_wxyz,
+    )
+    filter_rotation = _quaternion_delta_radians(
+        previous_filter_pose.orientation_wxyz,
+        current_filter_pose.orientation_wxyz,
+    )
+    previous_relative_orientation = _quaternion_relative_orientation(
+        previous_sensor_pose.orientation_wxyz,
+        previous_filter_pose.orientation_wxyz,
+    )
+    current_relative_orientation = _quaternion_relative_orientation(
+        current_sensor_pose.orientation_wxyz,
+        current_filter_pose.orientation_wxyz,
+    )
+    relative_rotation = _quaternion_delta_radians(
+        previous_relative_orientation,
+        current_relative_orientation,
+    )
+    rotation_delta = _contact_mapping(
+        evidence.get("rotation_delta_radians"),
+        "continuous collision rotation delta",
+    )
+    if set(rotation_delta) != {"sensor", "filter", "relative", "maximum"}:
+        raise HostedDroidError("continuous collision rotation delta is incomplete")
+    reported_sensor_rotation = _contact_number(
+        rotation_delta.get("sensor"),
+        "continuous collision sensor rotation",
+        nonnegative=True,
+    )
+    reported_filter_rotation = _contact_number(
+        rotation_delta.get("filter"),
+        "continuous collision filter rotation",
+        nonnegative=True,
+    )
+    reported_relative_rotation = _contact_number(
+        rotation_delta.get("relative"),
+        "continuous collision relative rotation",
+        nonnegative=True,
+    )
+    reported_maximum_rotation = _contact_number(
+        rotation_delta.get("maximum"),
+        "continuous collision maximum rotation",
+        nonnegative=True,
+    )
+    if (
+        not _contact_numbers_close(reported_sensor_rotation, sensor_rotation)
+        or not _contact_numbers_close(reported_filter_rotation, filter_rotation)
+        or not _contact_numbers_close(
+            reported_relative_rotation,
+            relative_rotation,
+        )
+        or not _contact_numbers_close(
+            reported_maximum_rotation,
+            max(sensor_rotation, filter_rotation, relative_rotation),
+        )
+    ):
+        raise HostedDroidError("continuous collision rotation delta is inconsistent")
+
+    maximum_rotation = _contact_mapping(
+        evidence.get("maximum_rotation_radians"),
+        "continuous collision rotation limits",
+    )
+    if set(maximum_rotation) != {"sensor", "filter"}:
+        raise HostedDroidError("continuous collision rotation limits are incomplete")
+    sensor_rotation_limit = _contact_number(
+        maximum_rotation.get("sensor"),
+        "continuous collision sensor rotation limit",
+        nonnegative=True,
+    )
+    filter_rotation_limit = _contact_number(
+        maximum_rotation.get("filter"),
+        "continuous collision filter rotation limit",
+        nonnegative=True,
+    )
+    expected_sensor_limit = _contact_number(
+        expected_config.get("maximum_sensor_rotation_rad"),
+        "configured continuous collision sensor rotation limit",
+        nonnegative=True,
+    )
+    expected_filter_limit = _contact_number(
+        expected_config.get("maximum_filter_rotation_rad"),
+        "configured continuous collision filter rotation limit",
+        nonnegative=True,
+    )
+    if not _contact_numbers_close(
+        sensor_rotation_limit, expected_sensor_limit
+    ) or not _contact_numbers_close(filter_rotation_limit, expected_filter_limit):
+        raise HostedDroidError("continuous collision rotation limits are invalid")
+    if (
+        sensor_rotation > expected_sensor_limit + 1e-12
+        or filter_rotation > expected_filter_limit + 1e-12
+    ):
+        raise HostedDroidError("continuous collision rotation limit was exceeded")
+
+    relative_motion = _contact_mapping(
+        evidence.get("relative_motion"),
+        "continuous collision relative motion",
+    )
+    if set(relative_motion) != {"translation_m", "direction_unit", "distance_m"}:
+        raise HostedDroidError("continuous collision relative motion is incomplete")
+    reported_translation = _contact_vector(
+        relative_motion.get("translation_m"),
+        "continuous collision relative translation",
+        length=3,
+    )
+    reported_direction = _contact_vector(
+        relative_motion.get("direction_unit"),
+        "continuous collision relative direction",
+        length=3,
+    )
+    reported_distance = _contact_number(
+        relative_motion.get("distance_m"),
+        "continuous collision relative distance",
+        nonnegative=True,
+    )
+    previous_sensor_from_filter = tuple(
+        previous_sensor_pose.position_m[axis] - previous_filter_pose.position_m[axis]
+        for axis in range(3)
+    )
+    previous_sensor_in_filter = _vector_in_quaternion_frame(
+        cast(tuple[float, float, float], previous_sensor_from_filter),
+        previous_filter_pose.orientation_wxyz,
+    )
+    current_sensor_from_filter = tuple(
+        current_sensor_pose.position_m[axis] - current_filter_pose.position_m[axis]
+        for axis in range(3)
+    )
+    current_sensor_in_filter = _vector_in_quaternion_frame(
+        cast(tuple[float, float, float], current_sensor_from_filter),
+        current_filter_pose.orientation_wxyz,
+    )
+    expected_translation = tuple(
+        current_sensor_in_filter[axis] - previous_sensor_in_filter[axis]
+        for axis in range(3)
+    )
+    expected_distance = math.sqrt(
+        sum(component * component for component in expected_translation)
+    )
+    if expected_distance <= _CONTINUOUS_COLLISION_MOTION_EPSILON_METERS:
+        expected_translation = (0.0, 0.0, 0.0)
+        expected_direction = (0.0, 0.0, 0.0)
+        expected_distance = 0.0
+    else:
+        expected_direction = tuple(
+            component / expected_distance for component in expected_translation
+        )
+    if (
+        not all(
+            _contact_numbers_close(actual, expected)
+            for actual, expected in zip(
+                reported_translation,
+                expected_translation,
+                strict=True,
+            )
+        )
+        or not all(
+            _contact_numbers_close(actual, expected)
+            for actual, expected in zip(
+                reported_direction,
+                expected_direction,
+                strict=True,
+            )
+        )
+        or not _contact_numbers_close(reported_distance, expected_distance)
+    ):
+        raise HostedDroidError("continuous collision relative motion is inconsistent")
+
+    rotation_envelope = _contact_mapping(
+        evidence.get("rotation_envelope"),
+        "continuous collision rotation envelope",
+    )
+    if set(rotation_envelope) != {
+        "method",
+        "base_half_extents_m",
+        "radius_m",
+        "relative_rotation_rad",
+        "inflation_m",
+        "query_half_extents_m",
+        "query_kind",
+    }:
+        raise HostedDroidError(
+            "continuous collision rotation envelope fields are invalid"
+        )
+    if (
+        rotation_envelope.get("method")
+        != _CONTINUOUS_COLLISION_ROTATION_ENVELOPE_METHOD
+    ):
+        raise HostedDroidError(
+            "continuous collision rotation envelope method is invalid"
+        )
+    base_half_extents = _contact_vector(
+        rotation_envelope.get("base_half_extents_m"),
+        "continuous collision rotation envelope base half extents",
+        length=3,
+    )
+    if not all(component > 0 for component in base_half_extents):
+        raise HostedDroidError(
+            "continuous collision rotation envelope base half extents must be positive"
+        )
+    expected_radius = math.sqrt(
+        sum(component * component for component in base_half_extents)
+    )
+    radius = _contact_number(
+        rotation_envelope.get("radius_m"),
+        "continuous collision rotation envelope radius",
+        nonnegative=True,
+    )
+    envelope_relative_rotation = _contact_number(
+        rotation_envelope.get("relative_rotation_rad"),
+        "continuous collision rotation envelope relative rotation",
+        nonnegative=True,
+    )
+    inflation = _contact_number(
+        rotation_envelope.get("inflation_m"),
+        "continuous collision rotation envelope inflation",
+        nonnegative=True,
+    )
+    query_half_extents = _contact_vector(
+        rotation_envelope.get("query_half_extents_m"),
+        "continuous collision rotation envelope query half extents",
+        length=3,
+    )
+    if not all(component > 0 for component in query_half_extents):
+        raise HostedDroidError(
+            "continuous collision rotation envelope query half extents must be positive"
+        )
+    expected_inflation = 2.0 * expected_radius * math.sin(relative_rotation / 2.0)
+    expected_query_half_extents = tuple(
+        component + expected_inflation for component in base_half_extents
+    )
+    expected_query_kind = (
+        "sweep_box_all"
+        if expected_distance > _CONTINUOUS_COLLISION_MOTION_EPSILON_METERS
+        else "overlap_box"
+    )
+    if (
+        not _contact_numbers_close(radius, expected_radius)
+        or not _contact_numbers_close(
+            envelope_relative_rotation,
+            relative_rotation,
+        )
+        or not _contact_numbers_close(inflation, expected_inflation)
+        or not all(
+            _contact_numbers_close(actual, expected)
+            for actual, expected in zip(
+                query_half_extents,
+                expected_query_half_extents,
+                strict=True,
+            )
+        )
+        or rotation_envelope.get("query_kind") != expected_query_kind
+    ):
+        raise HostedDroidError("continuous collision rotation envelope is inconsistent")
+
+    expected_max_hits = _contact_integer(
+        expected_config.get("max_hits_per_pair"),
+        "configured continuous collision maximum hits",
+        minimum=1,
+        maximum=_CONTINUOUS_COLLISION_MAX_HITS_PER_PAIR,
+    )
+    paired_hit_count = _validate_collision_sweep(
+        evidence.get("sweep"),
+        name="continuous collision safety sweep evidence",
+        filter_path=filter_path,
+        expected_max_hits=expected_max_hits,
+        maximum_distance_m=expected_distance,
+    )
+    _validate_collision_sweep(
+        evidence.get("translation_shape_sweep"),
+        name="continuous collision translation shape sweep diagnostic",
+        filter_path=filter_path,
+        expected_max_hits=expected_max_hits,
+        maximum_distance_m=expected_distance,
+    )
+    reported_paired_hits = _contact_integer(
+        evidence.get("paired_hit_count"),
+        "continuous collision paired hit count",
+        maximum=expected_max_hits,
+    )
+    if reported_paired_hits != paired_hit_count:
+        raise HostedDroidError("continuous collision paired hit count is inconsistent")
+
+    swept_collision_risk_detected = (
+        paired_hit_count > 0
+        and not previous_endpoint_contact
+        and not current_endpoint_contact
+    )
+    reported_risk = evidence.get("swept_collision_risk_detected")
+    tunneling_compatibility_alias = evidence.get("tunneling_detected")
+    if (
+        type(reported_risk) is not bool
+        or type(tunneling_compatibility_alias) is not bool
+        or reported_risk is not swept_collision_risk_detected
+        or tunneling_compatibility_alias is not reported_risk
+    ):
+        raise HostedDroidError(
+            "continuous collision swept collision risk verdict is inconsistent"
+        )
+    expected_classification = (
+        "paired_tunneling" if swept_collision_risk_detected else "clear"
+    )
+    expected_passed = not swept_collision_risk_detected
+    expected_failure_reasons = (
+        ["paired_body_sweep_hit_without_endpoint_contact"]
+        if swept_collision_risk_detected
+        else []
+    )
+    failure_reasons = _contact_string_list(
+        evidence.get("failure_reasons"),
+        "continuous collision failure reasons",
+        maximum=16,
+    )
+    evidence_errors = _contact_string_list(
+        evidence.get("errors"),
+        "continuous collision errors",
+        maximum=16,
+    )
+    if evidence.get("complete") is not True or evidence_errors:
+        raise HostedDroidError("continuous collision evidence is incomplete")
+    if (
+        evidence.get("classification") != expected_classification
+        or evidence.get("passed") is not expected_passed
+        or failure_reasons != expected_failure_reasons
+    ):
+        raise HostedDroidError("continuous collision classification is inconsistent")
+
+    return _ContinuousCollisionEvidence(
+        previous_sensor_pose=previous_sensor_pose,
+        current_sensor_pose=current_sensor_pose,
+        previous_filter_pose=previous_filter_pose,
+        current_filter_pose=current_filter_pose,
+        previous_endpoint_contact=previous_endpoint_contact,
+        current_endpoint_contact=current_endpoint_contact,
+        relative_translation_m=expected_distance,
+        sensor_rotation_rad=sensor_rotation,
+        filter_rotation_rad=filter_rotation,
+        relative_rotation_rad=relative_rotation,
+        rotation_envelope_inflation_m=inflation,
+        swept_collision_risk_detected=swept_collision_risk_detected,
+        paired_hit_count=paired_hit_count,
+    )
+
+
 class _DroidTaskSuccessTracker:
     """Own the temporal proof required for a policy-driven placement."""
 
@@ -584,9 +1418,15 @@ class _DroidTaskSuccessTracker:
         observed_gripper_position: float,
         commanded_gripper_closed: bool,
         contact_integrity: Mapping[str, Any],
+        expected_contact_updates: int,
+        expected_contact_physics_dt_seconds: float,
     ) -> dict[str, Any]:
         self.checks += 1
-        contacts = self._contact_evidence(contact_integrity)
+        contacts = self._contact_evidence(
+            contact_integrity,
+            expected_updates=expected_contact_updates,
+            expected_physics_dt_seconds=expected_contact_physics_dt_seconds,
+        )
         geometry = self._geometry(state)
         previous_object_center = self.previous_object_center
         object_displacement = math.dist(
@@ -771,217 +1611,499 @@ class _DroidTaskSuccessTracker:
             return "trajectory_violation:object_displacement"
         return None
 
-    def _contact_evidence(self, trace: Mapping[str, Any]) -> dict[str, Any]:
+    def _contact_evidence(
+        self,
+        trace: Mapping[str, Any],
+        *,
+        expected_updates: int,
+        expected_physics_dt_seconds: float,
+    ) -> dict[str, Any]:
         if not isinstance(trace, Mapping):
             raise HostedDroidError("contact integrity telemetry is missing")
-        if trace.get("schema_version") != 1:
+        schema_version = trace.get("schema_version")
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version != _CONTACT_INTEGRITY_SCHEMA_VERSION
+        ):
             raise HostedDroidError("contact integrity telemetry schema is unsupported")
-        if trace.get("complete") is not True:
-            raise HostedDroidError("contact integrity telemetry is incomplete")
+        if trace.get("capture_source") != _CONTACT_CAPTURE_SOURCE:
+            raise HostedDroidError("contact integrity capture source is invalid")
+        if trace.get("sampling_semantics") != _CONTINUOUS_COLLISION_SAMPLING_SEMANTICS:
+            raise HostedDroidError("contact integrity sampling semantics are invalid")
+        expected_updates = _contact_integer(
+            expected_updates,
+            "expected contact integrity update count",
+            minimum=1,
+        )
+        expected_physics_dt_seconds = _contact_number(
+            expected_physics_dt_seconds,
+            "expected contact integrity physics dt",
+        )
+        if expected_physics_dt_seconds <= 0:
+            raise HostedDroidError(
+                "expected contact integrity physics dt must be positive"
+            )
+
+        request = _contact_integrity_request(self.spec)
+        expected_continuous = cast(
+            Mapping[str, Any],
+            request["continuous_collision"],
+        )
+        configured_continuous = _contact_mapping(
+            trace.get("continuous_collision"),
+            "contact integrity continuous collision configuration",
+        )
+        if set(configured_continuous) != set(expected_continuous):
+            raise HostedDroidError(
+                "contact integrity continuous collision configuration is incomplete"
+            )
+        for name in (
+            "maximum_sensor_rotation_rad",
+            "maximum_filter_rotation_rad",
+        ):
+            actual = _contact_number(
+                configured_continuous.get(name),
+                f"contact integrity continuous collision {name}",
+                nonnegative=True,
+            )
+            expected = _contact_number(
+                expected_continuous.get(name),
+                f"configured contact integrity continuous collision {name}",
+                nonnegative=True,
+            )
+            if not _contact_numbers_close(actual, expected):
+                raise HostedDroidError(
+                    f"contact integrity continuous collision {name} is invalid"
+                )
+        configured_max_hits = _contact_integer(
+            configured_continuous.get("max_hits_per_pair"),
+            "contact integrity continuous collision maximum hits",
+            minimum=1,
+            maximum=_CONTINUOUS_COLLISION_MAX_HITS_PER_PAIR,
+        )
+        if configured_max_hits != expected_continuous["max_hits_per_pair"]:
+            raise HostedDroidError(
+                "contact integrity continuous collision maximum hits are invalid"
+            )
+
         expected_limits = {
             "maximum_penetration_m": self.spec.maximum_contact_penetration_meters,
-            "maximum_normal_impulse_ns": (self.spec.maximum_contact_normal_impulse_ns),
+            "maximum_normal_impulse_ns": self.spec.maximum_contact_normal_impulse_ns,
+            "maximum_sensor_rotation_rad_per_update": (
+                _CONTINUOUS_COLLISION_MAX_ROTATION_RADIANS
+            ),
+            "maximum_filter_rotation_rad_per_update": (
+                _CONTINUOUS_COLLISION_MAX_ROTATION_RADIANS
+            ),
+            "unreported_swept_collisions": 0.0,
         }
-        limits = trace.get("limits")
-        if not isinstance(limits, Mapping) or set(limits) != set(expected_limits):
+        limits = _contact_mapping(trace.get("limits"), "contact integrity limits")
+        if set(limits) != set(expected_limits):
             raise HostedDroidError("contact integrity limits are incomplete")
         for name, expected in expected_limits.items():
-            value = limits.get(name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or not math.isclose(float(value), expected, rel_tol=1e-9, abs_tol=1e-12)
-            ):
+            value = _contact_number(
+                limits.get(name),
+                f"contact integrity limit {name}",
+                nonnegative=True,
+            )
+            if not _contact_numbers_close(value, expected):
                 raise HostedDroidError(f"contact integrity limit {name} is invalid")
-        violations = trace.get("violations")
-        if not isinstance(violations, list):
-            raise HostedDroidError("contact integrity violations are invalid")
+
+        trace_physics_dt = _contact_number(
+            trace.get("physics_dt_seconds"),
+            "contact integrity physics dt",
+        )
+        if trace_physics_dt <= 0 or not _contact_numbers_close(
+            trace_physics_dt,
+            expected_physics_dt_seconds,
+        ):
+            raise HostedDroidError("contact integrity physics dt is invalid")
+        requested = _contact_integer(
+            trace.get("requested_updates"),
+            "contact integrity requested update count",
+            minimum=1,
+        )
+        captured = _contact_integer(
+            trace.get("captured_updates"),
+            "contact integrity captured update count",
+            minimum=1,
+        )
         samples = trace.get("samples")
-        requested = trace.get("requested_updates")
-        captured = trace.get("captured_updates")
         if (
             not isinstance(samples, list)
-            or not samples
-            or isinstance(requested, bool)
-            or not isinstance(requested, int)
-            or isinstance(captured, bool)
-            or not isinstance(captured, int)
-            or requested != captured
-            or captured != len(samples)
+            or requested != expected_updates
+            or captured != expected_updates
+            or len(samples) != expected_updates
         ):
             raise HostedDroidError("contact integrity update count is invalid")
 
         expected_pairs = {
-            _LEFT_FINGER_CONTACT: (
-                self.spec.left_finger_prim_path,
-                self.spec.object_prim_path,
-            ),
-            _RIGHT_FINGER_CONTACT: (
-                self.spec.right_finger_prim_path,
-                self.spec.object_prim_path,
-            ),
-            _RECEPTACLE_CONTACT: (
-                self.spec.object_prim_path,
-                self.spec.receptacle_prim_path,
-            ),
+            cast(str, pair["label"]): (
+                cast(str, pair["sensor_path"]),
+                cast(str, pair["filter_path"]),
+            )
+            for pair in cast(list[dict[str, Any]], request["pairs"])
         }
+        pair_count = len(expected_pairs)
+        contact_slots = expected_updates * pair_count * _CONTACT_MAX_CONTACTS_PER_PAIR
+        sweep_slots = (
+            expected_updates * pair_count * _CONTINUOUS_COLLISION_MAX_HITS_PER_PAIR * 2
+        )
+        if contact_slots + sweep_slots > _CONTACT_TRACE_SLOT_BUDGET:
+            raise HostedDroidError("contact integrity response budget is unbounded")
+
+        trace_complete = trace.get("complete")
+        if type(trace_complete) is not bool:
+            raise HostedDroidError("contact integrity completeness verdict is invalid")
+        errors = _contact_string_list(
+            trace.get("errors"),
+            "contact integrity errors",
+            maximum=expected_updates * pair_count,
+        )
+        saturated_pairs = _contact_string_list(
+            trace.get("saturated_pairs"),
+            "contact integrity saturated pairs",
+            maximum=pair_count,
+        )
+        incomplete_pairs = _contact_string_list(
+            trace.get("continuous_collision_incomplete_pairs"),
+            "contact integrity continuous collision incomplete pairs",
+            maximum=pair_count,
+        )
+        violations = trace.get("violations")
+        if (
+            not isinstance(violations, list)
+            or len(violations) > expected_updates * pair_count * 3
+        ):
+            raise HostedDroidError("contact integrity violations are invalid")
+
         maximum_penetration = 0.0
         maximum_normal_impulse = 0.0
+        maximum_relative_translation = 0.0
+        maximum_sensor_rotation = 0.0
+        maximum_filter_rotation = 0.0
+        maximum_relative_rotation = 0.0
+        maximum_rotation_envelope_inflation = 0.0
+        updates_with_contact = 0
+        unreported_swept_collisions = 0
         bilateral_contact_updates = 0
         receptacle_contact_updates = 0
         last_contacts: set[str] = set()
         last_bilateral_normal_dot: float | None = None
         bilateral_contact_flags: list[bool] = []
-        for expected_update_index, sample in enumerate(samples):
-            if not isinstance(sample, Mapping):
-                raise HostedDroidError("contact integrity sample is invalid")
-            if sample.get("update_index") != expected_update_index:
+        previous_continuous: dict[str, _ContinuousCollisionEvidence] = {}
+        expected_violations: dict[tuple[int, str, str], tuple[float, float]] = {}
+
+        for expected_update_index, sample_value in enumerate(samples):
+            sample = _contact_mapping(
+                sample_value,
+                "contact integrity sample",
+            )
+            sample_update_index = _contact_integer(
+                sample.get("update_index"),
+                "contact integrity update index",
+                maximum=expected_updates - 1,
+            )
+            if sample_update_index != expected_update_index:
                 raise HostedDroidError("contact integrity update index is invalid")
-            physics_dt = sample.get("physics_dt_seconds")
-            if (
-                isinstance(physics_dt, bool)
-                or not isinstance(physics_dt, (int, float))
-                or not math.isfinite(float(physics_dt))
-                or float(physics_dt) <= 0
+            sample_physics_dt = _contact_number(
+                sample.get("physics_dt_seconds"),
+                "contact integrity sample physics dt",
+            )
+            if sample_physics_dt <= 0 or not _contact_numbers_close(
+                sample_physics_dt,
+                expected_physics_dt_seconds,
             ):
-                raise HostedDroidError("contact integrity physics dt is invalid")
-            physics_dt = float(physics_dt)
+                raise HostedDroidError("contact integrity sample physics dt is invalid")
             pairs = sample.get("pairs")
-            if not isinstance(pairs, list):
+            if not isinstance(pairs, list) or len(pairs) != pair_count:
                 raise HostedDroidError("contact integrity pair list is invalid")
             by_label: dict[str, Mapping[str, Any]] = {}
-            for pair in pairs:
-                if not isinstance(pair, Mapping) or not isinstance(
-                    pair.get("label"), str
-                ):
-                    raise HostedDroidError("contact integrity pair is invalid")
-                label = cast(str, pair["label"])
-                if label in by_label:
-                    raise HostedDroidError("contact integrity pair label is duplicated")
+            for pair_value in pairs:
+                pair = _contact_mapping(pair_value, "contact integrity pair")
+                label = pair.get("label")
+                if not isinstance(label, str) or label in by_label:
+                    raise HostedDroidError(
+                        "contact integrity pair label is invalid or duplicated"
+                    )
                 by_label[label] = pair
             if set(by_label) != set(expected_pairs):
                 raise HostedDroidError("contact integrity pair labels are incomplete")
 
             contacts_this_update: set[str] = set()
             mean_normals: dict[str, tuple[float, float, float]] = {}
-            for label, pair in by_label.items():
-                if pair.get("complete") is not True:
-                    raise HostedDroidError("contact integrity pair is incomplete")
-                sensor_path, filter_path = expected_pairs[label]
+            shared_poses: dict[tuple[str, str], _ContactPose] = {}
+            for label, (sensor_path, filter_path) in expected_pairs.items():
+                pair = by_label[label]
                 if (
                     pair.get("sensor_path") != sensor_path
                     or pair.get("filter_path") != filter_path
                 ):
                     raise HostedDroidError("contact integrity pair paths are invalid")
+                if type(pair.get("buffer_saturated")) is not bool:
+                    raise HostedDroidError(
+                        "contact integrity pair saturation verdict is invalid"
+                    )
+                if pair.get("buffer_saturated") is True:
+                    raise HostedDroidError(
+                        "contact integrity contact buffer is saturated"
+                    )
                 contacts_list = pair.get("contacts")
-                if not isinstance(contacts_list, list):
-                    raise HostedDroidError("contact integrity contacts are invalid")
-                contact_count = pair.get("contact_count")
                 if (
-                    isinstance(contact_count, bool)
-                    or not isinstance(contact_count, int)
-                    or contact_count != len(contacts_list)
+                    not isinstance(contacts_list, list)
+                    or len(contacts_list) >= _CONTACT_MAX_CONTACTS_PER_PAIR
                 ):
-                    raise HostedDroidError("contact integrity contact count is invalid")
+                    raise HostedDroidError(
+                        "contact integrity contacts are invalid or unbounded"
+                    )
+                contact_count = _contact_integer(
+                    pair.get("contact_count"),
+                    "contact integrity contact count",
+                    maximum=_CONTACT_MAX_CONTACTS_PER_PAIR,
+                )
+                if (
+                    contact_count != len(contacts_list)
+                    or contact_count >= _CONTACT_MAX_CONTACTS_PER_PAIR
+                ):
+                    raise HostedDroidError(
+                        "contact integrity contact count is inconsistent"
+                    )
                 if contacts_list:
                     contacts_this_update.add(label)
+
                 normals: list[tuple[float, float, float]] = []
-                for contact in contacts_list:
-                    if not isinstance(contact, Mapping):
-                        raise HostedDroidError("contact integrity point is invalid")
-                    penetration = contact.get("penetration_m")
-                    if (
-                        isinstance(penetration, bool)
-                        or not isinstance(penetration, (int, float))
-                        or not math.isfinite(float(penetration))
-                        or float(penetration) < 0
-                    ):
-                        raise HostedDroidError(
-                            "contact integrity penetration is invalid"
-                        )
-                    maximum_penetration = max(maximum_penetration, float(penetration))
-                    impulse = contact.get("normal_impulse_ns")
-                    force = contact.get("normal_force_n")
-                    if (
-                        isinstance(impulse, bool)
-                        or not isinstance(impulse, (int, float))
-                        or not math.isfinite(float(impulse))
-                        or float(impulse) < 0
-                        or isinstance(force, bool)
-                        or not isinstance(force, (int, float))
-                        or not math.isfinite(float(force))
-                        or float(force) < 0
-                        or not math.isclose(
-                            float(force),
-                            float(impulse) / physics_dt,
-                            rel_tol=1e-5,
-                            abs_tol=1e-8,
-                        )
-                    ):
-                        raise HostedDroidError(
-                            "contact integrity normal impulse is invalid"
-                        )
-                    maximum_normal_impulse = max(maximum_normal_impulse, float(impulse))
-                    normal = _finite_triplet(
-                        contact.get("normal_filter_to_sensor"),
-                        "contact_integrity.normal_filter_to_sensor",
+                pair_maximum_penetration = 0.0
+                pair_maximum_impulse = 0.0
+                pair_total_impulse = 0.0
+                for contact_value in contacts_list:
+                    contact = _contact_mapping(
+                        contact_value,
+                        "contact integrity contact",
                     )
-                    normal_length = math.sqrt(sum(value * value for value in normal))
+                    _contact_vector(
+                        contact.get("point_m"),
+                        "contact integrity contact point",
+                        length=3,
+                    )
+                    normal = _contact_vector(
+                        contact.get("normal_filter_to_sensor"),
+                        "contact integrity contact normal",
+                        length=3,
+                    )
+                    normal_length = math.sqrt(
+                        sum(component * component for component in normal)
+                    )
                     if normal_length <= 1e-9:
                         raise HostedDroidError("contact integrity normal is degenerate")
                     normals.append(
                         cast(
                             tuple[float, float, float],
-                            tuple(value / normal_length for value in normal),
+                            tuple(component / normal_length for component in normal),
                         )
+                    )
+                    signed_separation = _contact_number(
+                        contact.get("signed_separation_m"),
+                        "contact integrity signed separation",
+                    )
+                    penetration = _contact_number(
+                        contact.get("penetration_m"),
+                        "contact integrity penetration",
+                        nonnegative=True,
+                    )
+                    if not _contact_numbers_close(
+                        penetration,
+                        max(0.0, -signed_separation),
+                    ):
+                        raise HostedDroidError(
+                            "contact integrity penetration is inconsistent"
+                        )
+                    impulse = _contact_number(
+                        contact.get("normal_impulse_ns"),
+                        "contact integrity normal impulse",
+                        nonnegative=True,
+                    )
+                    force = _contact_number(
+                        contact.get("normal_force_n"),
+                        "contact integrity normal force",
+                        nonnegative=True,
+                    )
+                    if not _contact_numbers_close(
+                        force,
+                        impulse / sample_physics_dt,
+                    ):
+                        raise HostedDroidError(
+                            "contact integrity normal force is inconsistent"
+                        )
+                    pair_maximum_penetration = max(
+                        pair_maximum_penetration,
+                        penetration,
+                    )
+                    pair_maximum_impulse = max(pair_maximum_impulse, impulse)
+                    pair_total_impulse += impulse
+
+                reported_pair_penetration = _contact_number(
+                    pair.get("maximum_penetration_m"),
+                    "contact integrity pair maximum penetration",
+                    nonnegative=True,
+                )
+                reported_pair_impulse = _contact_number(
+                    pair.get("maximum_normal_impulse_ns"),
+                    "contact integrity pair maximum normal impulse",
+                    nonnegative=True,
+                )
+                reported_pair_total_impulse = _contact_number(
+                    pair.get("total_normal_impulse_ns"),
+                    "contact integrity pair total normal impulse",
+                    nonnegative=True,
+                )
+                if (
+                    not _contact_numbers_close(
+                        reported_pair_penetration,
+                        pair_maximum_penetration,
+                    )
+                    or not _contact_numbers_close(
+                        reported_pair_impulse,
+                        pair_maximum_impulse,
+                    )
+                    or not _contact_numbers_close(
+                        reported_pair_total_impulse,
+                        pair_total_impulse,
+                    )
+                ):
+                    raise HostedDroidError(
+                        "contact integrity pair contact summary is inconsistent"
+                    )
+                maximum_penetration = max(
+                    maximum_penetration,
+                    pair_maximum_penetration,
+                )
+                maximum_normal_impulse = max(
+                    maximum_normal_impulse,
+                    pair_maximum_impulse,
+                )
+
+                friction_contacts = pair.get("friction_contacts")
+                if (
+                    not isinstance(friction_contacts, list)
+                    or len(friction_contacts) >= _CONTACT_MAX_CONTACTS_PER_PAIR
+                ):
+                    raise HostedDroidError(
+                        "contact integrity friction data is invalid or unbounded"
+                    )
+                for friction_value in friction_contacts:
+                    friction = _contact_mapping(
+                        friction_value,
+                        "contact integrity friction contact",
+                    )
+                    _contact_vector(
+                        friction.get("point_m"),
+                        "contact integrity friction point",
+                        length=3,
+                    )
+                    vector = _contact_vector(
+                        friction.get("impulse_vector_ns"),
+                        "contact integrity friction impulse",
+                        length=3,
+                    )
+                    magnitude = _contact_number(
+                        friction.get("impulse_magnitude_ns"),
+                        "contact integrity friction impulse magnitude",
+                        nonnegative=True,
+                    )
+                    expected_magnitude = math.sqrt(
+                        sum(component * component for component in vector)
+                    )
+                    if not _contact_numbers_close(magnitude, expected_magnitude):
+                        raise HostedDroidError(
+                            "contact integrity friction impulse is inconsistent"
+                        )
+
+                continuous = _validate_continuous_collision_evidence(
+                    pair.get("continuous_collision"),
+                    label=label,
+                    sensor_path=sensor_path,
+                    filter_path=filter_path,
+                    manifold_contact=bool(contacts_list),
+                    expected_config=expected_continuous,
+                    previous=previous_continuous.get(label),
+                    shared_poses=shared_poses,
+                )
+                previous_continuous[label] = continuous
+                maximum_relative_translation = max(
+                    maximum_relative_translation,
+                    continuous.relative_translation_m,
+                )
+                maximum_sensor_rotation = max(
+                    maximum_sensor_rotation,
+                    continuous.sensor_rotation_rad,
+                )
+                maximum_filter_rotation = max(
+                    maximum_filter_rotation,
+                    continuous.filter_rotation_rad,
+                )
+                maximum_relative_rotation = max(
+                    maximum_relative_rotation,
+                    continuous.relative_rotation_rad,
+                )
+                maximum_rotation_envelope_inflation = max(
+                    maximum_rotation_envelope_inflation,
+                    continuous.rotation_envelope_inflation_m,
+                )
+                if continuous.swept_collision_risk_detected:
+                    unreported_swept_collisions += 1
+                    expected_violations[
+                        (
+                            expected_update_index,
+                            label,
+                            "unreported_swept_collision",
+                        )
+                    ] = (float(continuous.paired_hit_count), 0.0)
+                if pair.get("complete") is not True:
+                    raise HostedDroidError("contact integrity pair is incomplete")
+                if (
+                    pair_maximum_penetration
+                    > self.spec.maximum_contact_penetration_meters
+                ):
+                    expected_violations[
+                        (
+                            expected_update_index,
+                            label,
+                            "maximum_penetration_m",
+                        )
+                    ] = (
+                        pair_maximum_penetration,
+                        self.spec.maximum_contact_penetration_meters,
+                    )
+                if pair_maximum_impulse > self.spec.maximum_contact_normal_impulse_ns:
+                    expected_violations[
+                        (
+                            expected_update_index,
+                            label,
+                            "maximum_normal_impulse_ns",
+                        )
+                    ] = (
+                        pair_maximum_impulse,
+                        self.spec.maximum_contact_normal_impulse_ns,
                     )
                 if normals:
                     mean = tuple(
                         sum(normal[axis] for normal in normals) / len(normals)
                         for axis in range(3)
                     )
-                    mean_length = math.sqrt(sum(value * value for value in mean))
+                    mean_length = math.sqrt(
+                        sum(component * component for component in mean)
+                    )
                     if mean_length <= 1e-9:
                         raise HostedDroidError(
                             "contact integrity mean normal is degenerate"
                         )
                     mean_normals[label] = cast(
                         tuple[float, float, float],
-                        tuple(value / mean_length for value in mean),
+                        tuple(component / mean_length for component in mean),
                     )
 
-                friction_contacts = pair.get("friction_contacts")
-                if not isinstance(friction_contacts, list):
-                    raise HostedDroidError("contact integrity friction data is invalid")
-                for friction_contact in friction_contacts:
-                    if not isinstance(friction_contact, Mapping):
-                        raise HostedDroidError(
-                            "contact integrity friction point is invalid"
-                        )
-                    vector = _finite_triplet(
-                        friction_contact.get("impulse_vector_ns"),
-                        "contact_integrity.friction_impulse",
-                    )
-                    magnitude = friction_contact.get("impulse_magnitude_ns")
-                    expected_magnitude = math.sqrt(
-                        sum(value * value for value in vector)
-                    )
-                    if (
-                        isinstance(magnitude, bool)
-                        or not isinstance(magnitude, (int, float))
-                        or not math.isfinite(float(magnitude))
-                        or float(magnitude) < 0
-                        or not math.isclose(
-                            float(magnitude),
-                            expected_magnitude,
-                            rel_tol=1e-5,
-                            abs_tol=1e-8,
-                        )
-                    ):
-                        raise HostedDroidError(
-                            "contact integrity friction impulse is invalid"
-                        )
+            updates_with_contact += int(bool(contacts_this_update))
             bilateral_contact = {
                 _LEFT_FINGER_CONTACT,
                 _RIGHT_FINGER_CONTACT,
@@ -1001,6 +2123,128 @@ class _DroidTaskSuccessTracker:
                 receptacle_contact_updates += 1
             last_contacts = contacts_this_update
 
+        actual_violations: dict[tuple[int, str, str], tuple[float, float]] = {}
+        for violation_value in violations:
+            violation = _contact_mapping(
+                violation_value,
+                "contact integrity violation",
+            )
+            if set(violation) != {
+                "update_index",
+                "pair_label",
+                "metric",
+                "observed",
+                "limit",
+            }:
+                raise HostedDroidError("contact integrity violation fields are invalid")
+            update_index = _contact_integer(
+                violation.get("update_index"),
+                "contact integrity violation update index",
+                maximum=expected_updates - 1,
+            )
+            pair_label = violation.get("pair_label")
+            metric = violation.get("metric")
+            if pair_label not in expected_pairs or metric not in {
+                "maximum_penetration_m",
+                "maximum_normal_impulse_ns",
+                "unreported_swept_collision",
+            }:
+                raise HostedDroidError("contact integrity violation is invalid")
+            key = (update_index, cast(str, pair_label), cast(str, metric))
+            if key in actual_violations:
+                raise HostedDroidError("contact integrity violation is duplicated")
+            actual_violations[key] = (
+                _contact_number(
+                    violation.get("observed"),
+                    "contact integrity violation observed value",
+                    nonnegative=True,
+                ),
+                _contact_number(
+                    violation.get("limit"),
+                    "contact integrity violation limit",
+                    nonnegative=True,
+                ),
+            )
+        if set(actual_violations) != set(expected_violations):
+            raise HostedDroidError("contact integrity violations are inconsistent")
+        for key, (expected_observed, expected_limit) in expected_violations.items():
+            actual_observed, actual_limit = actual_violations[key]
+            if not _contact_numbers_close(
+                actual_observed, expected_observed
+            ) or not _contact_numbers_close(actual_limit, expected_limit):
+                raise HostedDroidError(
+                    "contact integrity violation values are inconsistent"
+                )
+
+        summary = _contact_mapping(
+            trace.get("summary"),
+            "contact integrity summary",
+        )
+        expected_summary_fields = {
+            "updates_with_contact",
+            "maximum_penetration_m",
+            "maximum_normal_impulse_ns",
+            "unreported_swept_collisions",
+            "maximum_relative_translation_m",
+            "maximum_sensor_rotation_rad",
+            "maximum_filter_rotation_rad",
+            "maximum_relative_rotation_rad",
+            "maximum_rotation_envelope_inflation_m",
+        }
+        if set(summary) != expected_summary_fields:
+            raise HostedDroidError("contact integrity summary is incomplete")
+        if (
+            _contact_integer(
+                summary.get("updates_with_contact"),
+                "contact integrity updates with contact",
+                maximum=expected_updates,
+            )
+            != updates_with_contact
+        ):
+            raise HostedDroidError("contact integrity contact summary is inconsistent")
+        if (
+            _contact_integer(
+                summary.get("unreported_swept_collisions"),
+                "contact integrity unreported swept collision count",
+                maximum=expected_updates * pair_count,
+            )
+            != unreported_swept_collisions
+        ):
+            raise HostedDroidError(
+                "contact integrity swept collision summary is inconsistent"
+            )
+        for name, expected in (
+            ("maximum_penetration_m", maximum_penetration),
+            ("maximum_normal_impulse_ns", maximum_normal_impulse),
+            ("maximum_relative_translation_m", maximum_relative_translation),
+            ("maximum_sensor_rotation_rad", maximum_sensor_rotation),
+            ("maximum_filter_rotation_rad", maximum_filter_rotation),
+            ("maximum_relative_rotation_rad", maximum_relative_rotation),
+            (
+                "maximum_rotation_envelope_inflation_m",
+                maximum_rotation_envelope_inflation,
+            ),
+        ):
+            actual = _contact_number(
+                summary.get(name),
+                f"contact integrity summary {name}",
+                nonnegative=True,
+            )
+            if not _contact_numbers_close(actual, expected):
+                raise HostedDroidError(
+                    f"contact integrity summary {name} is inconsistent"
+                )
+
+        computed_within_limits = trace_complete is True and not expected_violations
+        if trace.get("within_configured_limits") is not computed_within_limits:
+            raise HostedDroidError("contact integrity limit verdict is inconsistent")
+        if trace_complete is not True or errors or saturated_pairs or incomplete_pairs:
+            raise HostedDroidError("contact integrity telemetry is incomplete")
+        if unreported_swept_collisions > 0:
+            raise HostedDroidError(
+                "contact integrity reported an unreported swept collision"
+            )
+
         maximum_bilateral_gap = 0
         current_gap = 0
         for has_bilateral_contact in bilateral_contact_flags:
@@ -1010,19 +2254,19 @@ class _DroidTaskSuccessTracker:
                 current_gap += 1
                 maximum_bilateral_gap = max(maximum_bilateral_gap, current_gap)
 
-        computed_within_limits = (
-            maximum_penetration <= self.spec.maximum_contact_penetration_meters
-            and maximum_normal_impulse <= self.spec.maximum_contact_normal_impulse_ns
-        )
-        if trace.get("within_configured_limits") is not computed_within_limits:
-            raise HostedDroidError("contact integrity limit verdict is inconsistent")
-        if bool(violations) is computed_within_limits or not all(
-            isinstance(violation, Mapping) for violation in violations
-        ):
-            raise HostedDroidError("contact integrity violations are inconsistent")
-
         return {
             "contact_integrity_complete": True,
+            "continuous_collision_complete": True,
+            "unreported_swept_collisions": unreported_swept_collisions,
+            "maximum_relative_translation_meters": maximum_relative_translation,
+            "maximum_sensor_rotation_radians": maximum_sensor_rotation,
+            "maximum_filter_rotation_radians": maximum_filter_rotation,
+            "maximum_allowed_sensor_rotation_radians": (
+                _CONTINUOUS_COLLISION_MAX_ROTATION_RADIANS
+            ),
+            "maximum_allowed_filter_rotation_radians": (
+                _CONTINUOUS_COLLISION_MAX_ROTATION_RADIANS
+            ),
             "maximum_penetration_meters": maximum_penetration,
             "maximum_allowed_penetration_meters": (
                 self.spec.maximum_contact_penetration_meters
@@ -3972,6 +5216,14 @@ print({{"status": "success", "prim_path": {prim_path}}})
                         contact_integrity=cast(
                             Mapping[str, Any],
                             simulation_timing.get("contact_integrity"),
+                        ),
+                        expected_contact_updates=cast(
+                            int,
+                            simulation_timing["stepped"],
+                        ),
+                        expected_contact_physics_dt_seconds=cast(
+                            float,
+                            simulation_timing["before"]["physics_dt"],
                         ),
                     )
                     if evidence is not None:

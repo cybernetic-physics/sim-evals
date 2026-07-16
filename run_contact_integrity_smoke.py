@@ -17,6 +17,8 @@ _ROOT_PATH = "/World/ContactIntegritySmoke"
 _PAIR_LABEL = "smoke-pair"
 _MAXIMUM_PENETRATION_M = 0.001
 _MAXIMUM_NORMAL_IMPULSE_NS = 0.5
+_MAXIMUM_ROTATION_RADIANS_PER_UPDATE = math.radians(5.0)
+_MAXIMUM_SWEEP_HITS_PER_PAIR = 16
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -162,6 +164,18 @@ def _evaluate_saturation_fault(trace: Mapping[str, Any]) -> dict[str, bool]:
     }
 
 
+def _evaluate_tunneling_fault(trace: Mapping[str, Any]) -> dict[str, bool]:
+    return {
+        "complete": trace.get("complete") is True,
+        "swept_crossing_detected": _summary_number(trace, "unreported_swept_collisions")
+        > 0,
+        "limit_verdict_failed": trace.get("within_configured_limits") is False,
+        "swept_collision_violation_present": _violates(
+            trace, "unreported_swept_collision"
+        ),
+    }
+
+
 def _state_number(state: Mapping[str, Any], name: str) -> float:
     value = state.get(name)
     if (
@@ -222,17 +236,26 @@ def _fixture_script(*, scenario: str) -> str:
         filter_position = (8.5, 0.0, 1.0)
         sensor_velocity = (0.0, 0.0, 0.0)
         max_depenetration_velocity = 3.0
+        enable_ccd = True
     elif scenario in {"penetration", "saturation"}:
         base_x = 10.0 if scenario == "penetration" else 14.0
         sensor_position = (base_x, 0.0, 1.0)
         filter_position = (base_x + 0.08, 0.0, 1.0)
         sensor_velocity = (0.0, 0.0, 0.0)
         max_depenetration_velocity = 0.01
+        enable_ccd = True
     elif scenario == "impulse":
         sensor_position = (12.0, 0.0, 1.0)
         filter_position = (12.099, 0.0, 1.0)
         sensor_velocity = (5.0, 0.0, 0.0)
         max_depenetration_velocity = 0.01
+        enable_ccd = True
+    elif scenario == "tunneling":
+        sensor_position = (16.0, 0.0, 1.0)
+        filter_position = (16.2, 0.0, 1.0)
+        sensor_velocity = (120.0, 0.0, 0.0)
+        max_depenetration_velocity = 0.01
+        enable_ccd = False
     else:
         raise ValueError(f"unsupported fixture scenario: {scenario}")
 
@@ -263,7 +286,14 @@ if stage.GetPrimAtPath(scenario_root).IsValid():
     stage.RemovePrim(scenario_root)
 UsdGeom.Xform.Define(stage, scenario_root)
 
-def define_cube(path, position, velocity, kinematic, max_depenetration_velocity):
+def define_cube(
+    path,
+    position,
+    velocity,
+    kinematic,
+    max_depenetration_velocity,
+    enable_ccd,
+):
     cube = UsdGeom.Cube.Define(stage, path)
     cube.CreateSizeAttr(0.1)
     prim = cube.GetPrim()
@@ -279,7 +309,7 @@ def define_cube(path, position, velocity, kinematic, max_depenetration_velocity)
     PhysxSchema.PhysxContactReportAPI.Apply(prim).CreateThresholdAttr(0.0)
     physx_rigid = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
     physx_rigid.CreateDisableGravityAttr(True)
-    physx_rigid.CreateEnableCCDAttr(True)
+    physx_rigid.CreateEnableCCDAttr(enable_ccd)
     physx_rigid.CreateMaxDepenetrationVelocityAttr(max_depenetration_velocity)
 
 define_cube(
@@ -288,6 +318,7 @@ define_cube(
     (0.0, 0.0, 0.0),
     False,
     {max_depenetration_velocity!r},
+    {enable_ccd!r},
 )
 define_cube(
     {filter_path!r},
@@ -295,6 +326,7 @@ define_cube(
     (0.0, 0.0, 0.0),
     True,
     3.0,
+    True,
 )
 app.update()
 timeline.play()
@@ -345,7 +377,13 @@ print("CONTACT_INTEGRITY_FIXTURE_REMOVED")
 
 
 def _scenario_paths(scenario: str) -> tuple[str, str, str]:
-    if scenario not in {"clean", "penetration", "impulse", "saturation"}:
+    if scenario not in {
+        "clean",
+        "penetration",
+        "impulse",
+        "saturation",
+        "tunneling",
+    }:
         raise ValueError(f"unsupported fixture scenario: {scenario}")
     root = f"{_ROOT_PATH}/{scenario.capitalize()}"
     return root, f"{root}/Sensor", f"{root}/Filter"
@@ -365,6 +403,11 @@ def _trace_config(max_contacts_per_pair: int, *, scenario: str) -> dict[str, Any
         "limits": {
             "maximum_penetration_m": _MAXIMUM_PENETRATION_M,
             "maximum_normal_impulse_ns": _MAXIMUM_NORMAL_IMPULSE_NS,
+        },
+        "continuous_collision": {
+            "maximum_sensor_rotation_rad": _MAXIMUM_ROTATION_RADIANS_PER_UPDATE,
+            "maximum_filter_rotation_rad": _MAXIMUM_ROTATION_RADIANS_PER_UPDATE,
+            "max_hits_per_pair": _MAXIMUM_SWEEP_HITS_PER_PAIR,
         },
     }
 
@@ -439,12 +482,19 @@ def _run_matrix(mcp: Any) -> dict[str, Any]:
             num_steps=2,
             max_contacts_per_pair=1,
         ),
+        "tunneling": _run_scenario(
+            mcp,
+            scenario="tunneling",
+            num_steps=1,
+            max_contacts_per_pair=64,
+        ),
     }
     checks = {
         "clean": _evaluate_clean(scenarios["clean"]["trace"]),
         "penetration": _evaluate_penetration_fault(scenarios["penetration"]["trace"]),
         "impulse": _evaluate_impulse_fault(scenarios["impulse"]["trace"]),
         "saturation": _evaluate_saturation_fault(scenarios["saturation"]["trace"]),
+        "tunneling": _evaluate_tunneling_fault(scenarios["tunneling"]["trace"]),
     }
     for name, scenario in scenarios.items():
         checks[name].update(
@@ -472,6 +522,7 @@ def main() -> None:
             "environment_uri": args.environment_uri,
             "requested_session_id": args.session_id,
             "runtime_provider": args.runtime_provider,
+            "launch_timeout_seconds": args.launch_timeout_seconds,
             "keep_session": args.keep_session,
             "limits": _trace_config(64, scenario="clean")["limits"],
         },
@@ -495,11 +546,23 @@ def main() -> None:
             launch = client.launch(
                 args.environment_uri,
                 runtime_provider=args.runtime_provider,
-                wait=True,
-                timeout_seconds=args.launch_timeout_seconds,
+                wait=False,
             )
             session_id = launch.session_id
             launched = True
+            print(
+                json.dumps(
+                    {
+                        "event": "session_created",
+                        "session_id": session_id,
+                    }
+                ),
+                flush=True,
+            )
+            client.wait_for_session(
+                session_id,
+                timeout_seconds=args.launch_timeout_seconds,
+            )
         assert session_id is not None
         with client.mcp_session(
             session_id,

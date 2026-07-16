@@ -5,6 +5,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import tempfile
@@ -26,6 +27,7 @@ from sim_evals.hosted_droid import (
     _DROID_DYNAMICS_PROFILE,
     _DROID_DYNAMICS_STDOUT_PREFIX,
     _DROID_INITIAL_ARM_JOINT_POSITIONS,
+    _DroidTaskSuccessTracker,
     _parse_task_state,
     _contact_integrity_request,
     _validate_policy_response,
@@ -41,6 +43,29 @@ from sim_evals.hosted_droid import (
 )
 from sim_evals.inference.droid_observation import DroidObservation
 from run_hosted_eval import _resolve_open_loop_horizon, _timestamped_results_dir
+
+
+def _rotate_vector_wxyz(
+    orientation: list[float],
+    vector: list[float],
+) -> list[float]:
+    w, x, y, z = orientation
+    vx, vy, vz = vector
+    twice_cross = [
+        2.0 * (y * vz - z * vy),
+        2.0 * (z * vx - x * vz),
+        2.0 * (x * vy - y * vx),
+    ]
+    cross_again = [
+        y * twice_cross[2] - z * twice_cross[1],
+        z * twice_cross[0] - x * twice_cross[2],
+        x * twice_cross[1] - y * twice_cross[0],
+    ]
+    return [
+        vx + w * twice_cross[0] + cross_again[0],
+        vy + w * twice_cross[1] + cross_again[1],
+        vz + w * twice_cross[2] + cross_again[2],
+    ]
 
 
 def _png_base64(
@@ -142,20 +167,305 @@ def _contact_integrity_payload(
     contact_labels: set[str] | None = None,
     complete: bool = True,
     physics_dt_seconds: float = 1.0 / 240.0,
+    tunneling_at: tuple[int, str] | None = None,
+    missing_continuous_at: tuple[int, str] | None = None,
+    saturated_sweep_at: tuple[int, str] | None = None,
+    rotation_limit_at: tuple[int, str] | None = None,
 ) -> dict[str, Any]:
     pairs = request["pairs"]
+    continuous_config = dict(request["continuous_collision"])
     active_labels = (
         {str(pair["label"]) for pair in pairs}
         if contact_labels is None
         else contact_labels
     )
+    all_paths = sorted(
+        {
+            str(pair[path_name])
+            for pair in pairs
+            for path_name in ("sensor_path", "filter_path")
+        }
+    )
+    path_index = {path: index for index, path in enumerate(all_paths)}
+
+    def pose(
+        path: str,
+        endpoint_index: int,
+        *,
+        rotation_radians: float = 0.0,
+    ) -> dict[str, list[float]]:
+        index = path_index[path]
+        orientation_radians = (
+            (index + 1) * 0.1 + endpoint_index * (index + 1) * 0.005 + rotation_radians
+        )
+        position = [
+            index * 0.25 + endpoint_index * (index + 1) * 0.0001,
+            index * 0.01,
+            0.5,
+        ]
+        orientation = [
+            math.cos(orientation_radians / 2.0),
+            0.0,
+            0.0,
+            math.sin(orientation_radians / 2.0),
+        ]
+        return {
+            "position_m": position,
+            "orientation_wxyz": orientation,
+        }
+
+    def quaternion_delta(
+        start: list[float],
+        end: list[float],
+    ) -> float:
+        dot = abs(sum(left * right for left, right in zip(start, end, strict=True)))
+        return 2.0 * math.acos(min(1.0, max(0.0, dot)))
+
+    def quaternion_multiply(
+        left: list[float],
+        right: list[float],
+    ) -> list[float]:
+        left_w, left_x, left_y, left_z = left
+        right_w, right_x, right_y, right_z = right
+        return [
+            left_w * right_w - left_x * right_x - left_y * right_y - left_z * right_z,
+            left_w * right_x + left_x * right_w + left_y * right_z - left_z * right_y,
+            left_w * right_y - left_x * right_z + left_y * right_w + left_z * right_x,
+            left_w * right_z + left_x * right_y - left_y * right_x + left_z * right_w,
+        ]
+
+    def quaternion_conjugate(value: list[float]) -> list[float]:
+        w, x, y, z = value
+        return [w, -x, -y, -z]
+
+    def relative_orientation(
+        sensor_orientation: list[float],
+        filter_orientation: list[float],
+    ) -> list[float]:
+        return quaternion_multiply(
+            quaternion_conjugate(filter_orientation),
+            sensor_orientation,
+        )
+
+    def vector_in_frame(
+        vector_world: list[float],
+        frame_orientation: list[float],
+    ) -> list[float]:
+        rotated = quaternion_multiply(
+            quaternion_multiply(
+                quaternion_conjugate(frame_orientation),
+                [0.0, *vector_world],
+            ),
+            frame_orientation,
+        )
+        return rotated[1:]
+
+    def continuous_evidence(
+        pair: Mapping[str, Any],
+        update_index: int,
+        *,
+        manifold_contact: bool,
+        mode: str | None,
+    ) -> dict[str, Any]:
+        sensor_path = str(pair["sensor_path"])
+        filter_path = str(pair["filter_path"])
+        sensor_rotation = (
+            float(continuous_config["maximum_sensor_rotation_rad"]) * 2.0
+            if mode == "rotation_limit"
+            else 0.0
+        )
+        previous_sensor = pose(sensor_path, update_index)
+        current_sensor = pose(
+            sensor_path,
+            update_index + 1,
+            rotation_radians=sensor_rotation,
+        )
+        previous_filter = pose(filter_path, update_index)
+        current_filter = pose(filter_path, update_index + 1)
+        previous_sensor_from_filter = [
+            previous_sensor["position_m"][axis] - previous_filter["position_m"][axis]
+            for axis in range(3)
+        ]
+        previous_sensor_in_filter = vector_in_frame(
+            previous_sensor_from_filter,
+            previous_filter["orientation_wxyz"],
+        )
+        current_sensor_from_filter = [
+            current_sensor["position_m"][axis] - current_filter["position_m"][axis]
+            for axis in range(3)
+        ]
+        current_sensor_in_filter = vector_in_frame(
+            current_sensor_from_filter,
+            current_filter["orientation_wxyz"],
+        )
+        translation = [
+            current_sensor_in_filter[axis] - previous_sensor_in_filter[axis]
+            for axis in range(3)
+        ]
+        distance = math.sqrt(sum(component * component for component in translation))
+        direction = (
+            [component / distance for component in translation]
+            if distance > 0
+            else [0.0, 0.0, 0.0]
+        )
+        previous_endpoint_contact = manifold_contact
+        current_overlap = manifold_contact
+        current_endpoint_contact = manifold_contact
+        hits: list[dict[str, Any]] = []
+        if mode == "tunneling":
+            previous_endpoint_contact = False
+            current_overlap = False
+            current_endpoint_contact = False
+            hits.append(
+                {
+                    "rigid_body_path": filter_path,
+                    "collider_path": f"{filter_path}/collision",
+                    "distance_m": distance / 2.0,
+                }
+            )
+        sensor_delta = quaternion_delta(
+            previous_sensor["orientation_wxyz"],
+            current_sensor["orientation_wxyz"],
+        )
+        filter_delta = quaternion_delta(
+            previous_filter["orientation_wxyz"],
+            current_filter["orientation_wxyz"],
+        )
+        relative_delta = quaternion_delta(
+            relative_orientation(
+                previous_sensor["orientation_wxyz"],
+                previous_filter["orientation_wxyz"],
+            ),
+            relative_orientation(
+                current_sensor["orientation_wxyz"],
+                current_filter["orientation_wxyz"],
+            ),
+        )
+        base_half_extents = [0.05, 0.04, 0.03]
+        radius = math.sqrt(
+            sum(component * component for component in base_half_extents)
+        )
+        inflation = 2.0 * radius * math.sin(relative_delta / 2.0)
+        query_half_extents = [component + inflation for component in base_half_extents]
+        incomplete_reason = {
+            "saturated": "sweep_hits_saturated",
+            "rotation_limit": "sensor_rotation_limit_exceeded",
+        }.get(mode)
+        tunneling = mode == "tunneling"
+        evidence_complete = incomplete_reason is None
+        return {
+            "schema_version": 2,
+            "classification": (
+                "paired_tunneling"
+                if tunneling
+                else "clear"
+                if evidence_complete
+                else "indeterminate"
+            ),
+            "passed": evidence_complete and not tunneling,
+            "complete": evidence_complete,
+            "swept_collision_risk_detected": tunneling,
+            "tunneling_detected": tunneling,
+            "failure_reasons": (
+                ["paired_body_sweep_hit_without_endpoint_contact"]
+                if tunneling
+                else [incomplete_reason]
+                if incomplete_reason is not None
+                else []
+            ),
+            "errors": [],
+            "sensor_path": sensor_path,
+            "filter_path": filter_path,
+            "previous_endpoint_contact": previous_endpoint_contact,
+            "current_endpoint_contact": current_endpoint_contact,
+            "poses": {
+                "previous_sensor": previous_sensor,
+                "current_sensor": current_sensor,
+                "previous_filter": previous_filter,
+                "current_filter": current_filter,
+            },
+            "rotation_delta_radians": {
+                "sensor": sensor_delta,
+                "filter": filter_delta,
+                "relative": relative_delta,
+                "maximum": max(sensor_delta, filter_delta, relative_delta),
+            },
+            "maximum_rotation_radians": {
+                "sensor": continuous_config["maximum_sensor_rotation_rad"],
+                "filter": continuous_config["maximum_filter_rotation_rad"],
+            },
+            "relative_motion": {
+                "translation_m": translation,
+                "direction_unit": direction,
+                "distance_m": distance,
+            },
+            "rotation_envelope": {
+                "method": "body_centered_symmetric_obb_with_chord_inflation",
+                "base_half_extents_m": base_half_extents,
+                "radius_m": radius,
+                "relative_rotation_rad": relative_delta,
+                "inflation_m": inflation,
+                "query_half_extents_m": query_half_extents,
+                "query_kind": "sweep_box_all" if distance > 1e-12 else "overlap_box",
+            },
+            "sweep": {
+                "available": True,
+                "max_hits": continuous_config["max_hits_per_pair"],
+                "captured_hit_count": len(hits),
+                "saturated": mode == "saturated",
+                "hits": hits,
+            },
+            "translation_shape_sweep": {
+                "available": True,
+                "max_hits": continuous_config["max_hits_per_pair"],
+                "captured_hit_count": len(hits),
+                "saturated": False,
+                "hits": [dict(hit) for hit in hits],
+            },
+            "translation_shape_sweep_semantics": (
+                "current_sensor_collision_shapes_backward_through_relative_translation"
+            ),
+            "paired_hit_count": len(hits),
+            "sensor_collider_paths": [f"{sensor_path}/collision"],
+            "endpoint_evidence": {
+                "previous_contact_or_overlap": previous_endpoint_contact,
+                "current_overlap": current_overlap,
+                "current_manifold_contact": manifold_contact,
+                "current_contact_or_overlap": current_endpoint_contact,
+            },
+            "sweep_semantics": (
+                "rotation_safe_sensor_body_obb_backward_in_current_filter_frame"
+            ),
+            "diagnostic_errors": [],
+        }
+
     samples = []
+    violations = []
+    incomplete_labels: set[str] = set()
+    maximum_penetration = 0.0
+    maximum_normal_impulse = 0.0
+    maximum_relative_translation = 0.0
+    maximum_sensor_rotation = 0.0
+    maximum_filter_rotation = 0.0
+    maximum_relative_rotation = 0.0
+    maximum_rotation_envelope_inflation = 0.0
+    updates_with_contact = 0
+    unreported_swept_collisions = 0
     for update_index in range(steps):
         pair_records = []
+        update_has_contact = False
         for pair in pairs:
             label = str(pair["label"])
             contacts = []
-            if label in active_labels:
+            mode = None
+            if tunneling_at == (update_index, label):
+                mode = "tunneling"
+            elif saturated_sweep_at == (update_index, label):
+                mode = "saturated"
+            elif rotation_limit_at == (update_index, label):
+                mode = "rotation_limit"
+            has_contact = label in active_labels and mode != "tunneling"
+            if has_contact:
                 normal = {
                     "left-finger-cube": [1.0, 0.0, 0.0],
                     "right-finger-cube": [-1.0, 0.0, 0.0],
@@ -170,22 +480,90 @@ def _contact_integrity_payload(
                         "normal_force_n": normal_impulse_ns / physics_dt_seconds,
                     }
                 )
-            pair_records.append(
-                {
-                    "label": label,
-                    "sensor_path": pair["sensor_path"],
-                    "filter_path": pair["filter_path"],
-                    "complete": True,
-                    "buffer_saturated": False,
-                    "contact_count": len(contacts),
-                    "contacts": contacts,
-                    "friction_contacts": [],
-                    "maximum_penetration_m": penetration_meters,
-                    "maximum_normal_impulse_ns": (
-                        normal_impulse_ns if contacts else 0.0
-                    ),
-                }
-            )
+            update_has_contact = update_has_contact or bool(contacts)
+            pair_penetration = penetration_meters if contacts else 0.0
+            pair_impulse = normal_impulse_ns if contacts else 0.0
+            record = {
+                "label": label,
+                "sensor_path": pair["sensor_path"],
+                "filter_path": pair["filter_path"],
+                "complete": mode not in {"saturated", "rotation_limit"}
+                and missing_continuous_at != (update_index, label),
+                "buffer_saturated": False,
+                "contact_count": len(contacts),
+                "contacts": contacts,
+                "friction_contacts": [],
+                "maximum_penetration_m": pair_penetration,
+                "maximum_normal_impulse_ns": pair_impulse,
+                "total_normal_impulse_ns": pair_impulse,
+            }
+            if missing_continuous_at != (update_index, label):
+                continuous = continuous_evidence(
+                    pair,
+                    update_index,
+                    manifold_contact=bool(contacts),
+                    mode=mode,
+                )
+                record["continuous_collision"] = continuous
+                maximum_relative_translation = max(
+                    maximum_relative_translation,
+                    float(continuous["relative_motion"]["distance_m"]),
+                )
+                maximum_sensor_rotation = max(
+                    maximum_sensor_rotation,
+                    float(continuous["rotation_delta_radians"]["sensor"]),
+                )
+                maximum_filter_rotation = max(
+                    maximum_filter_rotation,
+                    float(continuous["rotation_delta_radians"]["filter"]),
+                )
+                maximum_relative_rotation = max(
+                    maximum_relative_rotation,
+                    float(continuous["rotation_delta_radians"]["relative"]),
+                )
+                maximum_rotation_envelope_inflation = max(
+                    maximum_rotation_envelope_inflation,
+                    float(continuous["rotation_envelope"]["inflation_m"]),
+                )
+                if continuous["swept_collision_risk_detected"]:
+                    unreported_swept_collisions += 1
+                    violations.append(
+                        {
+                            "update_index": update_index,
+                            "pair_label": label,
+                            "metric": "unreported_swept_collision",
+                            "observed": continuous["paired_hit_count"],
+                            "limit": 0,
+                        }
+                    )
+                if not continuous["complete"]:
+                    incomplete_labels.add(label)
+            else:
+                incomplete_labels.add(label)
+            pair_records.append(record)
+            maximum_penetration = max(maximum_penetration, pair_penetration)
+            maximum_normal_impulse = max(maximum_normal_impulse, pair_impulse)
+            if pair_penetration > request["limits"]["maximum_penetration_m"]:
+                violations.append(
+                    {
+                        "update_index": update_index,
+                        "pair_label": label,
+                        "metric": "maximum_penetration_m",
+                        "observed": pair_penetration,
+                        "limit": request["limits"]["maximum_penetration_m"],
+                    }
+                )
+            if pair_impulse > request["limits"]["maximum_normal_impulse_ns"]:
+                violations.append(
+                    {
+                        "update_index": update_index,
+                        "pair_label": label,
+                        "metric": "maximum_normal_impulse_ns",
+                        "observed": pair_impulse,
+                        "limit": request["limits"]["maximum_normal_impulse_ns"],
+                    }
+                )
+        updates_with_contact += int(update_has_contact)
         samples.append(
             {
                 "update_index": update_index,
@@ -193,31 +571,63 @@ def _contact_integrity_payload(
                 "pairs": pair_records,
             }
         )
-    limits = dict(request["limits"])
-    violations = []
-    if penetration_meters > limits["maximum_penetration_m"]:
-        violations.append({"metric": "maximum_penetration_m"})
-    if normal_impulse_ns > limits["maximum_normal_impulse_ns"]:
-        violations.append({"metric": "maximum_normal_impulse_ns"})
+    trace_complete = complete and not incomplete_labels
+    errors = [] if complete else ["injected incomplete trace"]
+    errors.extend(
+        f"{label}: continuous collision evidence incomplete"
+        for label in sorted(incomplete_labels)
+    )
     return {
-        "schema_version": 1,
-        "capture_source": "test",
-        "sampling_semantics": "after_each_requested_kit_update",
+        "schema_version": 2,
+        "capture_source": "RigidPrim_contact_tensors_and_PhysX_scene_queries",
+        "sampling_semantics": (
+            "initial_endpoint_overlap_then_pose_contact_rotation_safe_obb_and_"
+            "exact_shape_sweep_after_each_update"
+        ),
         "physics_dt_seconds": physics_dt_seconds,
         "requested_updates": steps,
         "captured_updates": steps,
-        "complete": complete,
-        "errors": [] if complete else ["injected incomplete trace"],
+        "complete": trace_complete,
+        "errors": errors,
         "saturated_pairs": [],
-        "limits": limits,
-        "within_configured_limits": complete and not violations,
+        "continuous_collision_incomplete_pairs": sorted(incomplete_labels),
+        "limits": {
+            **request["limits"],
+            "maximum_sensor_rotation_rad_per_update": (
+                continuous_config["maximum_sensor_rotation_rad"]
+            ),
+            "maximum_filter_rotation_rad_per_update": (
+                continuous_config["maximum_filter_rotation_rad"]
+            ),
+            "unreported_swept_collisions": 0,
+        },
+        "continuous_collision": continuous_config,
+        "within_configured_limits": trace_complete and not violations,
         "violations": violations,
         "summary": {
-            "maximum_penetration_m": penetration_meters,
-            "maximum_normal_impulse_ns": normal_impulse_ns,
+            "updates_with_contact": updates_with_contact,
+            "maximum_penetration_m": maximum_penetration,
+            "maximum_normal_impulse_ns": maximum_normal_impulse,
+            "unreported_swept_collisions": unreported_swept_collisions,
+            "maximum_relative_translation_m": maximum_relative_translation,
+            "maximum_sensor_rotation_rad": maximum_sensor_rotation,
+            "maximum_filter_rotation_rad": maximum_filter_rotation,
+            "maximum_relative_rotation_rad": maximum_relative_rotation,
+            "maximum_rotation_envelope_inflation_m": (
+                maximum_rotation_envelope_inflation
+            ),
         },
         "samples": samples,
     }
+
+
+def _contact_tracker() -> tuple[Any, _DroidTaskSuccessTracker]:
+    spec = scene1_cube_in_bowl_success_spec()
+    initial_state = _parse_task_state(
+        _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+        spec,
+    )
+    return spec, _DroidTaskSuccessTracker(spec, initial_state)
 
 
 class FakeMCP:
@@ -1310,6 +1720,584 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertEqual(spec.receptacle_prim_path, "/World/_24_bowl")
         self.assertEqual(_resolve_open_loop_horizon(None), 8)
         self.assertEqual(_resolve_open_loop_horizon(3), 3)
+
+    def test_contact_integrity_request_requires_bounded_continuous_collision(
+        self,
+    ) -> None:
+        request = _contact_integrity_request(scene1_cube_in_bowl_success_spec())
+        maximum_rotation = math.radians(5.0)
+
+        self.assertEqual(request["max_contacts_per_pair"], 64)
+        self.assertEqual(
+            request["continuous_collision"],
+            {
+                "maximum_sensor_rotation_rad": maximum_rotation,
+                "maximum_filter_rotation_rad": maximum_rotation,
+                "max_hits_per_pair": 16,
+            },
+        )
+        self.assertEqual(
+            {pair["label"] for pair in request["pairs"]},
+            {
+                "left-finger-cube",
+                "right-finger-cube",
+                "cube-receptacle",
+            },
+        )
+
+    def test_contact_integrity_accepts_complete_clear_schema_v2(self) -> None:
+        spec, tracker = _contact_tracker()
+        request = _contact_integrity_request(spec)
+        physics_dt = 1.0 / 240.0
+        trace = _contact_integrity_payload(
+            request,
+            steps=2,
+            contact_labels=set(),
+            physics_dt_seconds=physics_dt,
+        )
+
+        evidence = tracker._contact_evidence(
+            trace,
+            expected_updates=2,
+            expected_physics_dt_seconds=physics_dt,
+        )
+
+        self.assertTrue(evidence["contact_integrity_complete"])
+        self.assertTrue(evidence["continuous_collision_complete"])
+        self.assertEqual(evidence["unreported_swept_collisions"], 0)
+        self.assertLessEqual(
+            evidence["maximum_sensor_rotation_radians"],
+            math.radians(5.0),
+        )
+        self.assertLessEqual(
+            evidence["maximum_filter_rotation_radians"],
+            math.radians(5.0),
+        )
+
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        self.assertEqual(continuous["schema_version"], 2)
+        self.assertIs(
+            continuous["swept_collision_risk_detected"],
+            continuous["tunneling_detected"],
+        )
+        self.assertEqual(
+            set(continuous["rotation_delta_radians"]),
+            {"sensor", "filter", "relative", "maximum"},
+        )
+        self.assertGreater(continuous["rotation_delta_radians"]["relative"], 0.0)
+        self.assertEqual(
+            continuous["sweep_semantics"],
+            "rotation_safe_sensor_body_obb_backward_in_current_filter_frame",
+        )
+        self.assertEqual(
+            set(continuous["rotation_envelope"]),
+            {
+                "method",
+                "base_half_extents_m",
+                "radius_m",
+                "relative_rotation_rad",
+                "inflation_m",
+                "query_half_extents_m",
+                "query_kind",
+            },
+        )
+        envelope = continuous["rotation_envelope"]
+        base_half_extents = envelope["base_half_extents_m"]
+        expected_radius = math.sqrt(
+            sum(component * component for component in base_half_extents)
+        )
+        expected_inflation = (
+            2.0
+            * expected_radius
+            * math.sin(continuous["rotation_delta_radians"]["relative"] / 2.0)
+        )
+        self.assertAlmostEqual(envelope["radius_m"], expected_radius)
+        self.assertAlmostEqual(envelope["inflation_m"], expected_inflation)
+        self.assertEqual(envelope["query_kind"], "sweep_box_all")
+        self.assertEqual(
+            envelope["query_half_extents_m"],
+            [component + expected_inflation for component in base_half_extents],
+        )
+        self.assertIsNot(
+            continuous["sweep"],
+            continuous["translation_shape_sweep"],
+        )
+
+        poses = continuous["poses"]
+        relative_translation_world = [
+            (
+                poses["current_sensor"]["position_m"][axis]
+                - poses["previous_sensor"]["position_m"][axis]
+            )
+            - (
+                poses["current_filter"]["position_m"][axis]
+                - poses["previous_filter"]["position_m"][axis]
+            )
+            for axis in range(3)
+        ]
+        self.assertNotEqual(
+            continuous["relative_motion"]["translation_m"],
+            relative_translation_world,
+        )
+
+    def test_contact_integrity_accepts_overlap_envelope_for_zero_translation(
+        self,
+    ) -> None:
+        spec, tracker = _contact_tracker()
+        request = _contact_integrity_request(spec)
+        physics_dt = 1.0 / 240.0
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            contact_labels=set(),
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        poses = continuous["poses"]
+        previous_offset_world = [
+            poses["previous_sensor"]["position_m"][axis]
+            - poses["previous_filter"]["position_m"][axis]
+            for axis in range(3)
+        ]
+        previous_filter = poses["previous_filter"]["orientation_wxyz"]
+        previous_offset_filter = _rotate_vector_wxyz(
+            [previous_filter[0], *(-value for value in previous_filter[1:])],
+            previous_offset_world,
+        )
+        current_offset_world = _rotate_vector_wxyz(
+            poses["current_filter"]["orientation_wxyz"],
+            previous_offset_filter,
+        )
+        poses["current_sensor"]["position_m"] = [
+            poses["current_filter"]["position_m"][axis] + current_offset_world[axis]
+            for axis in range(3)
+        ]
+        continuous["relative_motion"] = {
+            "translation_m": [0.0, 0.0, 0.0],
+            "direction_unit": [0.0, 0.0, 0.0],
+            "distance_m": 0.0,
+        }
+        continuous["rotation_envelope"]["query_kind"] = "overlap_box"
+        trace["summary"]["maximum_relative_translation_m"] = max(
+            float(pair["continuous_collision"]["relative_motion"]["distance_m"])
+            for sample in trace["samples"]
+            for pair in sample["pairs"]
+        )
+
+        evidence = tracker._contact_evidence(
+            trace,
+            expected_updates=1,
+            expected_physics_dt_seconds=physics_dt,
+        )
+
+        self.assertTrue(evidence["continuous_collision_complete"])
+
+    def test_contact_integrity_rejects_tunneling_violation(self) -> None:
+        spec, tracker = _contact_tracker()
+        request = _contact_integrity_request(spec)
+        physics_dt = 1.0 / 240.0
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            contact_labels=set(),
+            physics_dt_seconds=physics_dt,
+            tunneling_at=(0, "left-finger-cube"),
+        )
+
+        self.assertEqual(trace["summary"]["unreported_swept_collisions"], 1)
+        self.assertEqual(
+            trace["violations"],
+            [
+                {
+                    "update_index": 0,
+                    "pair_label": "left-finger-cube",
+                    "metric": "unreported_swept_collision",
+                    "observed": 1,
+                    "limit": 0,
+                }
+            ],
+        )
+        with self.assertRaisesRegex(
+            HostedDroidError,
+            "unreported swept collision",
+        ):
+            tracker._contact_evidence(
+                trace,
+                expected_updates=1,
+                expected_physics_dt_seconds=physics_dt,
+            )
+
+    def test_contact_integrity_fails_closed_on_missing_continuous_evidence(
+        self,
+    ) -> None:
+        spec, tracker = _contact_tracker()
+        request = _contact_integrity_request(spec)
+        physics_dt = 1.0 / 240.0
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+            missing_continuous_at=(0, "right-finger-cube"),
+        )
+
+        with self.assertRaisesRegex(
+            HostedDroidError,
+            "continuous collision evidence",
+        ):
+            tracker._contact_evidence(
+                trace,
+                expected_updates=1,
+                expected_physics_dt_seconds=physics_dt,
+            )
+
+    def test_contact_integrity_fails_closed_on_saturated_sweep(self) -> None:
+        spec, tracker = _contact_tracker()
+        request = _contact_integrity_request(spec)
+        physics_dt = 1.0 / 240.0
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+            saturated_sweep_at=(0, "left-finger-cube"),
+        )
+
+        with self.assertRaisesRegex(
+            HostedDroidError,
+            "sweep evidence is saturated",
+        ):
+            tracker._contact_evidence(
+                trace,
+                expected_updates=1,
+                expected_physics_dt_seconds=physics_dt,
+            )
+
+    def test_contact_integrity_fails_closed_above_rotation_limit(self) -> None:
+        spec, tracker = _contact_tracker()
+        request = _contact_integrity_request(spec)
+        physics_dt = 1.0 / 240.0
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+            rotation_limit_at=(0, "left-finger-cube"),
+        )
+
+        with self.assertRaisesRegex(
+            HostedDroidError,
+            "rotation limit was exceeded",
+        ):
+            tracker._contact_evidence(
+                trace,
+                expected_updates=1,
+                expected_physics_dt_seconds=physics_dt,
+            )
+
+    def test_contact_integrity_rejects_malformed_v2_payloads(self) -> None:
+        spec, tracker = _contact_tracker()
+        request = _contact_integrity_request(spec)
+        physics_dt = 1.0 / 240.0
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        trace["schema_version"] = 1
+        with self.subTest("legacy schema"):
+            with self.assertRaisesRegex(HostedDroidError, "schema is unsupported"):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        continuous["tunneling_detected"] = not continuous[
+            "swept_collision_risk_detected"
+        ]
+        with self.subTest("risk compatibility alias mismatch"):
+            with self.assertRaisesRegex(
+                HostedDroidError,
+                "swept collision risk verdict is inconsistent",
+            ):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        continuous["schema_version"] = 1
+        with self.subTest("legacy nested schema"):
+            with self.assertRaisesRegex(HostedDroidError, "schema is unsupported"):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        continuous["unexpected"] = True
+        with self.subTest("unknown nested field"):
+            with self.assertRaisesRegex(
+                HostedDroidError,
+                "evidence fields are invalid",
+            ):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        continuous["poses"]["current_sensor"]["orientation_wxyz"] = [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+        with self.subTest("invalid pose"):
+            with self.assertRaisesRegex(HostedDroidError, "unit quaternion"):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        del continuous["rotation_delta_radians"]["relative"]
+        with self.subTest("missing relative rotation"):
+            with self.assertRaisesRegex(
+                HostedDroidError,
+                "rotation delta is incomplete",
+            ):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        continuous["relative_motion"]["distance_m"] += 1.0
+        with self.subTest("relative motion mismatch"):
+            with self.assertRaisesRegex(HostedDroidError, "relative motion"):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        poses = continuous["poses"]
+        relative_translation_world = [
+            (
+                poses["current_sensor"]["position_m"][axis]
+                - poses["previous_sensor"]["position_m"][axis]
+            )
+            - (
+                poses["current_filter"]["position_m"][axis]
+                - poses["previous_filter"]["position_m"][axis]
+            )
+            for axis in range(3)
+        ]
+        world_distance = math.sqrt(
+            sum(component * component for component in relative_translation_world)
+        )
+        continuous["relative_motion"] = {
+            "translation_m": relative_translation_world,
+            "direction_unit": [
+                component / world_distance for component in relative_translation_world
+            ],
+            "distance_m": world_distance,
+        }
+        with self.subTest("world-frame relative motion"):
+            with self.assertRaisesRegex(HostedDroidError, "relative motion"):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        continuous["sweep"]["captured_hit_count"] = 1
+        with self.subTest("sweep count mismatch"):
+            with self.assertRaisesRegex(
+                HostedDroidError,
+                "safety sweep evidence hit count",
+            ):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        continuous["translation_shape_sweep"]["captured_hit_count"] = 1
+        with self.subTest("translation diagnostic count mismatch"):
+            with self.assertRaisesRegex(
+                HostedDroidError,
+                "translation shape sweep diagnostic hit count",
+            ):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        continuous["translation_shape_sweep"]["saturated"] = True
+        with self.subTest("translation diagnostic saturation"):
+            with self.assertRaisesRegex(
+                HostedDroidError,
+                "translation shape sweep diagnostic is saturated",
+            ):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            physics_dt_seconds=physics_dt,
+        )
+        trace["summary"]["unreported_swept_collisions"] = 1
+        with self.subTest("summary disagreement"):
+            with self.assertRaisesRegex(HostedDroidError, "swept collision summary"):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+    def test_contact_integrity_rejects_malformed_rotation_envelope(self) -> None:
+        spec, tracker = _contact_tracker()
+        request = _contact_integrity_request(spec)
+        physics_dt = 1.0 / 240.0
+
+        def reject(
+            mutation: Any,
+            message: str,
+        ) -> None:
+            trace = _contact_integrity_payload(
+                request,
+                steps=1,
+                physics_dt_seconds=physics_dt,
+            )
+            envelope = trace["samples"][0]["pairs"][0]["continuous_collision"][
+                "rotation_envelope"
+            ]
+            mutation(envelope)
+            with self.assertRaisesRegex(HostedDroidError, message):
+                tracker._contact_evidence(
+                    trace,
+                    expected_updates=1,
+                    expected_physics_dt_seconds=physics_dt,
+                )
+
+        with self.subTest("unknown field"):
+            reject(
+                lambda envelope: envelope.__setitem__("unexpected", True),
+                "rotation envelope fields are invalid",
+            )
+        with self.subTest("method"):
+            reject(
+                lambda envelope: envelope.__setitem__("method", "translation_only"),
+                "rotation envelope method is invalid",
+            )
+        with self.subTest("positive base extents"):
+            reject(
+                lambda envelope: envelope["base_half_extents_m"].__setitem__(0, 0.0),
+                "base half extents must be positive",
+            )
+        with self.subTest("radius"):
+            reject(
+                lambda envelope: envelope.__setitem__(
+                    "radius_m",
+                    envelope["radius_m"] + 0.01,
+                ),
+                "rotation envelope is inconsistent",
+            )
+        with self.subTest("relative rotation"):
+            reject(
+                lambda envelope: envelope.__setitem__(
+                    "relative_rotation_rad",
+                    envelope["relative_rotation_rad"] + 0.01,
+                ),
+                "rotation envelope is inconsistent",
+            )
+        with self.subTest("inflation"):
+            reject(
+                lambda envelope: envelope.__setitem__(
+                    "inflation_m",
+                    envelope["inflation_m"] + 0.01,
+                ),
+                "rotation envelope is inconsistent",
+            )
+        with self.subTest("query extents"):
+            reject(
+                lambda envelope: envelope["query_half_extents_m"].__setitem__(
+                    1,
+                    envelope["query_half_extents_m"][1] + 0.01,
+                ),
+                "rotation envelope is inconsistent",
+            )
+        with self.subTest("query kind"):
+            reject(
+                lambda envelope: envelope.__setitem__("query_kind", "overlap_box"),
+                "rotation envelope is inconsistent",
+            )
 
     def test_writes_config_result_and_first_rgb_triplet(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
