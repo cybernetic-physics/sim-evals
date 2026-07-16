@@ -30,6 +30,7 @@ from sim_evals.hosted_droid import (
     _DROID_INITIAL_ARM_JOINT_POSITIONS,
     _DroidTaskSuccessTracker,
     _contact_poses_match,
+    _quaternion_delta_radians,
     _parse_task_state,
     _contact_integrity_request,
     _validate_policy_response,
@@ -220,8 +221,21 @@ def _contact_integrity_payload(
         start: list[float],
         end: list[float],
     ) -> float:
-        dot = abs(sum(left * right for left, right in zip(start, end, strict=True)))
-        return 2.0 * math.acos(min(1.0, max(0.0, dot)))
+        signed_dot = sum(left * right for left, right in zip(start, end, strict=True))
+        aligned_end = [-value for value in end] if signed_dot < 0.0 else end
+        difference_norm = math.sqrt(
+            sum(
+                (left - right) ** 2
+                for left, right in zip(start, aligned_end, strict=True)
+            )
+        )
+        sum_norm = math.sqrt(
+            sum(
+                (left + right) ** 2
+                for left, right in zip(start, aligned_end, strict=True)
+            )
+        )
+        return 4.0 * math.atan2(difference_norm, sum_norm)
 
     def quaternion_multiply(
         left: list[float],
@@ -1765,6 +1779,20 @@ class HostedDroidRunnerTest(unittest.TestCase):
 
         self.assertTrue(_contact_poses_match(pose, pose))
         self.assertTrue(_contact_poses_match(pose, negated))
+        tiny_rotation = 1.0e-9
+        self.assertAlmostEqual(
+            _quaternion_delta_radians(
+                (1.0, 0.0, 0.0, 0.0),
+                (
+                    math.cos(tiny_rotation / 2.0),
+                    math.sin(tiny_rotation / 2.0),
+                    0.0,
+                    0.0,
+                ),
+            ),
+            tiny_rotation,
+            delta=1.0e-15,
+        )
         self.assertFalse(
             _contact_poses_match(
                 pose,

@@ -676,10 +676,25 @@ def _quaternion_delta_radians(
     start_wxyz: tuple[float, float, float, float],
     end_wxyz: tuple[float, float, float, float],
 ) -> float:
-    absolute_dot = abs(
-        sum(start * end for start, end in zip(start_wxyz, end_wxyz, strict=True))
+    signed_dot = sum(
+        start * end for start, end in zip(start_wxyz, end_wxyz, strict=True)
     )
-    return 2.0 * math.acos(min(1.0, max(0.0, absolute_dot)))
+    aligned_end = (
+        tuple(-component for component in end_wxyz) if signed_dot < 0.0 else end_wxyz
+    )
+    difference_norm = math.sqrt(
+        sum(
+            (start - end) ** 2
+            for start, end in zip(start_wxyz, aligned_end, strict=True)
+        )
+    )
+    sum_norm = math.sqrt(
+        sum(
+            (start + end) ** 2
+            for start, end in zip(start_wxyz, aligned_end, strict=True)
+        )
+    )
+    return 4.0 * math.atan2(difference_norm, sum_norm)
 
 
 def _quaternion_multiply(
@@ -1080,19 +1095,26 @@ def _validate_continuous_collision_evidence(
         "continuous collision maximum rotation",
         nonnegative=True,
     )
-    if (
-        not _contact_numbers_close(reported_sensor_rotation, sensor_rotation)
-        or not _contact_numbers_close(reported_filter_rotation, filter_rotation)
-        or not _contact_numbers_close(
-            reported_relative_rotation,
-            relative_rotation,
+    computed_maximum_rotation = max(
+        sensor_rotation,
+        filter_rotation,
+        relative_rotation,
+    )
+    rotation_mismatches = [
+        f"{name} computed={computed:.12g} reported={reported:.12g}"
+        for name, computed, reported in (
+            ("sensor", sensor_rotation, reported_sensor_rotation),
+            ("filter", filter_rotation, reported_filter_rotation),
+            ("relative", relative_rotation, reported_relative_rotation),
+            ("maximum", computed_maximum_rotation, reported_maximum_rotation),
         )
-        or not _contact_numbers_close(
-            reported_maximum_rotation,
-            max(sensor_rotation, filter_rotation, relative_rotation),
+        if not _contact_numbers_close(reported, computed)
+    ]
+    if rotation_mismatches:
+        raise HostedDroidError(
+            "continuous collision rotation delta is inconsistent "
+            f"for {label}: {', '.join(rotation_mismatches)}"
         )
-    ):
-        raise HostedDroidError("continuous collision rotation delta is inconsistent")
 
     maximum_rotation = _contact_mapping(
         evidence.get("maximum_rotation_radians"),
