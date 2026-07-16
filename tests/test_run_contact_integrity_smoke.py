@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import unittest
+from pathlib import Path
 
 from run_contact_integrity_smoke import (
     _evaluate_atomic_step,
@@ -8,9 +10,11 @@ from run_contact_integrity_smoke import (
     _evaluate_impulse_fault,
     _evaluate_penetration_fault,
     _evaluate_saturation_fault,
+    _evaluate_tunneling_fault,
     _fixture_script,
     _parser,
     _scenario_paths,
+    _trace_config,
     _tool_data,
 )
 
@@ -36,6 +40,10 @@ def _trace(
             "updates_with_contact": contact_updates,
             "maximum_penetration_m": penetration,
             "maximum_normal_impulse_ns": impulse,
+            "unreported_swept_collisions": sum(
+                violation.get("metric") == "unreported_swept_collision"
+                for violation in configured_violations
+            ),
         },
     }
 
@@ -43,6 +51,17 @@ def _trace(
 class ContactIntegritySmokeTests(unittest.TestCase):
     def test_stops_launched_session_by_default(self) -> None:
         self.assertFalse(_parser().parse_args([]).keep_session)
+
+    def test_records_session_ownership_before_waiting_for_readiness(self) -> None:
+        source = Path("run_contact_integrity_smoke.py").read_text(encoding="utf-8")
+        launch_start = source.index("launch = client.launch(")
+        ownership = source.index("launched = True", launch_start)
+        announcement = source.index('"event": "session_created"', launch_start)
+        readiness = source.index("client.wait_for_session(", launch_start)
+
+        self.assertIn("wait=False", source[launch_start:ownership])
+        self.assertLess(ownership, announcement)
+        self.assertLess(announcement, readiness)
 
     def test_unwraps_gateway_data(self) -> None:
         self.assertEqual(
@@ -72,12 +91,43 @@ class ContactIntegritySmokeTests(unittest.TestCase):
         self.assertIn("runtime_velocity = (5.0, 0.0, 0.0)", script)
         self.assertIn("linear_velocities=[list(runtime_velocity)]", script)
 
+    def test_tunneling_fixture_crosses_filter_with_ccd_disabled(self) -> None:
+        script = _fixture_script(scenario="tunneling")
+
+        self.assertIn("runtime_velocity = (120.0, 0.0, 0.0)", script)
+        self.assertIn("CreateEnableCCDAttr(enable_ccd)", script)
+        _, sensor_path, filter_path = _scenario_paths("tunneling")
+        sensor_definition = script[
+            script.index(f"define_cube(\n    {sensor_path!r}") : script.index(
+                f"define_cube(\n    {filter_path!r}"
+            )
+        ]
+        self.assertTrue(sensor_definition.rstrip().endswith("False,\n)"))
+
+    def test_trace_config_allows_five_degree_rotation_updates(self) -> None:
+        continuous = _trace_config(64, scenario="clean")["continuous_collision"]
+
+        self.assertEqual(
+            continuous,
+            {
+                "maximum_sensor_rotation_rad": math.radians(5.0),
+                "maximum_filter_rotation_rad": math.radians(5.0),
+                "max_hits_per_pair": 16,
+            },
+        )
+
     def test_scenarios_have_disjoint_rigid_body_paths(self) -> None:
         paths = [
             _scenario_paths(name)
-            for name in ("clean", "penetration", "impulse", "saturation")
+            for name in (
+                "clean",
+                "penetration",
+                "impulse",
+                "saturation",
+                "tunneling",
+            )
         ]
-        self.assertEqual(len({path for group in paths for path in group}), 12)
+        self.assertEqual(len({path for group in paths for path in group}), 15)
 
     def test_rejects_inner_tool_error(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "MCP tool failed"):
@@ -132,6 +182,14 @@ class ContactIntegritySmokeTests(unittest.TestCase):
                 complete=False,
                 contact_updates=2,
                 saturated_pairs=["smoke-pair"],
+            )
+        )
+        self.assertTrue(all(checks.values()))
+
+    def test_tunneling_fault_requires_machine_sweep_violation(self) -> None:
+        checks = _evaluate_tunneling_fault(
+            _trace(
+                violations=[{"metric": "unreported_swept_collision"}],
             )
         )
         self.assertTrue(all(checks.values()))
