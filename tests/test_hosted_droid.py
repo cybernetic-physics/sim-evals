@@ -1080,6 +1080,7 @@ class FakeSampler:
         error: Exception | None = None,
         response: Any | None = None,
         close_error: BaseException | None = None,
+        allow_dsrl: bool = False,
     ) -> None:
         self.observations: list[DroidObservation] = []
         self.timeouts: list[float | None] = []
@@ -1088,13 +1089,23 @@ class FakeSampler:
         self.error = error
         self.response = response
         self.close_error = close_error
+        self.allow_dsrl = allow_dsrl
+        self.dsrl_actions: list[np.ndarray] = []
 
     def reset_sampling_session(self) -> None:
         self.reset_calls += 1
 
     def sample_droid(
-        self, observation: DroidObservation, *, timeout: float | None = None
+        self,
+        observation: DroidObservation,
+        *,
+        dsrl_action: np.ndarray | None = None,
+        timeout: float | None = None,
     ) -> Any:
+        if dsrl_action is not None and not self.allow_dsrl:
+            raise AssertionError("baseline hosted evaluator should not steer PI0")
+        if dsrl_action is not None:
+            self.dsrl_actions.append(dsrl_action.copy())
         self.observations.append(observation)
         self.timeouts.append(timeout)
         if self.error is not None:
@@ -1117,6 +1128,31 @@ class FakeSampler:
         self.closed = True
         if self.close_error is not None:
             raise self.close_error
+
+
+class FakeDsrlController:
+    gamma = 0.99
+
+    def __init__(self) -> None:
+        self.action = np.arange(32, dtype=np.float32)
+        self.observations: list[DroidObservation] = []
+        self.transitions: list[Any] = []
+
+    def metadata(self) -> dict[str, Any]:
+        return {"method": "test-dsrl", "base_policy_frozen": True}
+
+    def select_action(
+        self,
+        observation: DroidObservation,
+        *,
+        deterministic: bool = False,
+    ) -> np.ndarray:
+        self.observations.append(observation)
+        return self.action.copy()
+
+    def record_transition(self, transition) -> dict[str, int]:
+        self.transitions.append(transition)
+        return {"transitions": len(self.transitions), "updates": 3}
 
 
 class HostedDroidRunnerTest(unittest.TestCase):
@@ -1339,6 +1375,165 @@ class HostedDroidRunnerTest(unittest.TestCase):
         self.assertAlmostEqual(result.physics_dt, 1.0 / 240.0)
         self.assertEqual(result.physics_steps_per_action, 16)
         self.assertAlmostEqual(result.control_hz, 15.0)
+
+    def test_dsrl_records_one_verified_chunk_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "dsrl-episode"
+            controller = FakeDsrlController()
+            sampler = FakeSampler(
+                allow_dsrl=True,
+                response={
+                    "action_chunk": np.zeros((1, 10, 8), dtype=np.float32),
+                    "policy_metadata": {
+                        **_pi0_policy_profile(),
+                        "pi0_initial_flow_noise": {
+                            "contract_version": 1,
+                            "applied": True,
+                            "dtype": "float32",
+                            "shape": [10, 32],
+                            "sha256": hashlib.sha256(
+                                np.ascontiguousarray(
+                                    np.repeat(
+                                        controller.action[np.newaxis, :],
+                                        repeats=10,
+                                        axis=0,
+                                    ),
+                                    dtype="<f4",
+                                ).tobytes(order="C")
+                            ).hexdigest(),
+                        },
+                    },
+                },
+            )
+            task_states = [
+                _task_state_payload(object_center=(0.36, -0.08, 0.10))
+                for _ in range(11)
+            ]
+            result = HostedDroidRunner(
+                FakeSimulationClient(
+                    FakeMCP(
+                        readiness_failures=0,
+                        warm=True,
+                        task_state_payloads=task_states,
+                    )
+                ),
+                sampler,
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid/versions/ver_1",
+                    base_model="pi0-droid",
+                    max_action_steps=10,
+                    open_loop_horizon=10,
+                    keep_session=False,
+                    record_video=False,
+                    results_dir=results_dir,
+                    task_success=scene1_cube_in_bowl_success_spec(),
+                ),
+                dsrl_controller=controller,
+                sleep=lambda _: None,
+            ).run()
+
+            self.assertEqual(result.dsrl_transitions, 1)
+            self.assertEqual(result.dsrl_updates, 3)
+            self.assertEqual(result.dsrl_updates_total, 3)
+            self.assertEqual(result.dsrl_updates_delta, 3)
+            self.assertEqual(len(sampler.dsrl_actions), 1)
+            np.testing.assert_array_equal(sampler.dsrl_actions[0], controller.action)
+            self.assertEqual(len(controller.transitions), 1)
+            transition = controller.transitions[0]
+            self.assertEqual(transition.reward, -1.0)
+            self.assertAlmostEqual(transition.discount, 0.99**10)
+            self.assertEqual(transition.mask, 1.0)
+            self.assertFalse(transition.terminated)
+            self.assertTrue(transition.truncated)
+            self.assertEqual(transition.executed_primitive_actions, 10)
+            records = [
+                json.loads(line)
+                for line in (results_dir / "dsrl-transitions.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["dsrl_action"], controller.action.tolist())
+            self.assertEqual(len(records[0]["pi0_initial_flow_noise"]), 10)
+            self.assertEqual(records[0]["controller_metrics"]["updates"], 3)
+
+    def test_dsrl_requires_pi0_full_horizon_and_task_predicate(self) -> None:
+        controller = FakeDsrlController()
+        simulation = FakeSimulationClient(FakeMCP(readiness_failures=0, warm=True))
+        with self.assertRaisesRegex(ValueError, "base_model='pi0-droid'"):
+            HostedDroidRunner(
+                simulation,
+                FakeSampler(),
+                HostedDroidConfig(environment_uri="cybernetics://envs/env_droid"),
+                dsrl_controller=controller,
+            )
+        with self.assertRaisesRegex(ValueError, "open_loop_horizon=10"):
+            HostedDroidRunner(
+                simulation,
+                FakeSampler(),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    base_model="pi0-droid",
+                    open_loop_horizon=8,
+                    task_success=scene1_cube_in_bowl_success_spec(),
+                ),
+                dsrl_controller=controller,
+            )
+        with self.assertRaisesRegex(ValueError, "explicit task predicate"):
+            HostedDroidRunner(
+                simulation,
+                FakeSampler(),
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid",
+                    base_model="pi0-droid",
+                    open_loop_horizon=10,
+                ),
+                dsrl_controller=controller,
+            )
+
+    def test_dsrl_rejects_mismatched_initial_flow_noise_acknowledgement(self) -> None:
+        action = np.zeros(32, dtype=np.float32)
+        response = {
+            "policy_metadata": {
+                **_pi0_policy_profile(),
+                "pi0_initial_flow_noise": {
+                    "contract_version": 1,
+                    "applied": True,
+                    "dtype": "float32",
+                    "shape": [10, 32],
+                    "sha256": "not-the-requested-noise",
+                },
+            }
+        }
+
+        with self.assertRaisesRegex(HostedDroidError, "different DSRL"):
+            _validate_policy_response(
+                "pi0-droid",
+                response,
+                np.zeros((10, 8), dtype=np.float32),
+                dsrl_action=action,
+            )
+        with self.assertRaisesRegex(HostedDroidError, "controller base-policy"):
+            _validate_policy_response(
+                "pi0-droid",
+                {
+                    "policy_metadata": {
+                        **_pi0_policy_profile(),
+                        "pi0_initial_flow_noise": {
+                            "contract_version": 1,
+                            "applied": True,
+                            "dtype": "float32",
+                            "shape": [10, 32],
+                            "sha256": hashlib.sha256(
+                                np.zeros((10, 32), dtype="<f4").tobytes(order="C")
+                            ).hexdigest(),
+                        },
+                    }
+                },
+                np.zeros((10, 8), dtype=np.float32),
+                dsrl_action=action,
+                expected_base_policy_metadata={"checkpoint_uri": "different"},
+            )
 
     def test_requests_maximum_mcp_ttl_for_1000_action_run(self) -> None:
         simulation = FakeSimulationClient(FakeMCP(readiness_failures=10))
@@ -2776,6 +2971,171 @@ class HostedDroidRunnerTest(unittest.TestCase):
                 records[-1]["evaluation"]["hard_body_integrity"], "violated"
             )
             self.assertFalse(records[-1]["evaluation"]["trajectory_valid"])
+
+    def test_dsrl_physics_failure_is_not_rewarded_as_task_success(self) -> None:
+        controller = FakeDsrlController()
+        actions = np.zeros((1, 10, 8), dtype=np.float32)
+        spec = scene1_cube_in_bowl_success_spec()
+        contact_request = _contact_integrity_request(spec)
+        task_states = [
+            _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+            _task_state_payload(object_center=(0.36, -0.08, 0.14)),
+            _task_state_payload(object_center=(0.36, -0.08, 0.15)),
+        ]
+        step_payloads = [
+            {"stepped": 64},
+            {"stepped": 16},
+            {"stepped": 16},
+            {
+                "stepped": 16,
+                "contact_integrity": _contact_integrity_payload(
+                    contact_request,
+                    steps=16,
+                ),
+            },
+            {
+                "stepped": 16,
+                "contact_integrity": _contact_integrity_payload(
+                    contact_request,
+                    steps=16,
+                    penetration_meters=0.003,
+                ),
+            },
+        ]
+        repeated_noise = np.repeat(controller.action[np.newaxis, :], 10, axis=0)
+        sampler = FakeSampler(
+            allow_dsrl=True,
+            response={
+                "action_chunk": actions,
+                "policy_metadata": {
+                    **_pi0_policy_profile(),
+                    "pi0_initial_flow_noise": {
+                        "contract_version": 1,
+                        "applied": True,
+                        "dtype": "float32",
+                        "shape": [10, 32],
+                        "sha256": hashlib.sha256(
+                            np.ascontiguousarray(repeated_noise, dtype="<f4").tobytes(
+                                order="C"
+                            )
+                        ).hexdigest(),
+                    },
+                },
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            results_dir = Path(temporary) / "dsrl-penetration"
+            result = HostedDroidRunner(
+                FakeSimulationClient(
+                    FakeMCP(
+                        readiness_failures=0,
+                        warm=True,
+                        task_state_payloads=task_states,
+                        step_payloads=step_payloads,
+                    )
+                ),
+                sampler,
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid/versions/ver_1",
+                    base_model="pi0-droid",
+                    max_action_steps=10,
+                    open_loop_horizon=10,
+                    keep_session=False,
+                    results_dir=results_dir,
+                    task_success=spec,
+                ),
+                dsrl_controller=controller,
+                sleep=lambda _: None,
+            ).run()
+
+            self.assertFalse(result.task_success)
+            self.assertEqual(result.action_steps, 2)
+            self.assertEqual(len(controller.transitions), 1)
+            transition = controller.transitions[0]
+            self.assertEqual(transition.reward, -1.0)
+            self.assertAlmostEqual(transition.discount, 0.99**2)
+            self.assertEqual(transition.mask, 1.0)
+            self.assertFalse(transition.terminated)
+            self.assertTrue(transition.truncated)
+            record = json.loads(
+                (results_dir / "dsrl-transitions.jsonl").read_text().strip()
+            )
+            self.assertEqual(record["reward"], -1.0)
+            self.assertEqual(record["mask"], 1.0)
+            self.assertFalse(record["terminated"])
+            self.assertTrue(record["truncated"])
+
+    def test_dsrl_task_success_owns_zero_reward_terminal_transition(self) -> None:
+        controller = FakeDsrlController()
+        actions = np.zeros((1, 10, 8), dtype=np.float32)
+        actions[0, :5, 7] = 1.0
+        task_states = [
+            _task_state_payload(object_center=(0.36, -0.08, 0.10)),
+            _task_state_payload(object_center=(0.36, -0.08, 0.14)),
+            _task_state_payload(object_center=(0.36, -0.08, 0.15)),
+            _task_state_payload(object_center=(0.375, 0.00, 0.15)),
+            _task_state_payload(object_center=(0.39, 0.08, 0.15)),
+            _task_state_payload(object_center=(0.405, 0.16, 0.15)),
+            _task_state_payload(object_center=(0.405, 0.174, 0.105)),
+            _task_state_payload(object_center=(0.405, 0.174, 0.105)),
+            _task_state_payload(object_center=(0.405, 0.174, 0.105)),
+        ]
+        repeated_noise = np.repeat(controller.action[np.newaxis, :], 10, axis=0)
+        sampler = FakeSampler(
+            allow_dsrl=True,
+            response={
+                "action_chunk": actions,
+                "policy_metadata": {
+                    **_pi0_policy_profile(),
+                    "pi0_initial_flow_noise": {
+                        "contract_version": 1,
+                        "applied": True,
+                        "dtype": "float32",
+                        "shape": [10, 32],
+                        "sha256": hashlib.sha256(
+                            np.ascontiguousarray(repeated_noise, dtype="<f4").tobytes(
+                                order="C"
+                            )
+                        ).hexdigest(),
+                    },
+                },
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result = HostedDroidRunner(
+                FakeSimulationClient(
+                    FakeMCP(
+                        readiness_failures=0,
+                        warm=True,
+                        task_state_payloads=task_states,
+                        closed_gripper_observation=0.34,
+                    )
+                ),
+                sampler,
+                HostedDroidConfig(
+                    environment_uri="cybernetics://envs/env_droid/versions/ver_1",
+                    base_model="pi0-droid",
+                    max_action_steps=10,
+                    open_loop_horizon=10,
+                    keep_session=False,
+                    results_dir=Path(temporary) / "dsrl-success",
+                    task_success=scene1_cube_in_bowl_success_spec(),
+                ),
+                dsrl_controller=controller,
+                sleep=lambda _: None,
+            ).run()
+
+        self.assertTrue(result.task_success)
+        self.assertEqual(result.action_steps, 8)
+        self.assertEqual(len(controller.transitions), 1)
+        transition = controller.transitions[0]
+        self.assertEqual(transition.reward, 0.0)
+        self.assertAlmostEqual(transition.discount, 0.99**8)
+        self.assertEqual(transition.mask, 0.0)
+        self.assertTrue(transition.terminated)
+        self.assertFalse(transition.truncated)
 
     def test_scene1_acceptance_rejects_closed_gripper_support_loss(self) -> None:
         actions = np.zeros((1, 8, 8), dtype=np.float32)

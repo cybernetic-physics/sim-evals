@@ -14,6 +14,11 @@ dependencies = [
   "websockets>=16.0",
 ]
 
+[project.optional-dependencies]
+dsrl = [
+  "torch>=2.2,<3",
+]
+
 [tool.uv]
 override-dependencies = [
   "websockets>=16.0"
