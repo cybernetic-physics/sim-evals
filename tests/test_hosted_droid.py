@@ -917,6 +917,8 @@ class FakeMCP:
                     "physics_hz": physics_hz,
                     "solver_position_iterations": solver_position_iterations,
                     "solver_velocity_iterations": solver_velocity_iterations,
+                    "finger_ccd_enabled": True,
+                    "finger_ccd_rigid_bodies": 2,
                     "gripper_drive": {
                         "stiffness": 100.0,
                         "damping": 0.0002,
@@ -1235,6 +1237,11 @@ class HostedDroidRunnerTest(unittest.TestCase):
             dynamics_script,
         )
         self.assertIn("GetEnableCCDAttr().Set(True)", dynamics_script)
+        self.assertIn("finger_ccd_rigid_bodies", dynamics_script)
+        self.assertIn(
+            "DROID dynamics profile did not enable CCD on both inner-finger bodies",
+            dynamics_script,
+        )
         self.assertIn(
             "GetMaxDepenetrationVelocityAttr().Set(\n            3.0", dynamics_script
         )

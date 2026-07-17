@@ -3961,6 +3961,10 @@ robot_path = {robot_path}
 cube_path = {cube_path}
 receptacle_path = {receptacle_path}
 table_path = {table_path}
+finger_binding_paths = [
+    robot_path + "/Gripper/Robotiq_2F_85/left_inner_finger",
+    robot_path + "/Gripper/Robotiq_2F_85/right_inner_finger",
+]
 root = stage.GetPrimAtPath(robot_path)
 if not root.IsValid():
     raise RuntimeError(f"DROID robot prim not found: {{robot_path}}")
@@ -4004,6 +4008,7 @@ configured_gripper = False
 gripper_joint_path = None
 articulation_roots = 0
 rigid_bodies = 0
+finger_ccd_rigid_bodies = 0
 for prim in Usd.PrimRange(root):
     name = prim.GetName()
     if name in joint_settings:
@@ -4035,6 +4040,16 @@ for prim in Usd.PrimRange(root):
         rigid_api.GetMaxDepenetrationVelocityAttr().Set(
             {_DROID_MAX_DEPENETRATION_VELOCITY_MPS}
         )
+        prim_path = str(prim.GetPath())
+        if any(
+            prim_path == binding_path
+            or prim_path.startswith(binding_path + "/")
+            for binding_path in finger_binding_paths
+        ):
+            # Articulated fingers can cross a small cube between contact updates;
+            # CCD keeps the physical solver aligned with the telemetry sweep.
+            rigid_api.GetEnableCCDAttr().Set(True)
+            finger_ccd_rigid_bodies += 1
         rigid_bodies += 1
     if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
         articulation_api = PhysxSchema.PhysxArticulationAPI.Apply(prim)
@@ -4055,6 +4070,10 @@ if not configured_gripper:
 if articulation_roots < 1 or rigid_bodies < 1:
     raise RuntimeError(
         "DROID dynamics profile found no articulation root or rigid bodies"
+    )
+if finger_ccd_rigid_bodies < 2:
+    raise RuntimeError(
+        "DROID dynamics profile did not enable CCD on both inner-finger bodies"
     )
 
 physics_scenes = 0
@@ -4092,11 +4111,6 @@ if receptacle_root.HasAPI(UsdPhysics.RigidBodyAPI):
 table_root = stage.GetPrimAtPath(table_path)
 if not table_root.IsValid():
     raise RuntimeError("DROID table prim unavailable: %s" % table_path)
-
-finger_binding_paths = [
-    robot_path + "/Gripper/Robotiq_2F_85/left_inner_finger",
-    robot_path + "/Gripper/Robotiq_2F_85/right_inner_finger",
-]
 
 def configure_contact_root(path, material):
     profile_root = stage.GetPrimAtPath(path)
@@ -4492,6 +4506,8 @@ runtime_profile = {{
     "configured_gripper": configured_gripper,
     "articulation_roots": articulation_roots,
     "rigid_bodies": rigid_bodies,
+    "finger_ccd_enabled": True,
+    "finger_ccd_rigid_bodies": finger_ccd_rigid_bodies,
     "physics_scenes": physics_scenes,
     "solver_type": "TGS",
     "solver_position_iterations": {solver_position_iterations},
@@ -4571,6 +4587,19 @@ print(
             observed = profile.get(field_name)
             if isinstance(observed, bool) or observed != expected:
                 raise HostedDroidError(f"Isaac emitted the wrong DROID {field_name}")
+        if profile.get("finger_ccd_enabled") is not True:
+            raise HostedDroidError(
+                "Isaac emitted a DROID dynamics profile without inner-finger CCD"
+            )
+        finger_ccd_rigid_bodies = profile.get("finger_ccd_rigid_bodies")
+        if (
+            isinstance(finger_ccd_rigid_bodies, bool)
+            or not isinstance(finger_ccd_rigid_bodies, int)
+            or finger_ccd_rigid_bodies < 2
+        ):
+            raise HostedDroidError(
+                "Isaac emitted an incomplete inner-finger CCD profile"
+            )
         return cast(dict[str, Any], profile)
 
     def _reset_robot_for_policy(
