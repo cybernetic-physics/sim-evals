@@ -797,6 +797,7 @@ def _validate_collision_sweep(
     filter_path: str,
     expected_max_hits: int,
     maximum_distance_m: float,
+    require_available: bool = True,
 ) -> int:
     sweep = _contact_mapping(value, name)
     if set(sweep) != {
@@ -807,7 +808,7 @@ def _validate_collision_sweep(
         "hits",
     }:
         raise HostedDroidError(f"{name} is incomplete")
-    if sweep.get("available") is not True:
+    if require_available and sweep.get("available") is not True:
         raise HostedDroidError(f"{name} is unavailable")
     if sweep.get("saturated") is not False:
         raise HostedDroidError(f"{name} is saturated")
@@ -1330,12 +1331,17 @@ def _validate_continuous_collision_evidence(
         expected_max_hits=expected_max_hits,
         maximum_distance_m=expected_distance,
     )
+    exact_query_required = (
+        expected_distance > _CONTINUOUS_COLLISION_MOTION_EPSILON_METERS
+        or paired_hit_count > 0
+    )
     translation_shape_paired_hit_count = _validate_collision_sweep(
         evidence.get("translation_shape_sweep"),
         name="continuous collision translation shape sweep diagnostic",
         filter_path=filter_path,
         expected_max_hits=expected_max_hits,
         maximum_distance_m=expected_distance,
+        require_available=exact_query_required,
     )
     exact_paired_hit_count = _validate_collision_sweep(
         evidence.get("exact_shape_sweep"),
@@ -1343,6 +1349,7 @@ def _validate_continuous_collision_evidence(
         filter_path=filter_path,
         expected_max_hits=expected_max_hits,
         maximum_distance_m=expected_distance,
+        require_available=exact_query_required,
     )
     if translation_shape_paired_hit_count != exact_paired_hit_count:
         raise HostedDroidError(
