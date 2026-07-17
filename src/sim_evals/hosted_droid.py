@@ -585,6 +585,8 @@ class _ContinuousCollisionEvidence:
     rotation_envelope_inflation_m: float
     swept_collision_risk_detected: bool
     paired_hit_count: int
+    exact_paired_hit_count: int
+    broad_phase_only: bool
 
 
 def _contact_mapping(value: Any, name: str) -> Mapping[str, Any]:
@@ -901,6 +903,9 @@ def _validate_continuous_collision_evidence(
         "translation_shape_sweep",
         "translation_shape_sweep_semantics",
         "paired_hit_count",
+        "exact_shape_sweep",
+        "exact_paired_hit_count",
+        "broad_phase_only",
         "sensor_collider_paths",
         "endpoint_evidence",
         "sweep_semantics",
@@ -1325,13 +1330,24 @@ def _validate_continuous_collision_evidence(
         expected_max_hits=expected_max_hits,
         maximum_distance_m=expected_distance,
     )
-    _validate_collision_sweep(
+    translation_shape_paired_hit_count = _validate_collision_sweep(
         evidence.get("translation_shape_sweep"),
         name="continuous collision translation shape sweep diagnostic",
         filter_path=filter_path,
         expected_max_hits=expected_max_hits,
         maximum_distance_m=expected_distance,
     )
+    exact_paired_hit_count = _validate_collision_sweep(
+        evidence.get("exact_shape_sweep"),
+        name="continuous collision exact shape sweep evidence",
+        filter_path=filter_path,
+        expected_max_hits=expected_max_hits,
+        maximum_distance_m=expected_distance,
+    )
+    if translation_shape_paired_hit_count != exact_paired_hit_count:
+        raise HostedDroidError(
+            "continuous collision translation and exact shape sweep evidence disagree"
+        )
     reported_paired_hits = _contact_integer(
         evidence.get("paired_hit_count"),
         "continuous collision paired hit count",
@@ -1340,8 +1356,27 @@ def _validate_continuous_collision_evidence(
     if reported_paired_hits != paired_hit_count:
         raise HostedDroidError("continuous collision paired hit count is inconsistent")
 
+    reported_exact_paired_hits = _contact_integer(
+        evidence.get("exact_paired_hit_count"),
+        "continuous collision exact paired hit count",
+        maximum=expected_max_hits,
+    )
+    if reported_exact_paired_hits != exact_paired_hit_count:
+        raise HostedDroidError(
+            "continuous collision exact paired hit count is inconsistent"
+        )
+    broad_phase_only = paired_hit_count > 0 and exact_paired_hit_count == 0
+    reported_broad_phase_only = evidence.get("broad_phase_only")
+    if (
+        type(reported_broad_phase_only) is not bool
+        or reported_broad_phase_only is not broad_phase_only
+    ):
+        raise HostedDroidError(
+            "continuous collision broad phase diagnostic is inconsistent"
+        )
+
     swept_collision_risk_detected = (
-        paired_hit_count > 0
+        exact_paired_hit_count > 0
         and not previous_endpoint_contact
         and not current_endpoint_contact
     )
@@ -1357,7 +1392,11 @@ def _validate_continuous_collision_evidence(
             "continuous collision swept collision risk verdict is inconsistent"
         )
     expected_classification = (
-        "paired_tunneling" if swept_collision_risk_detected else "clear"
+        "paired_tunneling"
+        if swept_collision_risk_detected
+        else "conservative_envelope_only"
+        if broad_phase_only
+        else "clear"
     )
     expected_passed = not swept_collision_risk_detected
     expected_failure_reasons = (
@@ -1398,6 +1437,8 @@ def _validate_continuous_collision_evidence(
         rotation_envelope_inflation_m=inflation,
         swept_collision_risk_detected=swept_collision_risk_detected,
         paired_hit_count=paired_hit_count,
+        exact_paired_hit_count=exact_paired_hit_count,
+        broad_phase_only=broad_phase_only,
     )
 
 
