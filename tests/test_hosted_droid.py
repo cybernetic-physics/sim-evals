@@ -438,10 +438,19 @@ def _contact_integrity_payload(
                 "saturated": False,
                 "hits": [dict(hit) for hit in hits],
             },
+            "exact_shape_sweep": {
+                "available": True,
+                "max_hits": continuous_config["max_hits_per_pair"],
+                "captured_hit_count": len(hits),
+                "saturated": False,
+                "hits": [dict(hit) for hit in hits],
+            },
             "translation_shape_sweep_semantics": (
                 "current_sensor_collision_shapes_backward_through_relative_translation"
             ),
             "paired_hit_count": len(hits),
+            "exact_paired_hit_count": len(hits),
+            "broad_phase_only": False,
             "sensor_collider_paths": [f"{sensor_path}/collision"],
             "endpoint_evidence": {
                 "previous_contact_or_overlap": previous_endpoint_contact,
@@ -1956,6 +1965,42 @@ class HostedDroidRunnerTest(unittest.TestCase):
         )
 
         self.assertTrue(evidence["continuous_collision_complete"])
+
+    def test_contact_integrity_treats_obb_only_hit_as_diagnostic(self) -> None:
+        spec, tracker = _contact_tracker()
+        request = _contact_integrity_request(spec)
+        physics_dt = 1.0 / 240.0
+        trace = _contact_integrity_payload(
+            request,
+            steps=1,
+            contact_labels=set(),
+            physics_dt_seconds=physics_dt,
+        )
+        continuous = trace["samples"][0]["pairs"][0]["continuous_collision"]
+        continuous["sweep"]["hits"] = [
+            {
+                "rigid_body_path": continuous["filter_path"],
+                "collider_path": f'{continuous["filter_path"]}/collision',
+                "distance_m": 0.0001,
+            }
+        ]
+        continuous["sweep"]["captured_hit_count"] = 1
+        continuous["paired_hit_count"] = 1
+        continuous["classification"] = "conservative_envelope_only"
+        continuous["broad_phase_only"] = True
+
+        evidence = tracker._contact_evidence(
+            trace,
+            expected_updates=1,
+            expected_physics_dt_seconds=physics_dt,
+        )
+
+        self.assertTrue(evidence["contact_integrity_complete"])
+        self.assertEqual(evidence["unreported_swept_collisions"], 0)
+        self.assertEqual(
+            trace["continuous_collision_incomplete_pairs"],
+            [],
+        )
 
     def test_contact_integrity_rejects_tunneling_violation(self) -> None:
         spec, tracker = _contact_tracker()
