@@ -1638,6 +1638,19 @@ class _DroidTaskSuccessTracker:
         if success and self.success_action_index is None:
             self.success_action_index = action_index
 
+        gripper_state = (
+            "closed"
+            if gripper_closed
+            else "open"
+            if released
+            else "ambiguous"
+        )
+        gripper_intent = "close" if commanded_gripper_closed else "open"
+        gripper_intent_consistent = (
+            (gripper_intent == "close" and gripper_state == "closed")
+            or (gripper_intent == "open" and gripper_state == "open")
+        )
+
         return {
             "predicate": self.spec.name,
             "phase": "post_action",
@@ -1646,6 +1659,9 @@ class _DroidTaskSuccessTracker:
             "commanded_gripper_closed": commanded_gripper_closed,
             "gripper_closed": gripper_closed,
             "gripper_released": released,
+            "gripper_intent": gripper_intent,
+            "gripper_state": gripper_state,
+            "gripper_intent_consistent": gripper_intent_consistent,
             "release_command_after_lift_seen": self.release_command_after_lift_seen,
             "object_displacement_meters": object_displacement,
             "gripper_object_distance_meters": gripper_object_distance,
@@ -2354,6 +2370,18 @@ class _DroidTaskSuccessTracker:
             "maximum_allowed_normal_impulse_ns": (
                 self.spec.maximum_contact_normal_impulse_ns
             ),
+            "limit_violations": [
+                {
+                    "update_index": update_index,
+                    "pair_label": label,
+                    "metric": metric,
+                    "observed": observed,
+                    "limit": limit,
+                }
+                for (update_index, label, metric), (observed, limit) in sorted(
+                    expected_violations.items()
+                )
+            ],
             "bilateral_finger_contact_updates": bilateral_contact_updates,
             "bilateral_finger_contact_fraction": (
                 bilateral_contact_updates / len(samples)
